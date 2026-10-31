@@ -34,6 +34,8 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
         src/stream_manager.cpp
         src/layout_engine.cpp
         src/mqtt_controller.cpp
+        src/mqtt_json.cpp
+        src/mqtt_commands.cpp
         src/ffmpeg_decoder.cpp
         src/drm_renderer.cpp
     )
