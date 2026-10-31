@@ -6,7 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Layout math, the in-memory stream table, and MQTT command parsing have no
 # FFmpeg, libmosquitto, or DRM dependency, so CI can build and run them on a
-# normal Linux host. The player target below stays optional. A test that
+# normal Linux host. ffmpeg_decoder_tests is added only when the libav*
+# packages are present. The player target below stays optional. A test that
 # links libmosquitto should be added only when MOSQUITTO_FOUND is true.
 add_executable(layout_engine_tests
     tests/layout_engine_test.cpp
@@ -47,6 +48,35 @@ if(PkgConfig_FOUND)
     if(FFMPEG_FOUND AND MOSQUITTO_FOUND AND DRM_FOUND)
         set(AMLOGIC_PLAYER_DEPS_FOUND TRUE)
     endif()
+endif()
+
+# Software-decode smoke test. Links libav* only, so it can run when the
+# player target is skipped for lack of libmosquitto or libdrm. The test
+# generates a local fixture with the ffmpeg CLI and exits 77 when that
+# CLI is missing (ctest SKIP_RETURN_CODE).
+if(FFMPEG_FOUND)
+    find_program(FFMPEG_CLI ffmpeg)
+    add_executable(ffmpeg_decoder_tests
+        tests/ffmpeg_decoder_test.cpp
+        src/ffmpeg_decoder.cpp
+    )
+    target_include_directories(ffmpeg_decoder_tests SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
+    target_include_directories(ffmpeg_decoder_tests PRIVATE src)
+    if(FFMPEG_LIBRARY_DIRS)
+        target_link_directories(ffmpeg_decoder_tests PRIVATE ${FFMPEG_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(ffmpeg_decoder_tests PRIVATE ${FFMPEG_LIBRARIES})
+    target_compile_options(ffmpeg_decoder_tests PRIVATE -Wall -Wextra -Wpedantic ${FFMPEG_CFLAGS_OTHER})
+    if(FFMPEG_CLI)
+        target_compile_definitions(ffmpeg_decoder_tests PRIVATE FFMPEG_CLI="${FFMPEG_CLI}")
+    else()
+        target_compile_definitions(ffmpeg_decoder_tests PRIVATE FFMPEG_CLI="")
+    endif()
+    add_test(NAME ffmpeg_decoder COMMAND ffmpeg_decoder_tests)
+    set_tests_properties(ffmpeg_decoder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+else()
+    message(STATUS
+        "Skipping ffmpeg_decoder test: need libavformat, libavcodec, libavutil, and libswscale")
 endif()
 
 if(AMLOGIC_PLAYER_DEPS_FOUND)
