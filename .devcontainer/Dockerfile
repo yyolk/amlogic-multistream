@@ -11,6 +11,7 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
         ca-certificates \
         cmake \
         curl \
+        ffmpeg \
         file \
         g++ \
         libavcodec-dev \

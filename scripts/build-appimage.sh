@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Build amlogic-multistream and package it as an AppImage.
 #
-# Host: normal Linux, x86_64 or aarch64. No GS-King X, CoreELEC image, or
-# /dev/dri device is required. The skeleton player is enough: this script
-# still produces a real AppImage and runs it.
+# Host: normal Linux. The AppImage matches this machine: x86_64 for a host
+# smoke build, aarch64 for an Amlogic S922X device build. CI runs the script
+# once on each runner. No GS-King X or CoreELEC image is required to package.
 #
 # linuxdeploy fills the AppDir (binary, desktop file, icon, shared libraries).
 # linuxdeploy-plugin-appimage then runs appimagetool. A copy of appimagetool
 # is also placed on PATH because the plugin looks there if its bundled copy
 # is not found.
 #
-# CoreELEC-only and not used here: scripts/launch-coreelec.sh.
+# scripts/launch-coreelec.sh requires GS-King X / CoreELEC and is not used here.
 
 set -euo pipefail
 
@@ -43,6 +43,7 @@ case "$(uname -m)" in
   *) die "unsupported architecture: $(uname -m) (need x86_64 or aarch64)" ;;
 esac
 export ARCH
+echo "Packaging for ${ARCH} ($(uname -m))"
 
 VERSION="${VERSION:-}"
 if [[ -z "$VERSION" ]]; then
@@ -70,8 +71,10 @@ if [[ ! -x "$BIN" ]]; then
   die "player binary not built at $BIN. Install cmake, g++, pkg-config, libavformat-dev, libavcodec-dev, libavutil-dev, libswscale-dev, libmosquitto-dev, and libdrm-dev, then re-run."
 fi
 
-echo "Smoke-testing unpackaged player"
-timeout --foreground 60 "$BIN"
+# --help exits 0 without a broker. The default path connects to MQTT and
+# either blocks or exits 1 when nothing is listening on localhost:1883.
+echo "Smoke-testing unpackaged player --help"
+timeout --foreground 60 "$BIN" --help
 
 mkdir -p "$TOOLS_DIR" "$DIST_DIR"
 rm -rf "$APPDIR"
@@ -114,7 +117,7 @@ unset LDAI_SIGN || true
 [[ -f "$OUTPUT" ]] || die "linuxdeploy did not write $OUTPUT"
 chmod +x "$OUTPUT"
 
-echo "Smoke-testing $OUTPUT"
-timeout --foreground 60 "$OUTPUT" --appimage-extract-and-run
+echo "Smoke-testing $OUTPUT --help"
+timeout --foreground 60 "$OUTPUT" --appimage-extract-and-run --help
 ls -lh "$OUTPUT"
 echo "AppImage ready: $OUTPUT"

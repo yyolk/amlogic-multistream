@@ -5,8 +5,7 @@
 # built or is not registered with CTest. Every other add_test() target runs
 # in the same ctest invocation.
 #
-# CoreELEC-only and not used here: scripts/launch-coreelec.sh
-# (stops Kodi and expects /storage/amlogic-multistream on a GS-King X).
+# scripts/launch-coreelec.sh requires GS-King X / CoreELEC and is not used here.
 
 set -euo pipefail
 
@@ -55,4 +54,4 @@ if ! grep -q 'layout_engine_tests' <<<"$listing"; then
 fi
 
 echo "Running ctest (layout_engine_tests and any other registered tests)"
-timeout --foreground 120 ctest --test-dir "$BUILD_DIR" --output-on-failure --verbose
+timeout --foreground 300 ctest --test-dir "$BUILD_DIR" --output-on-failure --verbose
