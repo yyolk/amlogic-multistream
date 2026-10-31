@@ -10,7 +10,7 @@ Multi-stream HLS viewer for Amlogic S922X (GS-King X / CoreELEC).
 - RetroArch-style launch: stop Kodi → run app → restart Kodi
 
 ## Status
-Initial skeleton. Grid layout selection is implemented and unit-tested. Single-stream DRM + hardware decode proof of concept is the next milestone.
+Grid layout selection is implemented and unit-tested. MQTT command control is implemented against an in-memory stream table. Single-stream DRM + Amlogic hardware decode is still a stub and is not started by this process.
 
 ## Layouts
 
@@ -30,11 +30,18 @@ Tiles meet edge to edge and do not overlap. The full grid covers the viewport ex
 ## Build (on a normal Linux or cross)
 ```bash
 cmake -S . -B build
-cmake --build build --target layout_engine_tests
+cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The `amlogic-multistream` player target is configured only when libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm are all present. Layout tests do not need them.
+`layout_engine_tests`, `stream_manager_test`, and `mqtt_smoke_test` do not need a broker. Layout and stream-table tests also do not need FFmpeg, libmosquitto, or libdrm. `mqtt_smoke_test` parses commands in-process and does not link libmosquitto.
+
+The `amlogic-multistream` player target is configured only when libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm are all present.
+
+## MQTT
+The process connects to a broker and blocks until SIGINT or SIGTERM. Defaults are `localhost:1883` and topic prefix `amlogic-multistream` (`MQTT_HOST`, `MQTT_PORT`, `MQTT_TOPIC_PREFIX`). Command topics, JSON fields, and `mosquitto_pub` examples are in [docs/mqtt.md](docs/mqtt.md).
+
+This build does not open DRM/KMS devices or Amlogic decoders. On CoreELEC, `scripts/launch-coreelec.sh` still stops Kodi for the lifetime of this process.
 
 ## Launch on CoreELEC
 See `scripts/launch-coreelec.sh`.
