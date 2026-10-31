@@ -101,7 +101,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-`stream_manager_test` checks add, remove, list, mute, restart, and layout state. `mqtt_smoke_test` checks JSON parsing, topic routing, and command results. Neither opens a socket.
+`layout_engine` checks grid selection. `stream_manager_test` checks add, remove, list, mute, restart, and layout state. `mqtt_smoke_test` checks JSON parsing, topic routing, and command results. None of these open a socket or link libmosquitto. The `amlogic-multistream` player binary is configured only when FFmpeg, libmosquitto, and libdrm are all present.
 
 With a broker and the app running:
 
