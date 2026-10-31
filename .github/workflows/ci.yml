@@ -1,0 +1,81 @@
+# Build on a stock Ubuntu runner. No Amlogic board and no CoreELEC image.
+# scripts/launch-coreelec.sh stops Kodi on a GS-King X and is not called.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and package AppImage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CMAKE_BUILD_TYPE: Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('CMakeLists.txt', 'src/**', 'tests/**') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache AppImage tools
+        uses: actions/cache@v6
+        with:
+          path: .cache/appimage-tools
+          key: appimage-tools-${{ runner.os }}-${{ runner.arch }}-v1
+
+      # Library list matches .devcontainer/Dockerfile, plus ccache.
+      # layout_engine_tests itself only needs a C++ compiler. The media
+      # libraries let the player configure, and let later CTest targets
+      # that link FFmpeg, mosquitto, or libdrm build in this same step.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            ca-certificates \
+            ccache \
+            cmake \
+            curl \
+            file \
+            g++ \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libdrm-dev \
+            libfuse2t64 \
+            libmosquitto-dev \
+            libswscale-dev \
+            patchelf \
+            pkg-config
+
+      - name: Run unit tests
+        run: ./scripts/run-tests.sh
+
+      - name: Build AppImage
+        run: ./scripts/build-appimage.sh
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: amlogic-multistream-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+          compression-level: 0
