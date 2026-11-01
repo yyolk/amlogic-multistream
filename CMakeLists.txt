@@ -256,7 +256,8 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
     # must exit 1 inside the same deadline. AUDIT5 F1/X1: a command during the
     # drain must not leave "online": true retained, and a reconnect stuck in
     # getaddrinfo (interposed by the test) or connect() must not hold the exit.
-    # Skips when mosquitto is missing.
+    # AUDIT6 N1: SIGTERM during the first getaddrinfo must not wait out the
+    # resolver. Skips when mosquitto is missing.
     add_executable(mqtt_exit_test
         tests/mqtt_exit_test.cpp
         src/mqtt_controller.cpp

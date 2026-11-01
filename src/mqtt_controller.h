@@ -14,14 +14,16 @@ struct mosquitto_message;
 class StreamPlayer;
 
 // Connects to an MQTT broker and applies command topics to StreamManager.
-// Broker I/O runs on the mosquitto thread. start() presents on the calling
-// thread until SIGINT, SIGTERM, or SIGHUP. Each stream is decoded on its own
-// thread, so a stalled read does not block the other tiles or the signal
-// wait. A broker that is down at startup is retried with backoff instead of
-// exiting. A CONNACK that refuses the username or password exits non-zero
-// after a few attempts so scripts/launch-coreelec.sh can start Kodi. That
-// give-up uses the same bounded worker drain as a signal and exits 1.
-// Hardware decode and DRM/KMS are not started.
+// The first mosquitto_connect_async (and its getaddrinfo) runs on a helper
+// so start() can stay in sigtimedwait. After that, broker I/O runs on the
+// mosquitto thread. start() presents on the calling thread until SIGINT,
+// SIGTERM, or SIGHUP. Each stream is decoded on its own thread, so a stalled
+// read does not block the other tiles or the signal wait. A broker that is
+// down at startup is retried with backoff instead of exiting. A CONNACK that
+// refuses the username or password exits non-zero after a few attempts so
+// scripts/launch-coreelec.sh can start Kodi. That give-up uses the same
+// bounded worker drain as a signal and exits 1. Hardware decode and DRM/KMS
+// are not started.
 class MqttController {
 public:
     using DecoderFactory = std::function<std::unique_ptr<DecoderBackend>()>;
@@ -35,11 +37,12 @@ public:
     MqttController& operator=(const MqttController&) = delete;
 
     // Read env and CLI, then connect, subscribe, and tick until SIGINT,
-    // SIGTERM, or SIGHUP. Returns 0 for --help or a signal before the first
-    // connect is queued, and 1 if the client cannot start. Once the network
-    // thread is running, start() does not return: a signal _exits 0, and
-    // authentication give-up or a failed sigtimedwait _exits 1, whether or not
-    // a worker is still blocked. An unreachable broker is retried.
+    // SIGTERM, or SIGHUP. Returns 0 for --help, and 1 if the client cannot
+    // start. A signal before mosquitto_loop_start _exits 0 without joining
+    // the startup helper, which may still be inside getaddrinfo. Once the
+    // network thread is running, start() does not return: a signal _exits 0,
+    // and authentication give-up or a failed sigtimedwait _exits 1, whether
+    // or not a worker is still blocked. An unreachable broker is retried.
     int start(int argc, char* argv[]);
 
 private:
