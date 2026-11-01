@@ -4,11 +4,16 @@ project(amlogic-multistream VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Layout math, the in-memory stream table, and MQTT command parsing have no
-# FFmpeg, libmosquitto, or DRM dependency, so CI can build and run them on a
-# normal Linux host. ffmpeg_decoder_tests is added only when the libav*
-# packages are present. The player target below stays optional. A test that
-# links libmosquitto should be added only when MOSQUITTO_FOUND is true.
+# Layout math, the in-memory stream table, MQTT command parsing, and the
+# software renderer have no FFmpeg, libmosquitto, or DRM dependency, so CI
+# can build and run them on a normal Linux host. ffmpeg_decoder_tests is
+# added only when the libav* packages are present. The player target below
+# stays optional. A test that links libmosquitto should be added only when
+# MOSQUITTO_FOUND is true.
+#
+# AMLOGIC_DRM_KMS defaults off. Turning it on compiles the /dev/dri hook in
+# DrmRenderer. That hook requires GS-King X / CoreELEC and is not used by
+# ctest. The default build does not open a DRM device.
 add_executable(layout_engine_tests
     tests/layout_engine_test.cpp
     src/layout_engine.cpp
@@ -34,10 +39,19 @@ add_executable(mqtt_smoke_test
 target_include_directories(mqtt_smoke_test PRIVATE src)
 target_compile_options(mqtt_smoke_test PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(software_renderer_tests
+    tests/software_renderer_test.cpp
+    src/software_renderer.cpp
+    src/layout_engine.cpp
+)
+target_include_directories(software_renderer_tests PRIVATE src)
+target_compile_options(software_renderer_tests PRIVATE -Wall -Wextra -Wpedantic)
+
 enable_testing()
 add_test(NAME layout_engine COMMAND layout_engine_tests)
 add_test(NAME stream_manager_test COMMAND stream_manager_test)
 add_test(NAME mqtt_smoke_test COMMAND mqtt_smoke_test)
+add_test(NAME software_renderer COMMAND software_renderer_tests)
 
 find_package(PkgConfig QUIET)
 set(AMLOGIC_PLAYER_DEPS_FOUND FALSE)
@@ -79,6 +93,10 @@ else()
         "Skipping ffmpeg_decoder test: need libavformat, libavcodec, libavutil, and libswscale")
 endif()
 
+# Off unless a GS-King X / CoreELEC build explicitly asks for /dev/dri.
+# CI and ctest leave it off. See src/drm_renderer.cpp.
+option(AMLOGIC_DRM_KMS "Compile DRM/KMS /dev/dri hooks (requires GS-King X / CoreELEC)" OFF)
+
 if(AMLOGIC_PLAYER_DEPS_FOUND)
     add_executable(amlogic-multistream
         src/main.cpp
@@ -89,8 +107,12 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
         src/mqtt_json.cpp
         src/mqtt_commands.cpp
         src/ffmpeg_decoder.cpp
+        src/software_renderer.cpp
         src/drm_renderer.cpp
     )
+    if(AMLOGIC_DRM_KMS)
+        target_compile_definitions(amlogic-multistream PRIVATE AMLOGIC_DRM_KMS=1)
+    endif()
 
     target_include_directories(amlogic-multistream PRIVATE
         ${FFMPEG_INCLUDE_DIRS}
@@ -106,6 +128,21 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
     )
 
     target_compile_options(amlogic-multistream PRIVATE ${FFMPEG_CFLAGS_OTHER} ${MOSQUITTO_CFLAGS_OTHER})
+
+    # Runs the player against a local fixture. Skips when the ffmpeg CLI is
+    # missing. Does not need /dev/dri; --renderer drm is expected to fail.
+    add_executable(present_smoke_test tests/present_smoke_test.cpp)
+    target_compile_options(present_smoke_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_definitions(present_smoke_test PRIVATE
+        "PLAYER_BIN=\"$<TARGET_FILE:amlogic-multistream>\""
+    )
+    if(FFMPEG_CLI)
+        target_compile_definitions(present_smoke_test PRIVATE "FFMPEG_CLI=\"${FFMPEG_CLI}\"")
+    else()
+        target_compile_definitions(present_smoke_test PRIVATE "FFMPEG_CLI=\"\"")
+    endif()
+    add_test(NAME present_smoke COMMAND present_smoke_test)
+    set_tests_properties(present_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 else()
     message(STATUS
         "Skipping amlogic-multistream player: need libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm")
