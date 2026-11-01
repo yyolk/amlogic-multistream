@@ -76,6 +76,18 @@ add_test(NAME launch_coreelec
     COMMAND "${CMAKE_SOURCE_DIR}/scripts/test-launch-coreelec.sh")
 set_tests_properties(launch_coreelec PROPERTIES TIMEOUT 120)
 
+# Kodi add-on checks: addon.xml, settings, the packaged zip, default.py
+# against stub Kodi modules, and the install helper. Host only; Kodi and
+# systemd-run are stand-ins.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME kodi_addon
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/kodi_addon_test.py")
+    set_tests_properties(kodi_addon PROPERTIES TIMEOUT 120)
+else()
+    message(STATUS "Skipping kodi_addon test: python3 not found")
+endif()
+
 find_package(PkgConfig QUIET)
 set(AMLOGIC_PLAYER_DEPS_FOUND FALSE)
 if(PkgConfig_FOUND)
