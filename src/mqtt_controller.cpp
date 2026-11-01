@@ -254,6 +254,19 @@ int MqttController::start(int argc, char* argv[]) {
               << config_.prefix << "/cmd/# . Waiting for SIGINT, SIGTERM, or SIGHUP.\n";
     std::cout << "This build does not start DRM/KMS or Amlogic hardware decode.\n";
 
+    // Abort, queue the offline status, then join. getaddrinfo ignores abort,
+    // so the publish has to be queued before the wait. exitIfBusy leaves
+    // with _exit(0) if a worker is still inside that call after the deadline,
+    // which is shorter than the launch script's SIGTERM poll.
+    auto finishProcess = [&]() {
+        player.closeAll();
+        const std::string statusTopic = config_.prefix + "/status";
+        const std::string offline = buildStatusJson(false, playing_.load(), manager_.layout(),
+                                                    manager_.layoutSetting(), manager_.list());
+        publishRaw(statusTopic, offline, true);
+        player.exitIfBusy(StreamPlayer::kExitJoinDeadline);
+    };
+
     while (true) {
         if (authGiveUp_.load()) {
             std::cerr << "MQTT authentication failed after " << authRejects_.load()
@@ -275,17 +288,13 @@ int MqttController::start(int argc, char* argv[]) {
         }
         if (sig < 0 && errno != EAGAIN && errno != EINTR) {
             std::cerr << "sigtimedwait failed: " << std::strerror(errno) << "\n";
-            player.closeAll();
+            finishProcess();
             shutdown();
             return 1;
         }
     }
 
-    player.closeAll();
-    const std::string statusTopic = config_.prefix + "/status";
-    const std::string offline = buildStatusJson(false, playing_.load(), manager_.layout(),
-                                                manager_.layoutSetting(), manager_.list());
-    publishRaw(statusTopic, offline, true);
+    finishProcess();
     shutdown();
     return 0;
 }
