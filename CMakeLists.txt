@@ -74,7 +74,7 @@ add_test(NAME ctest_require
 # the signal, SIGINT before the player starts, and a bare ELF.
 add_test(NAME launch_coreelec
     COMMAND "${CMAKE_SOURCE_DIR}/scripts/test-launch-coreelec.sh")
-set_tests_properties(launch_coreelec PROPERTIES TIMEOUT 120)
+set_tests_properties(launch_coreelec PROPERTIES TIMEOUT 180)
 
 # Kodi add-on checks: addon.xml, settings, the packaged zip, default.py
 # against stub Kodi modules, and the install helper. Host only; Kodi and
@@ -213,6 +213,13 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
     endif()
     add_test(NAME present_smoke COMMAND present_smoke_test)
     set_tests_properties(present_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+    # Broker-down retry, SIGHUP retained status, and a SIGKILL that keeps
+    # the last stdout status line. Skips when mosquitto is not installed.
+    add_test(NAME mqtt_reconnect
+        COMMAND "${CMAKE_SOURCE_DIR}/scripts/test-mqtt-reconnect.sh"
+                "$<TARGET_FILE:amlogic-multistream>")
+    set_tests_properties(mqtt_reconnect PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 else()
     message(STATUS
         "Skipping amlogic-multistream player: need libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm")

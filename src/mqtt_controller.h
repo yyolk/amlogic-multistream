@@ -9,9 +9,10 @@ struct mosquitto_message;
 
 // Connects to an MQTT broker and applies command topics to StreamManager.
 // Broker I/O runs on the mosquitto thread. start() ticks software decode and
-// present on the calling thread until SIGINT/SIGTERM, so the process is not
-// blocked in sigwait with no decode loop. Hardware decode and DRM/KMS are
-// not started.
+// present on the calling thread until SIGINT, SIGTERM, or SIGHUP, so the
+// process is not blocked in sigwait with no decode loop. A broker that is
+// down at startup is retried with backoff instead of exiting. Hardware
+// decode and DRM/KMS are not started.
 class MqttController {
 public:
     explicit MqttController(StreamManager& manager);
@@ -20,8 +21,9 @@ public:
     MqttController(const MqttController&) = delete;
     MqttController& operator=(const MqttController&) = delete;
 
-    // Read env and CLI, then connect, subscribe, and tick until SIGINT/SIGTERM.
-    // Returns 0 after a clean shutdown or --help, and 1 if the client cannot start.
+    // Read env and CLI, then connect, subscribe, and tick until SIGINT,
+    // SIGTERM, or SIGHUP. Returns 0 after a clean shutdown or --help, and 1
+    // if the client cannot start. An unreachable broker is retried.
     int start(int argc, char* argv[]);
 
 private:
@@ -46,6 +48,11 @@ private:
     void handleMessage(const std::string& topic, const std::string& payload);
     void publishStatus();
     void publishRaw(const std::string& topic, const std::string& payload, bool retain);
+    // Offline snapshot of the current table. libmosquitto sends it on the
+    // next CONNECT, so a reconnect after a drop picks up streams added since
+    // the previous session. A SIGKILL before that reconnect still publishes
+    // the will from the last CONNECT.
+    bool refreshWill(bool fatal);
     void shutdown();
 
     static void onConnect(struct mosquitto* mosq, void* obj, int rc);

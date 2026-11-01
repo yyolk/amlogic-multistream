@@ -156,12 +156,7 @@ int MqttController::start(int argc, char* argv[]) {
         }
     }
 
-    const std::string statusTopic = config_.prefix + "/status";
-    const std::string will = buildStatusJson(false, false, "1x1", "auto", {});
-    rc = mosquitto_will_set(mosq_, statusTopic.c_str(), static_cast<int>(will.size()), will.data(), 1, true);
-    if (rc != MOSQ_ERR_SUCCESS) {
-        std::cerr << "MQTT will setup failed: " << mosquitto_strerror(rc) << "\n";
-        shutdown();
+    if (!refreshWill(true)) {
         return 1;
     }
 
@@ -174,13 +169,46 @@ int MqttController::start(int argc, char* argv[]) {
     sigemptyset(&signals);
     sigaddset(&signals, SIGINT);
     sigaddset(&signals, SIGTERM);
+    sigaddset(&signals, SIGHUP);
     pthread_sigmask(SIG_BLOCK, &signals, nullptr);
 
-    rc = mosquitto_connect_async(mosq_, config_.host.c_str(), config_.port, config_.keepalive);
-    if (rc != MOSQ_ERR_SUCCESS) {
-        std::cerr << "MQTT connect failed: " << mosquitto_strerror(rc) << "\n";
-        shutdown();
-        return 1;
+    // SoftwareRenderer has no scanout. Say so on stderr (unit-buffered) before
+    // any connect attempt, including the Kodi add-on's one-click Launch.
+    std::cerr << "MQTT software mode does not drive a display. Nothing from this player "
+                 "is shown until a DRM/KMS backend exists. Launch from the Kodi add-on "
+                 "stops Kodi with one remote click and puts no picture on screen. "
+                 "Stop this process to return to Kodi.\n";
+
+    // libmosquitto 2.0's threaded loop does not recover when the first
+    // connect_async fails (connection refused or a lookup error). Retry here
+    // with the same 1s..30s backoff, and keep accepting SIGINT/SIGTERM/SIGHUP
+    // so the launch script can still start Kodi.
+    int backoffSec = 1;
+    while (true) {
+        rc = mosquitto_connect_async(mosq_, config_.host.c_str(), config_.port, config_.keepalive);
+        if (rc == MOSQ_ERR_SUCCESS || rc == MOSQ_ERR_CONN_PENDING) {
+            break;
+        }
+        std::cerr << "MQTT connect failed: " << mosquitto_strerror(rc) << " (will retry)\n";
+        timespec timeout{};
+        timeout.tv_sec = backoffSec;
+        const int sig = sigtimedwait(&signals, nullptr, &timeout);
+        if (sig > 0) {
+            std::cout << "MQTT shutting down on signal " << sig << "\n";
+            shutdown();
+            return 0;
+        }
+        if (sig < 0 && errno != EAGAIN && errno != EINTR) {
+            std::cerr << "sigtimedwait failed: " << std::strerror(errno) << "\n";
+            shutdown();
+            return 1;
+        }
+        if (backoffSec < 30) {
+            backoffSec *= 2;
+            if (backoffSec > 30) {
+                backoffSec = 30;
+            }
+        }
     }
 
     rc = mosquitto_loop_start(mosq_);
@@ -193,7 +221,7 @@ int MqttController::start(int argc, char* argv[]) {
 
     std::cout << "MQTT running. Software decode ticks on this thread; broker I/O stays on the "
                  "mosquitto thread. Commands on "
-              << config_.prefix << "/cmd/# . Waiting for SIGINT or SIGTERM.\n";
+              << config_.prefix << "/cmd/# . Waiting for SIGINT, SIGTERM, or SIGHUP.\n";
     std::cout << "This build does not start DRM/KMS or Amlogic hardware decode.\n";
 
     while (true) {
@@ -216,6 +244,7 @@ int MqttController::start(int argc, char* argv[]) {
     }
 
     player.closeAll();
+    const std::string statusTopic = config_.prefix + "/status";
     const std::string offline = buildStatusJson(false, playing_.load(), manager_.layout(),
                                                 manager_.layoutSetting(), manager_.list());
     publishRaw(statusTopic, offline, true);
@@ -330,10 +359,12 @@ void MqttController::printUsage() const {
         << "\n"
         << "The process connects, subscribes to <prefix>/cmd/#, and software-decodes\n"
         << "added http:// and https:// streams into a SoftwareRenderer viewport until\n"
-        << "SIGINT or SIGTERM. Broker I/O runs on a background thread. start/play\n"
+        << "SIGINT, SIGTERM, or SIGHUP. If the broker is down it retries with backoff\n"
+        << "from 1s to 30s. Broker I/O runs on a background thread. start/play\n"
         << "opens decoders and presents; stop closes them. restart with an id\n"
         << "reopens that decoder. An unknown id does not restart other streams.\n"
-        << "DRM/KMS and Amlogic hardware decode are not started.\n"
+        << "Software mode does not drive a display. DRM/KMS and Amlogic hardware\n"
+        << "decode are not started, so nothing is shown until a DRM backend exists.\n"
         << "Command schema: docs/mqtt.md\n";
 }
 
@@ -383,6 +414,26 @@ void MqttController::publishStatus() {
     const std::string payload =
         buildStatusJson(true, playing_.load(), manager_.layout(), manager_.layoutSetting(), manager_.list());
     publishRaw(config_.prefix + "/status", payload, true);
+    refreshWill(false);
+}
+
+bool MqttController::refreshWill(bool fatal) {
+    if (!mosq_) {
+        return false;
+    }
+    const std::string topic = config_.prefix + "/status";
+    const std::string offline = buildStatusJson(false, playing_.load(), manager_.layout(),
+                                                manager_.layoutSetting(), manager_.list());
+    const int rc = mosquitto_will_set(mosq_, topic.c_str(), static_cast<int>(offline.size()),
+                                      offline.data(), 1, true);
+    if (rc != MOSQ_ERR_SUCCESS) {
+        std::cerr << "MQTT will update failed: " << mosquitto_strerror(rc) << "\n";
+        if (fatal) {
+            shutdown();
+        }
+        return false;
+    }
+    return true;
 }
 
 void MqttController::publishRaw(const std::string& topic, const std::string& payload, bool retain) {
@@ -393,6 +444,12 @@ void MqttController::publishRaw(const std::string& topic, const std::string& pay
                                      payload.data(), 1, retain);
     if (rc != MOSQ_ERR_SUCCESS) {
         std::cerr << "MQTT publish failed (" << topic << "): " << mosquitto_strerror(rc) << "\n";
+        return;
+    }
+    // One insertion so the line is flushed (stdout is unit-buffered). A
+    // later SIGKILL still leaves this last retained payload in the log.
+    if (retain) {
+        std::cout << "MQTT status " + payload + "\n";
     }
 }
 

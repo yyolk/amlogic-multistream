@@ -38,6 +38,10 @@ public:
     // `--url` passes true so local fixture files open. The default is false:
     // avformat_open_input then allows only http, https, tls, tcp, crypto, and
     // hls. MQTT must not set this; `add` already rejects non-HTTP URLs.
+    // open() also sets a demuxer whitelist (hls, mpegts, mov, mp4, mpeg) and
+    // a codec whitelist (h264, hevc, mpeg4, mpeg2video, mpeg1video, mjpeg,
+    // and aac, mp3, ac3, eac3 for container probe). gif and image demuxers
+    // are rejected on every path, including `--url`.
     void setAllowLocalFile(bool allow);
 
     bool open(const std::string& url) override;
