@@ -108,3 +108,35 @@ Everything else in the `SURVIVING4` filter and in #23 / #24 / #25 / #20 is clean
 | **N2** two-statement window after normal player exit before `restore_kodi` ignores HUP/TERM | nit | **Dropped** | **Correctly dropped.** Single shell function call boundary (`scripts/launch-coreelec.sh:270-271` → `:174`). |
 | **N3** `stream_player_stall` and `mqtt_reconnect` not in `DECODER_TESTS` | nit | **Dropped** | **Correctly dropped.** Both run and pass in CI (`ci.yml` installs `ffmpeg` with `libx264` and `mosquitto`). |
 | **I1–I3** plane count vs per-tile present, DMA-BUF handles, CE21 fbdev vs DRM | device notes | **Kept as device notes** | **Correctly handled.** Future DRM/hwaccel design constraints requiring a GS-King X. |
+
+---
+
+## 4. Cross-check against Opus `AUDIT4.md` (#27)
+
+See also standalone [`CROSSCHECK-GEMINI.md`](CROSSCHECK-GEMINI.md). Cross-checked Opus's [`AUDIT4.md`](https://github.com/yyolk/amlogic-multistream/pull/27) (`cursor/audit4-filter-fixes-d168`) against `REVIEW4.md`, `SURVIVING4.md`, and `main` @ `58a2f9c`.
+
+### Agree
+
+- **`SURVIVING4` filter calls:** Keeping `T1`, `K1`, `H1`, deferring `P1` until scanout exists, and dropping `M1`, `O1` (real race in worker logging, but cosmetic), `CI1`, `N1` (fixed in #25), `N2`, `N3`, and `I1–I3` all hold up.
+- **Core guarantees:** #20/#25 stall isolation holds (`remove` during a stuck DNS lookup freezes presents for 0 s; TSan clean); #24's startup auth refusal exits `1` (never `_exit(0)`); #24's `EnvironmentFile=` (`mode 0600`, `quote_systemd_env`) is sound.
+- **Must-fix regressions:**
+  - **Opus A1 == Gemini R1 (must fix, `[repro]`):** `finishProcess()` calls `player.exitIfBusy(kExitJoinDeadline)` (`_exit(0)`) before `MqttController::shutdown()` (`mosquitto_disconnect()`), so on a DNS-stalled shutdown the broker publishes the stale `CONNECT`-time Will (`"playing":false,"layout":"1x1","streams":[]`) over the final retained offline status.
+  - **Opus A2 == Gemini R2 edge case 2 (must fix, `[code + repro]`):** `authGiveUp_` (`src/mqtt_controller.cpp:271-277`) calls `return 1` without a bounded drain/exit, so `~StreamPlayer()` joins `reaper_` with no deadline if a mid-session reconnect fails auth while a worker is blocked in `getaddrinfo()`.
+  - **Opus A6 (part 1) == Gemini R2 edge case 1 (nit, `[code]`):** `sigtimedwait` error exit (`src/mqtt_controller.cpp:289-294`) calls `finishProcess()` before `return 1`, exiting `0` instead of `1` when a worker is blocked.
+
+### Disagree / Nuances (with evidence)
+
+1. **Severity of A1 / R1 (`minor` in Opus vs `major` in Gemini):**
+   - Opus rates A1 `minor (regression)` (while elevating it to **must fix**) because `"online":false` is still true in the startup Will. Gemini rates R1 `major` because preserving the live stream table in the retained offline `<prefix>/status` on shutdown is a documented guarantee (`docs/mqtt.md:53`, `test-mqtt-reconnect.sh:264-266`) and is the entire reason #25 called `publishRaw()` before waiting on workers; on the T1 shutdown path, the startup Will overwrites `publishRaw()` 100% of the time after any `add`. Both audits mark it **must fix** with the same fix (`shutdown()` before `_exit`).
+2. **`REVIEW4` CI2 recipe vs A1 / R1 (Opus is right):**
+   - Opus (`AUDIT4.md:80`) rightly notes that `REVIEW4`'s literal CI2 recipe (`REVIEW4.md:188`: blackhole + trickle URLs, SIGTERM, assert `"online":false`) would **not** have caught A1/R1: TCP blackhole/trickle sockets honor `abort()` (so `drain()` finishes in `<100 ms` without calling `_exit(0)`), and asserting only `"online":false` passes even when the startup Will wipes out `"streams"`. Catching A1/R1 requires an uninterruptible worker plus asserting that `"streams"` is preserved in the retained status.
+
+### Opus catches that Gemini missed (0 false positives in `AUDIT4.md`)
+
+Every claim in Opus's `AUDIT4.md` (`A1`–`A6`) was verified on `58a2f9c`; Opus has **no false positives**. Opus caught three valid issues (`A3`, `A4`, `A5`, plus `--help` wording in `A6`) that Gemini missed:
+
+- **Opus A3 (`minor`, new in #25 — verified `[code + repro]`):** `restart` (or `stop` + `start`) during a stuck lookup retires the blocked `Worker` onto `reaper_` and immediately spawns a replacement `std::thread` in `StreamPlayer::tick()` (`src/stream_player.cpp:400-428`) because `generationChanged` bypasses `session.backoff`. Command churn during a DNS outage stacks threads and UDP sockets on `reaper_` until `getaddrinfo()` times out (address-space hazard on 32-bit armv7).
+- **Opus A4 (`minor`, from #23 — verified `[repro]`):** Widening `kFormatWhitelist` also widened the post-open top-level check `av_match_list(fmt_->iformat->name, kFormatWhitelist, ',')` at `src/ffmpeg_decoder.cpp:162-169`. Gemini missed that FFmpeg's `mp3` demuxer exposes an ID3v2 `APIC` cover-art JPEG as `AVMEDIA_TYPE_VIDEO` (`mjpeg`, which is on `kCodecWhitelist`): reproduced on `58a2f9c` with `amlogic-multistream --url song.mp3 --frames 1`, which opens `stream=1 codec=mjpeg`, presents the `64x64` cover art, and exits `0`. Keeping a narrow top-level allowlist (`"hls,mpegts,mov,mp4,mpeg"`) for `fmt_->iformat->name` at line 163 while passing the wider `kFormatWhitelist` in `opts` fixes this cleanly.
+- **Opus A5 (`nit`, from #19 / #23 — verified `[repro]`):** In FFmpeg 6.1 (`libavcodec.so.60`), `avcodec_find_decoder(AV_CODEC_ID_MP3)->name` is `"mp3float"`, not `"mp3"`, so `avformat_find_stream_info` on an MP3-rendition HLS master logs `[mp3float @ ...] Codec (mp3float) not on whitelist ...` (video still opens and presents because audio is discarded).
+- **Opus A6 part 2 (`nit` — verified `[code]`):** `MqttController::printUsage()` (`src/mqtt_controller.cpp:412`) still says `"stop closes them"` instead of `"stop retires them"`.
+
