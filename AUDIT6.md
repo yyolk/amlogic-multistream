@@ -44,6 +44,11 @@ waits for `getaddrinfo` on the main thread. I rate it **should-fix** (N1): with
 two nameservers, the launch script SIGKILLs the player and Kodi comes back at
 11 s. The other new items are nits.
 
+**Cross-check:** [CROSSCHECK-OPUS.md](CROSSCHECK-OPUS.md) compares this file
+with `AUDIT6-GEMINI.md` ([#35](https://github.com/yyolk/amlogic-multistream/pull/35)).
+Gemini also rates the pre-connect DNS wait should-fix. The only survivor is
+N1 at should-fix, and no must-fix remains.
+
 | ID | Severity | Finding | From |
 | --- | --- | --- | --- |
 | **N1** | **should-fix** | SIGTERM during the pre-connect broker lookup waits for `getaddrinfo`: 9.6 s with 1 silent nameserver, 19.6 s with 2. Through the launch script, Kodi returns at 9.1 s and 11.1 s (SIGKILL) | pre-existing (start-up retry loop). #34 left it out of scope |
