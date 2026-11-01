@@ -27,6 +27,10 @@
 // The dual-variant case serves a master playlist on 127.0.0.1 from this
 // process. It does not use an outside network. It fails if a later segment
 // of the variant that was not selected is still requested.
+//
+// SURVIVING4 H1: an HLS master with a separate ADTS audio rendition. hls.c
+// copies the format whitelist onto that rendition during open, before audio
+// can be discarded. open() must succeed and a video frame must be presented.
 
 #ifndef FFMPEG_CLI
 #define FFMPEG_CLI ""
@@ -563,6 +567,97 @@ void testRejectGif(const std::string& ffmpeg, const std::filesystem::path& dir) 
     server.stop();
 }
 
+// Master playlist plus a raw-ADTS audio rendition. The video playlist is
+// MPEG-TS. The audio playlist's segment probes as format "aac", which hls.c
+// opens under the copied format whitelist.
+void testAdtsAudioMaster(const std::string& ffmpeg, const std::filesystem::path& dir) {
+    g_case = "generate adts hls master";
+    const std::filesystem::path root = dir / "adts-master";
+    const std::filesystem::path video_dir = root / "video";
+    std::filesystem::create_directories(video_dir);
+    const std::filesystem::path log = root / "ffmpeg.log";
+
+    const int video_rc = run(
+        {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "testsrc=size=160x120:rate=10:duration=0.4",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an",
+         "-hls_time", "1", "-hls_list_size", "0", "-hls_playlist_type", "vod",
+         "-hls_segment_filename", (video_dir / "index%d.ts").string(),
+         (video_dir / "index.m3u8").string()},
+        log);
+    if (video_rc != 0) {
+        std::cerr << "failed to generate ADTS-master video (exit " << video_rc << ")\n"
+                  << readFile(log);
+        ++g_failures;
+        return;
+    }
+
+    const int audio_rc = run(
+        {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "sine=frequency=440:sample_rate=44100:duration=0.4",
+         "-c:a", "aac", "-f", "adts", (root / "audio0.aac").string()},
+        log);
+    if (audio_rc != 0) {
+        std::cerr << "failed to generate ADTS audio (exit " << audio_rc << ")\n"
+                  << readFile(log);
+        ++g_failures;
+        return;
+    }
+    // A .aac name whose payload is MPEG-TS stays on the old whitelist. The
+    // rendition has to probe as ADTS (sync word 0xFFF) or this case is not H1.
+    {
+        std::ifstream adts(root / "audio0.aac", std::ios::binary);
+        unsigned char hdr[2] = {};
+        adts.read(reinterpret_cast<char*>(hdr), 2);
+        if (!adts || hdr[0] != 0xFF || (hdr[1] & 0xF0) != 0xF0) {
+            std::cerr << "ADTS fixture does not start with the ADTS sync word\n";
+            ++g_failures;
+            return;
+        }
+    }
+
+    {
+        std::ofstream audio(root / "audio.m3u8");
+        audio << "#EXTM3U\n"
+              << "#EXT-X-VERSION:3\n"
+              << "#EXT-X-TARGETDURATION:1\n"
+              << "#EXT-X-MEDIA-SEQUENCE:0\n"
+              << "#EXTINF:0.400,\n"
+              << "audio0.aac\n"
+              << "#EXT-X-ENDLIST\n";
+        std::ofstream master(root / "master.m3u8");
+        master << "#EXTM3U\n"
+               << "#EXT-X-VERSION:4\n"
+               << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,"
+                  "AUTOSELECT=YES,URI=\"audio.m3u8\"\n"
+               << "#EXT-X-STREAM-INF:BANDWIDTH=400000,CODECS=\"avc1.42e01e,mp4a.40.2\","
+                  "AUDIO=\"aud\"\n"
+               << "video/index.m3u8\n";
+    }
+
+    g_case = "hls adts audio master";
+    FfmpegDecoder decoder;
+    decoder.setAllowLocalFile(true);
+    const std::string url = (root / "master.m3u8").string();
+    const bool opened = decoder.open(url);
+    CHECK(opened);
+    if (!opened) {
+        decoder.close();
+        return;
+    }
+
+    int got = 0;
+    for (; got < 32; ++got) {
+        DecodedFrame frame;
+        if (!decoder.readFrame(frame)) {
+            break;
+        }
+        expectYuv420(frame);
+    }
+    CHECK(got >= 1);
+    decoder.close();
+}
+
 void testMissingFile(const std::filesystem::path& dir) {
     g_case = "missing file";
     FfmpegDecoder decoder;
@@ -619,6 +714,7 @@ int main() {
             g_case = "hls";
             testDecode(playlist.string());
             hls_decoded = true;
+            testAdtsAudioMaster(ffmpeg, tmp.path());
 
             g_case = "generate hls master";
             const std::filesystem::path master_root = tmp.path() / "master";
