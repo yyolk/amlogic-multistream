@@ -253,7 +253,10 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
 
     # AUDIT4 A1/A2: SIGTERM with a worker that ignores abort() must keep the
     # retained stream table when the broker is up, and authentication give-up
-    # must exit 1 inside the same deadline. Skips when mosquitto is missing.
+    # must exit 1 inside the same deadline. AUDIT5 F1/X1: a command during the
+    # drain must not leave "online": true retained, and a reconnect stuck in
+    # getaddrinfo (interposed by the test) or connect() must not hold the exit.
+    # Skips when mosquitto is missing.
     add_executable(mqtt_exit_test
         tests/mqtt_exit_test.cpp
         src/mqtt_controller.cpp
@@ -277,6 +280,7 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
     target_link_libraries(mqtt_exit_test PRIVATE
         ${FFMPEG_LIBRARIES}
         ${MOSQUITTO_LIBRARIES}
+        ${CMAKE_DL_LIBS}
         Threads::Threads
     )
     target_compile_options(mqtt_exit_test PRIVATE
@@ -285,7 +289,7 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
         ${MOSQUITTO_CFLAGS_OTHER}
     )
     add_test(NAME mqtt_exit_test COMMAND mqtt_exit_test)
-    set_tests_properties(mqtt_exit_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+    set_tests_properties(mqtt_exit_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 150)
 else()
     message(STATUS
         "Skipping amlogic-multistream player: need libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm")

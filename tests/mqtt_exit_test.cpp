@@ -9,6 +9,14 @@
 // Authentication give-up with that decoder still in open() must exit 1
 // within the same deadline, not join the worker from ~StreamPlayer. A
 // startup refusal with no streams must still exit 1 (K1).
+//
+// AUDIT5 F1: a command delivered during the exit drain must not republish
+// "online": true, which the DISCONNECT would then keep retained.
+//
+// AUDIT5 X1: the exit must not join libmosquitto's network thread while a
+// reconnect is stuck in getaddrinfo (broker gone before SIGTERM, or during
+// the drain after the offline publish went out) or in connect() to a broker
+// that drops packets.
 
 #include "decoder_backend.h"
 #include "mqtt_controller.h"
@@ -18,7 +26,9 @@
 
 #include <arpa/inet.h>
 #include <csignal>
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -35,6 +45,38 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace {
+
+// Broker name for the X1 lookup cases. It resolves to 127.0.0.1 until
+// g_dnsStallPath exists. After that, a lookup writes g_dnsEnteredPath and
+// blocks like a resolver whose nameservers never answer.
+constexpr const char* kStallHost = "broker.stall.test";
+std::string g_dnsStallPath;
+std::string g_dnsEnteredPath;
+
+}  // namespace
+
+// Defined in the executable so it interposes libmosquitto's getaddrinfo.
+extern "C" int getaddrinfo(const char* node,
+                           const char* service,
+                           const struct addrinfo* hints,
+                           struct addrinfo** res) {
+    using Real = int (*)(const char*, const char*, const struct addrinfo*, struct addrinfo**);
+    static const Real real = reinterpret_cast<Real>(dlsym(RTLD_NEXT, "getaddrinfo"));
+    if (node != nullptr && std::strcmp(node, kStallHost) == 0) {
+        if (!g_dnsStallPath.empty() && access(g_dnsStallPath.c_str(), F_OK) == 0) {
+            {
+                std::ofstream out(g_dnsEnteredPath);
+                out << "stalled\n";
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(60));
+            return EAI_AGAIN;
+        }
+        node = "127.0.0.1";
+    }
+    return real(node, service, hints, res);
+}
 
 namespace {
 
@@ -263,7 +305,8 @@ pid_t spawnPlayer(int port,
                   const std::string& clientId,
                   const std::string& readyPath,
                   const std::string& outPath,
-                  const std::string& errPath) {
+                  const std::string& errPath,
+                  const std::string& host = "127.0.0.1") {
     // Flush before fork. A child that freopen()s stdout would otherwise
     // write the parent's still-buffered lines a second time.
     std::cout.flush();
@@ -285,7 +328,7 @@ pid_t spawnPlayer(int port,
     std::vector<std::string> args = {
         "mqtt-exit-test",
         "--mqtt-host",
-        "127.0.0.1",
+        host,
         "--mqtt-port",
         std::to_string(port),
         "--mqtt-prefix",
@@ -427,6 +470,277 @@ void testSigtermKeepsStreams(Broker& broker, int port, const std::string& dir) {
     }
     if (!broker.alive()) {
         fail("SIGTERM: broker exited");
+    }
+}
+
+int msSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+struct Player {
+    pid_t pid = -1;
+    std::string prefix;
+    std::string ready;
+    std::string out;
+    std::string err;
+};
+
+// Spawn a player and wait for its subscribe. With stuckStream, also add and
+// start a stream whose open() never returns, so drain() sits out its deadline.
+bool launchPlayer(Player& player,
+                  int port,
+                  const std::string& name,
+                  const std::string& dir,
+                  const std::string& host,
+                  bool stuckStream) {
+    player.prefix = "audit5-" + name;
+    player.ready = dir + "/stall-" + name;
+    player.out = dir + "/" + name + ".out";
+    player.err = dir + "/" + name + ".err";
+    unlink(player.ready.c_str());
+    player.pid = spawnPlayer(port, player.prefix, player.prefix + "-client", player.ready, player.out,
+                             player.err, host);
+    if (player.pid <= 0) {
+        fail(name + ": fork failed");
+        return false;
+    }
+    auto abandon = [&](const std::string& why) {
+        fail(name + ": " + why);
+        dumpFile(player.out);
+        dumpFile(player.err);
+        kill(player.pid, SIGKILL);
+        waitExit(player.pid, 1000);
+        return false;
+    };
+    if (!waitUntil([&] { return fileContains(player.out, "subscribed to"); }, 5000)) {
+        return abandon("player did not subscribe");
+    }
+    if (!stuckStream) {
+        return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const std::string base = player.prefix + "/cmd/";
+    if (!publish(port, base + "add", "{\"id\":\"cam\",\"url\":\"http://example/stall.ts\"}") ||
+        !publish(port, base + "start", "{}")) {
+        return abandon("command publish failed");
+    }
+    if (!waitUntil([&] { return access(player.ready.c_str(), F_OK) == 0; }, 5000)) {
+        return abandon("stalling open() did not start");
+    }
+    return true;
+}
+
+void touch(const std::string& path) {
+    std::ofstream out(path);
+    out << "1\n";
+}
+
+// AUDIT5 F1. `list` during the 2s drain used to publish a retained
+// "online": true, and the DISCONNECT then told the broker to drop the will.
+void testCommandDuringDrain(int port, const std::string& dir) {
+    const int failuresBefore = g_failures;
+    Player player;
+    if (!launchPlayer(player, port, "drain-cmd", dir, "127.0.0.1", true)) {
+        return;
+    }
+    kill(player.pid, SIGTERM);
+    const auto signalled = std::chrono::steady_clock::now();
+    const std::string offlineLine = "MQTT status {\"online\":false";
+    if (!waitUntil([&] { return fileContains(player.out, offlineLine); }, 1500)) {
+        fail("drain-cmd: no offline status after SIGTERM");
+    }
+    if (!publish(port, player.prefix + "/cmd/list", "{}")) {
+        fail("drain-cmd: list publish failed");
+    }
+    const Exit result = waitExit(player.pid, 6000);
+    const int elapsedMs = msSince(signalled);
+    std::cout << "drain-cmd elapsedMs=" << elapsedMs << " code=" << result.code << "\n";
+    if (!result.exited || result.code != 0 || elapsedMs < 1500 || elapsedMs > 5000) {
+        fail("drain-cmd: expected exit 0 between 1500 and 5000 ms, got exited=" +
+             std::to_string(result.exited) + " code=" + std::to_string(result.code) +
+             " elapsedMs=" + std::to_string(elapsedMs));
+    }
+    if (!fileContains(player.out, "MQTT list ignored: shutting down")) {
+        fail("drain-cmd: list was not refused during the drain");
+    }
+    std::ifstream in(player.out);
+    const std::string log((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto offlineAt = log.find(offlineLine);
+    if (offlineAt != std::string::npos &&
+        log.find("MQTT status {\"online\":true", offlineAt) != std::string::npos) {
+        fail("drain-cmd: online status published after the offline status");
+    }
+    const std::string status = readRetained(port, player.prefix + "/status");
+    std::cout << "drain-cmd retained=" << status << "\n";
+    if (status.find("\"online\":false") == std::string::npos || status.find("\"id\":\"cam\"") == std::string::npos) {
+        fail("drain-cmd: retained status is not the offline table: " + status);
+    }
+    if (g_failures != failuresBefore) {
+        dumpFile(player.out);
+        dumpFile(player.err);
+    }
+}
+
+// AUDIT5 X1 (Gemini G1). No stuck worker, so drain() returns at once. The
+// broker went away first and the reconnect is blocked in getaddrinfo. The
+// exit used to join that thread in mosquitto_loop_stop.
+void testBrokerGoneStalledLookup(Broker& broker, int port, const std::string& dir) {
+    g_dnsStallPath = dir + "/dns-stall";
+    g_dnsEnteredPath = dir + "/dns-entered";
+    unlink(g_dnsStallPath.c_str());
+    unlink(g_dnsEnteredPath.c_str());
+    Player player;
+    if (launchPlayer(player, port, "gone-dns", dir, kStallHost, false)) {
+        touch(g_dnsStallPath);
+        broker.stop();
+        if (!waitUntil([&] { return access(g_dnsEnteredPath.c_str(), F_OK) == 0; }, 5000)) {
+            fail("gone-dns: reconnect did not reach the stalled lookup");
+            dumpFile(player.out);
+            dumpFile(player.err);
+            kill(player.pid, SIGKILL);
+            waitExit(player.pid, 1000);
+        } else {
+            kill(player.pid, SIGTERM);
+            const Exit result = waitExit(player.pid, 5000);
+            std::cout << "gone-dns elapsedMs=" << result.elapsedMs << " code=" << result.code << "\n";
+            if (!result.exited || result.code != 0 || result.elapsedMs > 1500) {
+                fail("gone-dns: expected exit 0 within 1500 ms, got exited=" + std::to_string(result.exited) +
+                     " code=" + std::to_string(result.code) + " elapsedMs=" + std::to_string(result.elapsedMs));
+                dumpFile(player.out);
+                dumpFile(player.err);
+            }
+        }
+    }
+    unlink(g_dnsStallPath.c_str());
+    if (!broker.start(port, true)) {
+        fail("gone-dns: broker did not restart");
+    }
+}
+
+// Listens on the broker's port with a full accept queue. Linux drops further
+// SYNs, so a blocking connect() hangs as it would against a broker address
+// that silently drops packets.
+class Blackhole {
+public:
+    ~Blackhole() { stop(); }
+
+    bool start(int port) {
+        listener_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listener_ < 0) {
+            return false;
+        }
+        const int one = 1;
+        setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(port));
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (bind(listener_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(listener_, 0) != 0) {
+            stop();
+            return false;
+        }
+        for (int i = 0; i < 4; ++i) {
+            const int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+            if (fd < 0) {
+                stop();
+                return false;
+            }
+            connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+            fillers_.push_back(fd);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        return true;
+    }
+
+    void stop() {
+        for (const int fd : fillers_) {
+            close(fd);
+        }
+        fillers_.clear();
+        if (listener_ >= 0) {
+            close(listener_);
+            listener_ = -1;
+        }
+    }
+
+private:
+    int listener_ = -1;
+    std::vector<int> fillers_;
+};
+
+// AUDIT5 X1, no DNS involved: the reconnect is blocked in connect().
+void testBlackholedBroker(Broker& broker, int port, const std::string& dir) {
+    Player player;
+    if (launchPlayer(player, port, "gone-blackhole", dir, "127.0.0.1", false)) {
+        broker.stop();
+        Blackhole hole;
+        if (!hole.start(port)) {
+            fail("gone-blackhole: could not listen on the broker port");
+            kill(player.pid, SIGKILL);
+            waitExit(player.pid, 1000);
+        } else if (!waitUntil([&] { return fileContains(player.err, "MQTT connection lost"); }, 3000)) {
+            fail("gone-blackhole: player did not notice the broker drop");
+            dumpFile(player.out);
+            dumpFile(player.err);
+            kill(player.pid, SIGKILL);
+            waitExit(player.pid, 1000);
+        } else {
+            // libmosquitto waits 1s before the first reconnect.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            kill(player.pid, SIGTERM);
+            const Exit result = waitExit(player.pid, 5000);
+            std::cout << "gone-blackhole elapsedMs=" << result.elapsedMs << " code=" << result.code << "\n";
+            if (!result.exited || result.code != 0 || result.elapsedMs > 1500) {
+                fail("gone-blackhole: expected exit 0 within 1500 ms, got exited=" +
+                     std::to_string(result.exited) + " code=" + std::to_string(result.code) +
+                     " elapsedMs=" + std::to_string(result.elapsedMs));
+                dumpFile(player.out);
+                dumpFile(player.err);
+            }
+        }
+    }
+    if (!broker.start(port, true)) {
+        fail("gone-blackhole: broker did not restart");
+    }
+}
+
+// AUDIT5 X1 (my F2). The offline publish went out, so DISCONNECT is due,
+// but the broker drops during the drain and the reconnect blocks in
+// getaddrinfo before the deadline.
+void testBrokerDropDuringDrain(Broker& broker, int port, const std::string& dir) {
+    g_dnsStallPath = dir + "/dns-stall";
+    g_dnsEnteredPath = dir + "/dns-entered";
+    unlink(g_dnsStallPath.c_str());
+    unlink(g_dnsEnteredPath.c_str());
+    Player player;
+    if (launchPlayer(player, port, "drop-drain", dir, kStallHost, true)) {
+        touch(g_dnsStallPath);
+        kill(player.pid, SIGTERM);
+        const auto signalled = std::chrono::steady_clock::now();
+        if (!waitUntil([&] { return fileContains(player.out, "MQTT status {\"online\":false"); }, 1500)) {
+            fail("drop-drain: no offline status after SIGTERM");
+        }
+        broker.stop();
+        const Exit result = waitExit(player.pid, 6000);
+        const int elapsedMs = msSince(signalled);
+        std::cout << "drop-drain elapsedMs=" << elapsedMs << " code=" << result.code << "\n";
+        if (!result.exited || result.code != 0 || elapsedMs < 1500 || elapsedMs > 4000) {
+            fail("drop-drain: expected exit 0 between 1500 and 4000 ms, got exited=" +
+                 std::to_string(result.exited) + " code=" + std::to_string(result.code) +
+                 " elapsedMs=" + std::to_string(elapsedMs));
+            dumpFile(player.out);
+            dumpFile(player.err);
+        }
+        if (access(g_dnsEnteredPath.c_str(), F_OK) != 0) {
+            fail("drop-drain: reconnect did not reach the stalled lookup during the drain");
+            dumpFile(player.out);
+            dumpFile(player.err);
+        }
+    }
+    unlink(g_dnsStallPath.c_str());
+    if (!broker.start(port, true)) {
+        fail("drop-drain: broker did not restart");
     }
 }
 
@@ -583,6 +897,10 @@ int main() {
             return 1;
         }
         testSigtermKeepsStreams(broker, port, dir);
+        testCommandDuringDrain(port, dir);
+        testBrokerGoneStalledLookup(broker, port, dir);
+        testBlackholedBroker(broker, port, dir);
+        testBrokerDropDuringDrain(broker, port, dir);
         testAuthGiveUpBounded(broker, port, dir);
         testStartupAuthExitCode(broker, port, dir);
     }
