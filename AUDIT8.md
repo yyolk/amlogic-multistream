@@ -239,9 +239,85 @@ them.
 
 ## Agreed survivors
 
-This pass has not been cross-checked. The survivors table above is the
-rating before that. Nothing here was fixed.
+The table in the verdict is this pass's rating before cross-check.
+[CROSSCHECK-A](#crosscheck-a) replaces it. Nothing in this file was fixed.
+
+---
+
+## CROSSCHECK-A
+
+Peer: [AUDIT8-B](https://github.com/yyolk/amlogic-multistream/pull/53)
+(`AUDIT8-B.md`, commit `e642c75` on `cursor/audit8-b-host-player-7327`).
+They audited `0518a7e` and did not read this file. This file audited the
+same tip. Nothing was fixed here.
+
+The survivors table at the top is this pass's rating before the cross-check.
+The calls below replace it for anything both auditors would still ship.
+
+### Their findings
+
+| ID | Call | After this pass | Reason |
+| --- | --- | --- | --- |
+| **P1** | **agree** | **should-fix** | Reproduced on this binary. Missed on the first pass. Width 8224, height 32, is copied and then `present` rejects every frame until EOF. Height 8224 never reaches `present` and takes the 1 s retry. `--url` returns 1 at viewport init. Not must-fix: the process stays up, the other tile keeps its own retry, and SIGTERM still publishes `online:false` with both ids. |
+| **L1** | **agree** | **nit** | Reproduced with dash. `/tmp/normglob/*` became `/tmp/normglob/aaa/bbb`, `/*` became `/aaa/bbb` from the cwd, a non-matching `foo*` stayed literal, `/storage/../etc` became `/etc`. A glob has to be in the environment value. Not a should-fix. |
+
+Their drops, not re-run here: symlink `rm -rf` of `squashfs-root` removes the link, and a CRLF in an HTTP `--url` is percent-encoded. Nothing in `launch-coreelec.sh` or the decoder contradicts those two. **Drop**, with them.
+
+**P1, this pass's numbers.** Same player binary as the suite, viewport
+`640x360`, broker `127.0.0.1:18883`, media on `127.0.0.1:8765`. `wide.mp4`
+is h264 8224×32, 10 frames, 1 s. `tall.mp4` is h264 32×8224, 2 frames.
+Both ids added, then `start`. Observed for 2.5 s, then SIGTERM.
+
+| Stream | Present failures | "will retry" | Opens |
+| --- | --- | --- | --- |
+| wide | **20** (10 frames × 2 opens) | 2, each only after the file ended | 2, log `8224x32` |
+| tall | **0** | 3 | 3, log `32x8224`, then `no frame from tall (will retry)` |
+
+Each wide failure is the pair
+`SoftwareRenderer::present: frame size must be 1..8192` and
+`StreamPlayer: present failed for wide` (`src/software_renderer.cpp:198-200`,
+`src/stream_player.cpp:503-505`). There is no backoff between those frames.
+`copyOwned` accepts the wide frame because the stride is under 65536 and the
+row count is under 8192 (`src/stream_player.cpp:16-18`, `:36-38`). The tall
+frame fails that row check, the worker returns `WorkerFail::Read`, and
+`tick` waits `kRetryDelay` (`:524-529`).
+
+`--url /tmp/audit8p1/wide.mp4 --frames 2`: stdout has `frame 0 8224x32`,
+stderr is `SoftwareRenderer::init: viewport must be 1..8192 on each side`,
+**rc 1**. No present line. `decodeUrl` sizes the viewport from the frame
+(`src/app.cpp:249-254`).
+
+Refine one sentence of their write-up. A finite file does take "will retry",
+but only after the last frame. The hot path is the frames themselves. A live
+input that never returns EOF never takes that retry. Their 20-frame file
+with 25 present-fail lines is the same path; this pass's 10-frame file
+logged 10 failures per open.
+
+Their fix shape is the right one, and it was not applied: reject width or
+height above 8192 before `av_frame_get_buffer`, and treat a present failure
+like a read failure (one line, retire, 1 s backoff).
+
+### This pass's findings
+
+| ID | Peer | After this pass | Reason |
+| --- | --- | --- | --- |
+| **B2** | **Agree, closed.** They re-ran the HTTP / `hls+http` `file://` segment, plus `FILE://`, absolute path, `crypto+file`, `concat`, `subfile`, master variant, AES key, and 302 to `file://`. Canary not opened. | **drop** (closed) | Same result as section 1. #51 holds on both passes. |
+| **B1** | Kept the known nit. No new `online:true`. | **keep nit** | Same code (`src/mqtt_controller.cpp:239-242`, `:262-272`). Not re-sampled here either. |
+| **N2** | Not promoted. | **keep nit** | `publishRaw` still returns true on a queued publish (`src/mqtt_controller.cpp:564-579`). Header still says "a live connection" (`src/mqtt_controller.h:69-71`). |
+| **N3** | Not promoted. | **keep nit** | Cap check unchanged (`src/stream_player.cpp:450-458`). |
+| **N4** | Not promoted. | **keep nit** | `src/stream_player.h:31-34` still ties `_exit` to a worker inside the blocking call. `finishProcess` always `_exit`s. |
+| **F4** | Not promoted. | **keep nit** | `reaperBusy` still waits out the in-flight lookup (`src/stream_player.cpp:444-446`). |
+| **F5** | Not promoted. They name the `mov` / wrapped-mp3 cover. | **keep nit** | No `AV_DISPOSITION_ATTACHED_PIC` check (`src/ffmpeg_decoder.cpp:187`). |
+| **F6** | Not promoted. | **keep nit** | Packed-audio fixture is still ADTS only. |
+| **F7** | Not promoted. Their suite also ran `mqtt_exit_test` because mosquitto was installed. | **keep nit** | `scripts/ctest-require.sh` still does not require it. |
+
+### Agreed survivors
+
+No must-fix. Both passes keep one should-fix:
 
 | ID | Severity | Summary |
 | --- | --- | --- |
-| — | — | Pending cross-check |
+| **P1** | should-fix | Width in (8192, 65536] with height ≤ 8192 is decoded and copied, then `SoftwareRenderer::present` fails every frame with no backoff until EOF. Height > 8192 already takes the 1 s retry. `--url` returns 1 at viewport init. Reject the source size before the frame buffer is allocated, and back off a present failure the way a read failure already does. |
+
+L1 stays a nit on both sides. B1, N2, N3, N4, F4, F5, F6, and F7 stay nits
+on both sides. B2 stays closed.
