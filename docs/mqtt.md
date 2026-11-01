@@ -130,8 +130,8 @@ mosquitto_pub -h localhost -t amlogic-multistream/cmd \
 ## Not in this build
 
 - Amlogic `multi_vdec` / hardware decode
-- DRM/KMS planes, modeset, or `/dev/dri`
+- DRM/KMS modeset or a plane commit (the `DrmRenderer` hook **requires GS-King X / CoreELEC** and is not started on this path)
 - HLS demux, audio, or a real mute that reaches a decoder
 - TLS, HTTP control, and Home Assistant discovery payloads
 
-`StreamManager` is the source of truth a later player loop can read. `FfmpegDecoder` and `DrmRenderer` are unchanged stubs.
+`StreamManager` is the source of truth a later player loop can read. `--url` software decode and `SoftwareRenderer` are a separate path and do not start this controller.
