@@ -61,8 +61,9 @@ at the rebase:
 | nit | **A6** the `sigtimedwait` error path can exit 0; `--help` still says stop "closes" | nit | #25 |
 
 A1 and A2 are marked must-fix even though each is minor. Each breaks a
-guarantee the fix PR documents, and each fix is about eight lines,
-verified in a scratch build.
+guarantee the fix PR documents, and each fix is under 20 lines,
+verified in a scratch build. A1's fix was corrected after the
+cross-check with Gemini's audit (`CROSSCHECK-OPUS.md`).
 
 ---
 
@@ -105,7 +106,10 @@ verified in a scratch build.
 
 - **Why it matters:** `docs/mqtt.md:54` says SIGINT, SIGTERM, and SIGHUP "are a clean shutdown: … publishes a final retained status from the live table". The T1 survivor fix ordered "publish the offline status before the shutdown join" so that status would survive a stuck lookup. `_exit(0)` without a DISCONNECT undoes that step on exactly the path it was written for. Before #25 this path was slow but clean whenever the lookup finished inside the launch script's 10 s poll. REVIEW4 (T1 fix 2) and SURVIVING4 (survivor 1 fix) both prescribed "flush and `_exit(0)`" without a disconnect, and #25 implemented that as written. So this is a gap in the filter's prescription that carried into the code.
 - **Why minor:** `"online":false` is still right, so Home Assistant sees the player go offline. The wrong fields are the table, the layout, and `playing`, and only after a shutdown that found a worker still blocked 2 s in (the T1 conditions). The next launch starts with an empty table anyway.
-- **Fix:** in `finishProcess`, replace `exitIfBusy` with `if (!player.drain(kExitJoinDeadline)) { shutdown(); flush; _exit(0); }`. `shutdown()` sends DISCONNECT and stops the mosquitto loop, so the broker discards the will. This was verified in a scratch build (last table row; the suite still passes, section 5). `MqttController::start` hard-codes `FfmpegDecoder`, so a controller-level test needs a decoder-factory seam to put `stream_player_test`'s `StallingDecoder` behind it. Then assert that the retained status still lists the streams after SIGTERM.
+- **Fix:**
+  - **Corrected after the cross-check (`CROSSCHECK-OPUS.md` section 1).** The first version here called `shutdown()` unconditionally before `_exit(0)`. That keeps the table (last table row), but `mosquitto_loop_stop` then joins libmosquitto's reconnect thread. When the broker is configured by DNS name and has dropped, that thread is stuck in `getaddrinfo`, and SIGTERM took 8.54 s (one nameserver) or 18.56 s (two) `[repro]`.
+  - Use the gated form instead: have `publishRaw` return whether the publish was queued, then `if (!player.drain(kExitJoinDeadline)) { if (sent) { shutdown(); } flush; _exit(0); }`. That kept the table and exited in 2.02 s in both cases, and the suite passed 13/13.
+  - `MqttController::start` hard-codes `FfmpegDecoder`, so a controller-level test needs a decoder-factory seam to put `stream_player_test`'s `StallingDecoder` behind it. Then assert that the retained status still lists the streams after SIGTERM.
 
 ### A2. minor, rebase gap between #24 and #25 — The auth give-up exit joins a stuck decode thread with no deadline `[repro]`
 
@@ -176,7 +180,7 @@ These parts of the fixes look sound and need no change:
 
 ## 5. Candidate fixes, scratch only
 
-A scratch worktree at `58a2f9c` (not pushed) carried the fixes for A1, A2, and A4: 18 insertions and 2 deletions in `mqtt_controller.cpp` and `ffmpeg_decoder.cpp`. With them, SIGTERM keeps the retained table, the auth exit is bounded at 2 s with rc 1, the packed-audio masters still play, and top-level `mp3`/`aac` are refused. `AMS_REQUIRE_DECODER_TESTS=1 ./scripts/run-tests.sh` on that tree: 13/13.
+A scratch worktree at `58a2f9c` (not pushed) carried the fixes for A1, A2, and A4: 18 insertions and 2 deletions in `mqtt_controller.cpp` and `ffmpeg_decoder.cpp`. With them, SIGTERM keeps the retained table, the auth exit is bounded at 2 s with rc 1, the packed-audio masters still play, and top-level `mp3`/`aac` are refused. `AMS_REQUIRE_DECODER_TESTS=1 ./scripts/run-tests.sh` on that tree: 13/13. That tree's A1 fix was the unconditional `shutdown()`. The gated form in A1 replaces it, and it was built and tested separately (`CROSSCHECK-OPUS.md` section 6).
 
 ## 6. Needs a GS-King X
 
