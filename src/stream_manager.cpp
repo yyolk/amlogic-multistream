@@ -23,12 +23,31 @@ void logRestart(const StreamInfo& stream) {
               << " (reconnect requested, generation " << stream.restartGeneration << ")\n";
 }
 
+bool layoutAccepted(const std::string& layout) {
+    if (layout == "auto") {
+        return true;
+    }
+    int rows = 0;
+    int cols = 0;
+    return LayoutEngine::parseLayout(layout, rows, cols);
+}
+
+bool rejectAdd(AddFailure* failure, AddFailure why) {
+    if (failure != nullptr) {
+        *failure = why;
+    }
+    return false;
+}
+
 }  // namespace
 
-bool StreamManager::addStream(const std::string& id, const std::string& url) {
+bool StreamManager::addStream(const std::string& id, const std::string& url, AddFailure* failure) {
+    if (failure != nullptr) {
+        *failure = AddFailure::None;
+    }
     if (id.empty() || url.empty()) {
         std::cerr << "Rejecting stream with empty id or url\n";
-        return false;
+        return rejectAdd(failure, AddFailure::Empty);
     }
 
     std::lock_guard<std::mutex> lock(mu_);
@@ -39,7 +58,13 @@ bool StreamManager::addStream(const std::string& id, const std::string& url) {
             return true;
         }
         std::cerr << "Stream already exists with a different url: " << id << "\n";
-        return false;
+        return rejectAdd(failure, AddFailure::Conflict);
+    }
+
+    if (streams_.size() >= static_cast<size_t>(LayoutEngine::kMaxStreams)) {
+        std::cerr << "Rejecting stream " << id << ": limit of " << LayoutEngine::kMaxStreams
+                  << " reached\n";
+        return rejectAdd(failure, AddFailure::Limit);
     }
 
     streams_.push_back(StreamInfo{id, url, false});
@@ -98,7 +123,8 @@ int StreamManager::restartAll() {
 }
 
 bool StreamManager::setLayout(const std::string& layout) {
-    if (layout.empty()) {
+    if (!layoutAccepted(layout)) {
+        std::cerr << "Rejecting layout \"" << layout << "\"\n";
         return false;
     }
     std::lock_guard<std::mutex> lock(mu_);

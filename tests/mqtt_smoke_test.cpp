@@ -1,3 +1,4 @@
+#include "layout_engine.h"
 #include "mqtt_commands.h"
 #include "mqtt_json.h"
 #include "stream_manager.h"
@@ -158,6 +159,33 @@ int main() {
     CHECK(layoutAuto.ok && layoutAuto.message == "1x2");
     CHECK(streams.layoutSetting() == "auto");
 
+    // Invalid tokens fail the command. They are not stored, not echoed as the
+    // current layout, and do not ask the controller to publish status.
+    for (const char* bad : {"banana", "2X2", "AUTO", "1x4", "4"}) {
+        const std::string payload = std::string("{\"layout\":\"") + bad + "\"}";
+        auto rejected = executeCommand(streams, playing, "layout", mustParse(payload));
+        CHECK(!rejected.ok && !rejected.publishStatus);
+        CHECK(rejected.message == "invalid layout");
+        CHECK(streams.layoutSetting() == "auto");
+        CHECK(streams.layout() == "1x2");
+    }
+    auto layoutNumber = executeCommand(streams, playing, "layout", mustParse(R"({"layout":4})"));
+    CHECK(!layoutNumber.ok && !layoutNumber.publishStatus);
+    CHECK(layoutNumber.message == "invalid layout");
+    CHECK(streams.layoutSetting() == "auto");
+    CHECK(streams.layout() == "1x2");
+    const std::string statusAfterReject =
+        buildStatusJson(true, playing, streams.layout(), streams.layoutSetting(), streams.list());
+    CHECK(statusAfterReject.find("\"layout\":\"1x2\"") != std::string::npos);
+    CHECK(statusAfterReject.find("\"layout_setting\":\"auto\"") != std::string::npos);
+    CHECK(statusAfterReject.find("banana") == std::string::npos);
+
+    auto layoutRotation = executeCommand(streams, playing, "layout", mustParse(R"({"layout":"2x1"})"));
+    CHECK(layoutRotation.ok && layoutRotation.publishStatus && layoutRotation.message == "2x1");
+    CHECK(streams.layout() == "2x1" && streams.layoutSetting() == "2x1");
+    auto layoutBack = executeCommand(streams, playing, "layout", mustParse(R"({"layout":"auto"})"));
+    CHECK(layoutBack.ok && streams.layoutSetting() == "auto" && streams.layout() == "1x2");
+
     auto muteBad = executeCommand(streams, playing, "mute", mustParse(R"({"id":"cam1"})"));
     CHECK(!muteBad.ok && muteBad.message == "muted is required");
     auto muteMissing = executeCommand(streams, playing, "mute", mustParse(R"({"id":"missing","muted":true})"));
@@ -244,6 +272,30 @@ int main() {
     CHECK(https.ok && https.message == "added");
     CHECK(streams.list().size() == beforeReject + 1);
     CHECK(streams.list().back().url == "https://example/live.m3u8");
+
+    StreamManager capped;
+    bool capPlaying = false;
+    for (int i = 0; i < LayoutEngine::kMaxStreams; ++i) {
+        const std::string payload = std::string("{\"id\":\"s") + std::to_string(i) +
+                                    "\",\"url\":\"http://example/" + std::to_string(i) + "\"}";
+        auto addedN = executeCommand(capped, capPlaying, "add", mustParse(payload));
+        CHECK(addedN.ok && addedN.message == "added" && addedN.publishStatus);
+    }
+    CHECK(capped.list().size() == static_cast<size_t>(LayoutEngine::kMaxStreams));
+    auto overflow = executeCommand(capped, capPlaying, "add",
+                                   mustParse(R"({"id":"extra","url":"http://example/extra"})"));
+    CHECK(!overflow.ok && !overflow.publishStatus);
+    CHECK(overflow.message == "stream limit reached");
+    CHECK(overflow.id == "extra");
+    CHECK(capped.list().size() == static_cast<size_t>(LayoutEngine::kMaxStreams));
+    auto alreadyAtCap = executeCommand(capped, capPlaying, "add",
+                                       mustParse(R"({"id":"s0","url":"http://example/0"})"));
+    CHECK(alreadyAtCap.ok && alreadyAtCap.message == "already present");
+    auto conflictAtCap = executeCommand(capped, capPlaying, "add",
+                                        mustParse(R"({"id":"s0","url":"http://example/other"})"));
+    CHECK(!conflictAtCap.ok && conflictAtCap.message == "stream already exists");
+    CHECK(capped.list().size() == static_cast<size_t>(LayoutEngine::kMaxStreams));
+    CHECK(capped.list()[0].url == "http://example/0");
 
     if (g_failed != 0) {
         std::cerr << g_failed << " check(s) failed\n";

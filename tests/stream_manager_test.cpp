@@ -1,3 +1,4 @@
+#include "layout_engine.h"
 #include "stream_manager.h"
 
 #include <iostream>
@@ -54,6 +55,14 @@ int main() {
     CHECK(!streams.setLayout(""));
     CHECK(streams.layoutSetting() == "auto");
     CHECK(streams.setLayout("2x2"));
+    CHECK(streams.layout() == "2x2");
+    CHECK(streams.layoutSetting() == "2x2");
+    CHECK(!streams.setLayout("banana"));
+    CHECK(!streams.setLayout("4"));
+    CHECK(!streams.setLayout("2X2"));
+    CHECK(!streams.setLayout("AUTO"));
+    CHECK(!streams.setLayout("1x4"));
+    CHECK(!streams.setLayout("2x2 "));
     CHECK(streams.layout() == "2x2");
     CHECK(streams.layoutSetting() == "2x2");
     CHECK(streams.removeStream("cam2"));
@@ -121,6 +130,27 @@ int main() {
     CHECK(grid.setLayout("1x2"));
     CHECK(grid.layout() == "1x2");
     CHECK(grid.layoutSetting() == "1x2");
+    CHECK(grid.setLayout("2x1"));
+    CHECK(grid.layout() == "2x1");
+    CHECK(grid.layoutSetting() == "2x1");
+    CHECK(!grid.setLayout("nope"));
+    CHECK(grid.layoutSetting() == "2x1");
+
+    CHECK(grid.addStream("s7", "http://example/7"));
+    CHECK(grid.addStream("s8", "http://example/8"));
+    CHECK(grid.list().size() == static_cast<size_t>(LayoutEngine::kMaxStreams));
+    AddFailure limit = AddFailure::None;
+    CHECK(!grid.addStream("s9", "http://example/9", &limit));
+    CHECK(limit == AddFailure::Limit);
+    CHECK(grid.list().size() == static_cast<size_t>(LayoutEngine::kMaxStreams));
+    CHECK(grid.addStream("s0", "http://example/0"));
+    AddFailure conflict = AddFailure::None;
+    CHECK(!grid.addStream("s0", "http://example/changed", &conflict));
+    CHECK(conflict == AddFailure::Conflict);
+    CHECK(grid.list()[0].url == "http://example/0");
+    CHECK(grid.removeStream("s8"));
+    CHECK(grid.addStream("s9", "http://example/9"));
+    CHECK(grid.list().size() == static_cast<size_t>(LayoutEngine::kMaxStreams));
 
     if (g_failed != 0) {
         std::cerr << g_failed << " check(s) failed\n";

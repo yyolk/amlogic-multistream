@@ -234,12 +234,14 @@ int main() {
         CHECK(harness.stats->opened == opened);
         CHECK(same(at(harness.renderer, 8, 8), leftColor));
 
-        CHECK(harness.streams.setLayout("nope"));
+        // An invalid token is not stored, so the next tick keeps the 1x1 wall.
         const int presented = harness.renderer.framesPresented();
-        CHECK(harness.player.tick(true) == 0);
-        CHECK(harness.renderer.framesPresented() == presented);
-        CHECK(allZero(harness.renderer));
-        CHECK(harness.player.tick(true) == 0);
+        CHECK(!harness.streams.setLayout("nope"));
+        CHECK(harness.streams.layout() == "1x1");
+        CHECK(harness.player.tick(true) == 1);
+        CHECK(harness.renderer.framesPresented() == presented + 1);
+        CHECK(same(at(harness.renderer, 8, 8), leftColor));
+        CHECK(!allZero(harness.renderer));
     }
 
     {

@@ -66,6 +66,8 @@ add_test(NAME stream_manager_test COMMAND stream_manager_test)
 add_test(NAME mqtt_smoke_test COMMAND mqtt_smoke_test)
 add_test(NAME software_renderer COMMAND software_renderer_tests)
 add_test(NAME stream_player_test COMMAND stream_player_test)
+add_test(NAME ctest_require
+    COMMAND "${CMAKE_SOURCE_DIR}/scripts/test-ctest-require.sh")
 
 # Stand-in for scripts/launch-coreelec.sh (that script requires GS-King X /
 # CoreELEC). Checks SIGTERM against a type-2 runtime that does not forward
@@ -89,6 +91,9 @@ endif()
 # player target is skipped for lack of libmosquitto or libdrm. The test
 # generates a local fixture with the ffmpeg CLI and exits 77 when that
 # CLI is missing (ctest SKIP_RETURN_CODE).
+# CI and the devcontainer set AMS_REQUIRE_DECODER_TESTS=1. scripts/run-tests.sh
+# then fails unless ffmpeg_decoder, present_smoke, and stream_player_http are
+# registered and pass. A local run without that variable still skips quietly.
 if(FFMPEG_FOUND)
     find_program(FFMPEG_CLI ffmpeg)
     add_executable(ffmpeg_decoder_tests

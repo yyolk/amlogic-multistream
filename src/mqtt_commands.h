@@ -29,6 +29,11 @@ std::string resolveCommandName(const TopicCommand& topic, const JsonObject& payl
 // While it is true, StreamPlayer opens a software decoder per visible stream.
 // `add` stores only http:// and https:// URLs, and rejects a NUL in the URL,
 // so a non-network URL never enters the table a decoder would open.
+// A new id past LayoutEngine::kMaxStreams (9) fails with "stream limit reached"
+// and does not publish status. Repeating an id already in the table is unchanged.
+// `layout` stores "auto" or a token LayoutEngine::parseLayout accepts.
+// "banana", "4", and "2X2" fail, leave the previous grid in place, and do not
+// publish status, so the wall is not cleared.
 // `restart` with an id bumps that stream's generation so the player reopens
 // its decoder. An unknown, empty, or non-string id fails and does not restart
 // any other stream. Omitting id restarts every stream.
