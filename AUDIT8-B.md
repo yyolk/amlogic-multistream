@@ -227,3 +227,53 @@ header. **Drop** the header-injection reading.
   publish is queued, about 20 ms when the broker name never resolves, rc 1
   on auth give-up).
 - **Symlink `rm -rf`** and **CRLF request smuggling** as above. **Drop.**
+
+---
+
+## CROSSCHECK-B
+
+Peer: [AUDIT8.md](https://github.com/yyolk/amlogic-multistream/pull/52) on
+draft [#52](https://github.com/yyolk/amlogic-multistream/pull/52)
+(`cursor/audit8-host-8992`). Same tip, `0518a7e`. No production code changed.
+Their line cites checked here still match the tree (`urlIsLocalFileSource`
+`src/app.cpp:178-188`, whitelist `src/ffmpeg_decoder.cpp:136-138`,
+`finishProcess` `_exit` `src/mqtt_controller.cpp:358`, `publishRaw`
+`src/mqtt_controller.cpp:564-579`, reaper gate `src/stream_player.cpp:444-458`,
+`av_find_best_stream` `src/ffmpeg_decoder.cpp:187`, header `src/stream_player.h:31-34`,
+`scripts/ctest-require.sh:5-9`). Both suites are 14/14. Wall time differs
+(theirs 117.0 s, this draft 132.61 s). That is not a finding.
+
+### Their findings
+
+| Their item | Their severity | This cross-check | Reason |
+| --- | --- | --- | --- |
+| B2 HTTP `--url` `file://` segment | closed | **agree** / **drop** | #51 holds on both probes. Whitelist line and no canary `openat` match. |
+| B1 startup CONNECT window, `online` stays false | nit | **agree** / **nit** | Same code. No new retained `online:true`. |
+| N2 `sent` true without a live socket | nit | **agree** / **nit** | `publishRaw` returns true on `MOSQ_ERR_SUCCESS`. Exit bound still holds. |
+| N3 full reaper cap delays healthy opens | nit | **agree** / **nit** | The `busyRetired >= kMaxBusyRetired` `continue` is unchanged. |
+| N4 header ties `_exit` to a stuck worker | nit | **agree** / **nit** | `stream_player.h:31-34` still says that. `finishProcess` always `_exit`s. |
+| F4 same-id replace waits out `reaperBusy` | nit | **agree** / **nit** | `src/stream_player.cpp:444-446` still skips the replacement open. |
+| F5 cover art via `av_find_best_stream` | nit | **agree** / **nit** | No attached-picture check after `:187`. Not re-promoted. |
+| F6 packed-audio fixtures are ADTS only | nit | **agree** / **nit** | Test gap. No runtime change in #51. |
+| F7 `mqtt_exit_test` / `mqtt_reconnect` skippable | nit | **agree** / **nit** | `ctest-require.sh` still lists only the three decoder tests. |
+| N1, F1, X1, F3, A1–A5 closed | closed | **agree** / **drop** | Suite timings and the unchanged gates match. |
+| Local playlist may open `file://`; absolute-path segment is an HTTP GET; `FILE://` / `HTTP://` fail closed; `data` / `pipe` / `concat` / `subfile` / `crypto+file` / `hls+file` do not open the canary; MOV `dref` default off | not a finding | **agree** / **drop** | Same results on the cases this draft ran. Their extra playlist forms (`#EXT-X-MAP`, `#EXT-X-MEDIA`, `pipe:`, `hls+file://`, `file://localhost`, percent-encoded `file`, leading space, `se:cret.mp4`) follow the same classifier. |
+| “No new should-fix” | verdict | **disagree** | Misses **P1**. Re-verified below. Their other ratings stay nits. |
+
+### This draft’s findings
+
+| ID | Was | Peer | After cross-check | Reason |
+| --- | --- | --- | --- | --- |
+| **P1** wide source, present fails every tick | should-fix | **missed** (their verdict is “should-fix: none”) | **keep should-fix** | Re-ran on the `0518a7e` binary. Viewport 640×360, broker `127.0.0.1:18883`, about 2.2 s of play. `wide_long.mp4` (8224×32): **40** `present failed` lines, **2** “will retry”, decoder log `8224x32` on each open. `tall_long.mp4` (32×8224): **0** present failures, **3** “will retry”, `32x8224`. Code is unchanged: present returns false and `tick` `continue`s (`src/stream_player.cpp:503-505`); height fails `copyOwned` (`kMaxPlaneRows` 8192) and takes the 1 s path. Not must-fix: the process stays up, other tiles still tick, and nothing is retained as online. |
+| L1 `normalize_abs` pathname expansion | nit | **missed** (they did not rebuild the launch-script harness) | **keep nit** | dash / busybox ash / bash still rewrite `/tmp/normglob/*` to `/tmp/normglob/aaa/bbb`. Needs a glob in the path. Not should-fix. |
+
+### Agreed survivors
+
+**None.** AUDIT8-A rates no must-fix and no should-fix. This draft’s only
+should-fix is **P1**, which that draft does not rate, so it is not a finding
+both audits keep. It stays should-fix in this file. L1 and every carried item
+above stay nits.
+
+| ID | Severity | Summary |
+| --- | --- | --- |
+| — | — | No must-fix or should-fix that both drafts rated and this cross-check keeps. |
