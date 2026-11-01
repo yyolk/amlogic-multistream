@@ -2,6 +2,8 @@
 
 This document summarizes how hardware video decoding is implemented and managed on Amlogic SoCs (especially the S922X / GS-King X) across CoreELEC and mainline Kodi.
 
+Deep dive on the CoreELEC `libamcodec` / `CAMLCodec` path (STREAM_TYPE_FRAME call sequence, concurrency, abort/hang, licensing, DecoderBackend mapping, device probe): [`amlogic-libamcodec-amlcodec.md`](amlogic-libamcodec-amlcodec.md).
+
 ## 1. CoreELEC: Amlogic-ng vs Amlogic-no
 
 CoreELEC maintains different branches based on the underlying Amlogic vendor kernel. The two primary ones for recent devices like the S922X (G12B family) are **Amlogic-ng** and **Amlogic-no**.
