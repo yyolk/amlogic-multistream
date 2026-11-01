@@ -815,6 +815,106 @@ void testExtentCap(const std::string& ffmpeg, const std::filesystem::path& dir) 
     }
 }
 
+// Drop PAT/PMT/SI so MPEG-TS streams appear only during demux (AUDIT10 D2).
+bool writePsiLessTs(const std::filesystem::path& src, const std::filesystem::path& dst) {
+    std::ifstream in(src, std::ios::binary);
+    std::ofstream out(dst, std::ios::binary);
+    char pkt[188];
+    bool kept = false;
+    while (in.read(pkt, 188) && in.gcount() == 188) {
+        if (static_cast<unsigned char>(pkt[0]) != 0x47) {
+            return false;
+        }
+        const int pid = ((static_cast<unsigned char>(pkt[1]) & 0x1f) << 8) |
+                        static_cast<unsigned char>(pkt[2]);
+        if (pid >= 0x20 && pid != 0x1000) {
+            out.write(pkt, 188);
+            kept = true;
+        }
+    }
+    return kept && out.good();
+}
+
+void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::path& dir) {
+    const std::filesystem::path log = dir / "late-stream-ffmpeg.log";
+
+    g_case = "generate small psi-less ts";
+    const std::filesystem::path smallPmt = dir / "small-pmt.ts";
+    const std::filesystem::path smallPsi = dir / "small-psiless.ts";
+    const int small_rc = run(
+        {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "testsrc=size=160x120:rate=10:duration=0.4",
+         "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+         "-f", "mpegts", smallPmt.string()},
+        log);
+    if (small_rc != 0) {
+        if (encoderMissing(readFile(log))) {
+            std::cout << "late-stream fixture skipped: libx264 encoder not available\n";
+            return;
+        }
+        std::cerr << "failed to generate small mpegts fixture (exit " << small_rc << ")\n"
+                  << readFile(log);
+        ++g_failures;
+        return;
+    }
+    if (!writePsiLessTs(smallPmt, smallPsi)) {
+        std::cerr << "failed to strip PSI from small mpegts fixture\n";
+        ++g_failures;
+        return;
+    }
+
+    g_case = "small psi-less ts presentable";
+    testDecode(smallPsi.string());
+
+    g_case = "small psi-less hls presentable";
+    const std::filesystem::path smallHls = dir / "small-psiless.m3u8";
+    {
+        std::ofstream out(smallHls);
+        out << "#EXTM3U\n"
+            << "#EXT-X-VERSION:3\n"
+            << "#EXT-X-TARGETDURATION:1\n"
+            << "#EXT-X-MEDIA-SEQUENCE:0\n"
+            << "#EXTINF:0.400,\n"
+            << smallPsi.filename().string() << "\n"
+            << "#EXT-X-ENDLIST\n";
+    }
+    testDecode(smallHls.string());
+
+    g_case = "generate 12000x12000 psi-less ts";
+    const std::filesystem::path hugePmt = dir / "huge-pmt.ts";
+    const std::filesystem::path hugePsi = dir / "huge-psiless.ts";
+    const int huge_rc = run(
+        {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "color=c=red:s=12000x12000:d=0.04", "-frames:v", "1",
+         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+         "-crf", "51", "-pix_fmt", "yuv420p", "-f", "mpegts", hugePmt.string()},
+        log);
+    if (huge_rc != 0) {
+        std::cerr << "failed to generate 12000x12000 mpegts fixture (exit " << huge_rc << ")\n"
+                  << readFile(log);
+        ++g_failures;
+        return;
+    }
+    if (!writePsiLessTs(hugePmt, hugePsi)) {
+        std::cerr << "failed to strip PSI from 12000x12000 mpegts fixture\n";
+        ++g_failures;
+        return;
+    }
+
+    g_case = "12000x12000 psi-less reject";
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        DecodedFrame frame;
+        const bool opened = decoder.open(hugePsi.string());
+        const bool got = opened && decoder.readFrame(frame);
+        CHECK(!got);
+        CHECK(frame.width == 0);
+        CHECK(frame.height == 0);
+        decoder.close();
+    }
+}
+
 void testMissingFile(const std::filesystem::path& dir) {
     g_case = "missing file";
     FfmpegDecoder decoder;
@@ -910,6 +1010,7 @@ int main() {
         testRejectCoverMp3(ffmpeg, tmp.path());
         testHttpPlaylistFileSegment(mp4, tmp.path());
         testExtentCap(ffmpeg, tmp.path());
+        testLateStreamMaxPixels(ffmpeg, tmp.path());
 
         g_case = "generate hls";
         const std::filesystem::path hls_dir = tmp.path() / "hls";

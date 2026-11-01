@@ -394,6 +394,62 @@ int main() {
             }
         }
 
+        // AUDIT10 D2: a PSI-less 12000x12000 H.264 TS creates its stream
+        // during find_stream_info. Probe max_pixels must still apply.
+        {
+            const std::filesystem::path hugeTs = tmp.path() / "huge.ts";
+            const std::filesystem::path hugePsi = tmp.path() / "huge-psiless.ts";
+            const int genHugeTs = run({ffmpegBinary(), "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                                       "color=c=red:s=12000x12000:d=0.04", "-frames:v", "1", "-c:v",
+                                       "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+                                       "-crf", "51", "-pix_fmt", "yuv420p", "-f", "mpegts",
+                                       hugeTs.string()},
+                                      empty, log);
+            if (genHugeTs != 0) {
+                std::cerr << "failed to generate 12000x12000 mpegts fixture (exit " << genHugeTs
+                          << ")\n"
+                          << readFile(log);
+                return 1;
+            }
+            {
+                std::ifstream in(hugeTs, std::ios::binary);
+                std::ofstream out(hugePsi, std::ios::binary);
+                char pkt[188];
+                bool kept = false;
+                while (in.read(pkt, 188) && in.gcount() == 188) {
+                    if (static_cast<unsigned char>(pkt[0]) != 0x47) {
+                        std::cerr << "huge mpegts fixture is not 188-byte packets\n";
+                        return 1;
+                    }
+                    const int pid = ((static_cast<unsigned char>(pkt[1]) & 0x1f) << 8) |
+                                    static_cast<unsigned char>(pkt[2]);
+                    if (pid >= 0x20 && pid != 0x1000) {
+                        out.write(pkt, 188);
+                        kept = true;
+                    }
+                }
+                if (!kept) {
+                    std::cerr << "failed to strip PSI from 12000x12000 mpegts fixture\n";
+                    return 1;
+                }
+            }
+            long maxRssKb = 0;
+            const int hugeTsRc =
+                run({player, "--url", hugePsi.string(), "--frames", "1"}, out, err, &maxRssKb);
+            const std::string hugeTsOut = readFile(out);
+            const std::string hugeTsErr = readFile(err);
+            constexpr long kConvertRssKb = 300000;
+            if (hugeTsRc == 0 || hugeTsOut.find("presented ") != std::string::npos ||
+                hugeTsOut.find("Decoded ") != std::string::npos ||
+                hugeTsOut.find("layout ") != std::string::npos ||
+                hugeTsOut.find("-> yuv420p") != std::string::npos || maxRssKb >= kConvertRssKb) {
+                std::cerr << "psi-less oversize --url must fail before convert (exit " << hugeTsRc
+                          << " rss_kb=" << maxRssKb << ")\n"
+                          << hugeTsOut << hugeTsErr;
+                return 1;
+            }
+        }
+
         // AUDIT9 D1: a 12000x12000 MJPEG still must fail without the ~425 MB convert.
         {
             const std::filesystem::path hugeMp4 = tmp.path() / "huge.mp4";

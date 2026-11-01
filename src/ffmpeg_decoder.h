@@ -51,9 +51,12 @@ public:
     // mp3float; mp3 stays for a build that registers that name (AUDIT4 A5).
     // gif and image demuxers are rejected on every path, including `--url`.
     // open() sets decoder max_pixels to SoftwareRenderer::kMaxExtent squared
-    // so FFmpeg can refuse an oversize still before it materializes.
-    // readFrame() also refuses to convert a frame that fails those extent
-    // and stride caps (AUDIT9 D1).
+    // so FFmpeg can refuse an oversize still before it materializes. Streams
+    // created during avformat_find_stream_info (PSI-less MPEG-TS, extra
+    // PIDs, HLS of those files) are demuxed into existence first so the
+    // same cap reaches those probe decoders (AUDIT10 D2). readFrame() also
+    // refuses to convert a frame that fails those extent and stride caps
+    // (AUDIT9 D1).
     void setAllowLocalFile(bool allow);
 
     bool open(const std::string& url) override;
@@ -69,12 +72,17 @@ private:
     bool failOpen(const char* what, int err);
     bool failRead(const char* what, int err);
     bool publishYuv420(const AVFrame* src, DecodedFrame& out);
+    int readDemuxPacket();
+    void freeProbePackets();
 
     AVFormatContext* fmt_ = nullptr;
     AVCodecContext* codec_ = nullptr;
     AVFrame* decoded_ = nullptr;
     AVFrame* yuv_ = nullptr;
     AVPacket* pkt_ = nullptr;
+    AVPacket** probe_pkts_ = nullptr;
+    unsigned probe_pkt_count_ = 0;
+    unsigned probe_pkt_pos_ = 0;
     SwsContext* sws_ = nullptr;
     std::string url_;
     int video_index_ = -1;
