@@ -107,7 +107,11 @@ CommandOutcome executeCommand(StreamManager& streams, bool& playing, const std::
             return fail(command, id, "url must be http:// or https://");
         }
         const size_t before = streams.list().size();
-        if (!streams.addStream(id, url)) {
+        AddFailure why = AddFailure::None;
+        if (!streams.addStream(id, url, &why)) {
+            if (why == AddFailure::Limit) {
+                return fail(command, id, "stream limit reached");
+            }
             return fail(command, id, "stream already exists");
         }
         CommandOutcome out;
@@ -159,8 +163,13 @@ CommandOutcome executeCommand(StreamManager& streams, bool& playing, const std::
             return out;
         }
         const std::string& layout = layoutField->second;
-        if (layout.empty() || !streams.setLayout(layout)) {
+        if (layout.empty()) {
             return fail(command, "", "layout must be a non-empty string");
+        }
+        if (!streams.setLayout(layout)) {
+            // Previous layout stays. publishStatus stays false, so the
+            // retained status is not replaced and the wall is not cleared.
+            return fail(command, "", "invalid layout");
         }
         CommandOutcome out;
         out.ok = true;

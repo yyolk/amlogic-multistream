@@ -9,6 +9,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -47,6 +48,11 @@ void check(bool cond, const char* expr, int line) {
 #define CHECK(cond) check(static_cast<bool>(cond), #cond, __LINE__)
 
 constexpr int kSkip = 77;
+
+bool decoderTestsRequired() {
+    const char* value = std::getenv("AMS_REQUIRE_DECODER_TESTS");
+    return value != nullptr && std::string(value) == "1";
+}
 constexpr int kWidth = 160;
 constexpr int kHeight = 120;
 
@@ -636,6 +642,11 @@ int main() {
                 return 1;
             }
             std::cout << "HLS fixture skipped: libx264 encoder not available\n";
+        }
+
+        if (decoderTestsRequired() && !hls_decoded) {
+            std::cerr << "HLS coverage required (AMS_REQUIRE_DECODER_TESTS=1) but it did not run\n";
+            return 1;
         }
 
         if (g_failures != 0) {

@@ -192,6 +192,9 @@ int StreamPlayer::tick(bool playing) {
         (setting.empty() || setting == "auto") ? std::string() : setting;
     const LayoutEngine::Result layout = LayoutEngine::compute(
         width_, height_, static_cast<int>(streams.size()), overrideLayout);
+    // setLayout only stores "auto" or a name parseLayout accepts, so MQTT
+    // cannot reach this branch. It still clears the wall if a setting
+    // compute() cannot parse is already stored.
     if (!layout.ok) {
         if (!layoutErrorLogged_) {
             std::cerr << "StreamPlayer: layout '" << setting << "' rejected";

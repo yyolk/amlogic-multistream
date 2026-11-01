@@ -85,7 +85,12 @@ jobs:
             patchelf \
             pkg-config
 
+      # The install step above provides libav*, libmosquitto, libdrm, and the
+      # ffmpeg CLI. AMS_REQUIRE_DECODER_TESTS makes a green run that never
+      # executed ffmpeg_decoder, present_smoke, or stream_player_http fail.
       - name: Run unit tests
+        env:
+          AMS_REQUIRE_DECODER_TESTS: "1"
         run: ./scripts/run-tests.sh
 
       - name: Build AppImage

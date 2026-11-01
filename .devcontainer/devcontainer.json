@@ -6,7 +6,8 @@
   "remoteUser": "vscode",
   "containerEnv": {
     "CC": "gcc",
-    "CXX": "g++"
+    "CXX": "g++",
+    "AMS_REQUIRE_DECODER_TESTS": "1"
   },
   // Leaves build/ configured so `ctest --test-dir build --output-on-failure` works.
   "postCreateCommand": "bash scripts/run-tests.sh",
