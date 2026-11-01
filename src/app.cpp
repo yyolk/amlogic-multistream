@@ -1,12 +1,16 @@
 #include "app.h"
 
+#include "drm_renderer.h"
 #include "ffmpeg_decoder.h"
+#include "layout_engine.h"
 #include "mqtt_controller.h"
+#include "software_renderer.h"
 #include "stream_manager.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -19,22 +23,36 @@ const char* programName(int argc, char* argv[]) {
     return "amlogic-multistream";
 }
 
+enum class PresenterKind { Software, Drm };
+
 void printDecodeUsage(const char* argv0) {
     std::cerr
         << "Usage:\n"
         << "  " << argv0 << " [--mqtt-host HOST ...]\n"
         << "      Connect to MQTT and run until SIGINT/SIGTERM. See docs/mqtt.md.\n"
         << "  " << argv0 << " --url <hls-or-media-url> [--frames N]\n"
-        << "      Software-decode one HLS, HTTP, or file URL and print N frames\n"
-        << "      (default 5). MQTT is not started. DRM present is skipped.\n";
+        << "      [--renderer software|drm] [--render-dir DIR]\n"
+        << "      Software-decode one HLS, HTTP, or file URL and present N frames\n"
+        << "      (default 5). MQTT is not started.\n"
+        << "      The default renderer is software: an RGB buffer, optional PPM\n"
+        << "      files in DIR, and no /dev/dri. --renderer drm requires\n"
+        << "      GS-King X / CoreELEC and a build with -DAMLOGIC_DRM_KMS=ON.\n";
 }
 
-// Decode mode is selected only when --url is present. Other arguments are
+// Decode mode is selected when a decode flag is present. Other arguments are
 // left for MqttController::start(), which owns --help and the --mqtt-* flags.
-bool parseDecodeArgs(int argc, char* argv[], std::string& url, int& frames, bool& help) {
+bool parseDecodeArgs(int argc,
+                     char* argv[],
+                     std::string& url,
+                     int& frames,
+                     std::string& renderDir,
+                     PresenterKind& presenter,
+                     bool& help) {
     frames = 5;
     help = false;
+    presenter = PresenterKind::Software;
     bool frames_set = false;
+    bool presenter_set = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i] != nullptr ? argv[i] : "";
         if (arg == "--help" || arg == "-h") {
@@ -65,11 +83,46 @@ bool parseDecodeArgs(int argc, char* argv[], std::string& url, int& frames, bool
             }
             continue;
         }
+        if (arg == "--render-dir") {
+            if (i + 1 >= argc || argv[i + 1] == nullptr) {
+                return false;
+            }
+            renderDir = argv[++i];
+            if (renderDir.empty()) {
+                std::cerr << "--render-dir requires a directory\n";
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--renderer") {
+            if (i + 1 >= argc || argv[i + 1] == nullptr) {
+                return false;
+            }
+            const std::string value = argv[++i];
+            if (value == "software") {
+                presenter = PresenterKind::Software;
+            } else if (value == "drm") {
+                presenter = PresenterKind::Drm;
+            } else {
+                std::cerr << "Unknown renderer '" << value << "' (expected software or drm)\n";
+                return false;
+            }
+            presenter_set = true;
+            continue;
+        }
         std::cerr << "Unexpected argument in --url mode: " << arg << "\n";
+        return false;
+    }
+    if (presenter == PresenterKind::Drm && !renderDir.empty()) {
+        std::cerr << "--render-dir is only valid with --renderer software\n";
         return false;
     }
     if (frames_set && url.empty() && !help) {
         std::cerr << "--frames requires --url\n";
+        return false;
+    }
+    if ((presenter_set || !renderDir.empty()) && url.empty() && !help) {
+        std::cerr << "renderer flags require --url\n";
         return false;
     }
     return true;
@@ -77,10 +130,11 @@ bool parseDecodeArgs(int argc, char* argv[], std::string& url, int& frames, bool
 
 bool wantsDecodeMode(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
-        if (argv[i] != nullptr && std::string(argv[i]) == "--url") {
-            return true;
+        if (argv[i] == nullptr) {
+            continue;
         }
-        if (argv[i] != nullptr && std::string(argv[i]) == "--frames") {
+        const std::string arg = argv[i];
+        if (arg == "--url" || arg == "--frames" || arg == "--render-dir" || arg == "--renderer") {
             return true;
         }
     }
@@ -115,10 +169,11 @@ bool frameLooksComplete(const DecodedFrame& frame) {
            frame.linesize[2] >= chroma_w;
 }
 
-// Single-stream software decode. DrmRenderer::present() is not called: it
-// does not consume DecodedFrame yet, and opening a DRM device belongs to
-// that workstream. MQTT is not started on this path.
-int decodeUrl(const std::string& url, int frames) {
+// Single-stream software decode, then one Renderer::present() per frame.
+// The default presenter is SoftwareRenderer, which does not open /dev/dri.
+// DrmRenderer is selected only with --renderer drm and requires GS-King X /
+// CoreELEC. MQTT is not started on this path.
+int decodeUrl(const std::string& url, int frames, PresenterKind presenter, const std::string& renderDir) {
     std::cout << "Software decode isHardware=0 url=" << url << "\n";
     FfmpegDecoder decoder;
     if (!decoder.open(url)) {
@@ -130,7 +185,21 @@ int decodeUrl(const std::string& url, int frames) {
         return 1;
     }
 
+    std::unique_ptr<Renderer> renderer;
+    SoftwareRenderer* software = nullptr;
+    if (presenter == PresenterKind::Drm) {
+        std::cout << "Presenter drm requires GS-King X / CoreELEC\n";
+        renderer = std::make_unique<DrmRenderer>();
+    } else {
+        auto owned = std::make_unique<SoftwareRenderer>(renderDir);
+        software = owned.get();
+        renderer = std::move(owned);
+        std::cout << "Presenter software (no /dev/dri)\n";
+    }
+
     DecodedFrame frame;
+    LayoutEngine::Rect tile;
+    bool rendererReady = false;
     int got = 0;
     for (int i = 0; i < frames; ++i) {
         if (!decoder.readFrame(frame)) {
@@ -138,6 +207,7 @@ int decodeUrl(const std::string& url, int frames) {
         }
         if (!frameLooksComplete(frame)) {
             std::cerr << "Decoded frame " << i << " is incomplete\n";
+            renderer->shutdown();
             decoder.close();
             return 1;
         }
@@ -150,8 +220,43 @@ int decodeUrl(const std::string& url, int frames) {
         }
         std::cout << " tb=" << frame.time_base_num << "/" << frame.time_base_den
                   << " ysum=" << sampleChecksum(frame) << "\n";
+
+        if (!rendererReady) {
+            if (!renderer->init(frame.width, frame.height)) {
+                renderer->shutdown();
+                decoder.close();
+                return 1;
+            }
+            const LayoutEngine::Result layout = LayoutEngine::compute(frame.width, frame.height, 1);
+            if (!layout.ok || layout.tiles.size() != 1) {
+                std::cerr << "LayoutEngine failed for one stream\n";
+                renderer->shutdown();
+                decoder.close();
+                return 1;
+            }
+            tile = layout.tiles[0].rect;
+            rendererReady = true;
+            std::cout << "layout " << layout.name << " tile " << tile.x << "," << tile.y << "+"
+                      << tile.width << "x" << tile.height << "\n";
+        }
+        if (!renderer->present(frame, tile)) {
+            std::cerr << "present failed for frame " << got << "\n";
+            renderer->shutdown();
+            decoder.close();
+            return 1;
+        }
+        std::cout << "presented " << got << " tile=" << tile.x << "," << tile.y << "+" << tile.width
+                  << "x" << tile.height;
+        if (software != nullptr) {
+            std::cout << " rgbsum=" << software->checksum();
+            if (!software->lastPpmPath().empty()) {
+                std::cout << " ppm=" << software->lastPpmPath();
+            }
+        }
+        std::cout << "\n";
         ++got;
     }
+    renderer->shutdown();
     decoder.close();
     if (got < 1) {
         std::cerr << "Opened but decoded 0 frames from " << url << "\n";
@@ -167,8 +272,10 @@ int App::run(int argc, char* argv[]) {
     if (wantsDecodeMode(argc, argv)) {
         std::string url;
         int frames = 5;
+        std::string renderDir;
+        PresenterKind presenter = PresenterKind::Software;
         bool help = false;
-        if (!parseDecodeArgs(argc, argv, url, frames, help)) {
+        if (!parseDecodeArgs(argc, argv, url, frames, renderDir, presenter, help)) {
             printDecodeUsage(programName(argc, argv));
             return 2;
         }
@@ -181,7 +288,7 @@ int App::run(int argc, char* argv[]) {
             printDecodeUsage(programName(argc, argv));
             return 2;
         }
-        return decodeUrl(url, frames);
+        return decodeUrl(url, frames, presenter, renderDir);
     }
 
     std::cout << "App::run\n";

@@ -129,6 +129,20 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
 
     target_compile_options(amlogic-multistream PRIVATE ${FFMPEG_CFLAGS_OTHER} ${MOSQUITTO_CFLAGS_OTHER})
 
+    # Runs the player against a local fixture. Skips when the ffmpeg CLI is
+    # missing. Does not need /dev/dri; --renderer drm is expected to fail.
+    add_executable(present_smoke_test tests/present_smoke_test.cpp)
+    target_compile_options(present_smoke_test PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_definitions(present_smoke_test PRIVATE
+        "PLAYER_BIN=\"$<TARGET_FILE:amlogic-multistream>\""
+    )
+    if(FFMPEG_CLI)
+        target_compile_definitions(present_smoke_test PRIVATE "FFMPEG_CLI=\"${FFMPEG_CLI}\"")
+    else()
+        target_compile_definitions(present_smoke_test PRIVATE "FFMPEG_CLI=\"\"")
+    endif()
+    add_test(NAME present_smoke COMMAND present_smoke_test)
+    set_tests_properties(present_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 else()
     message(STATUS
         "Skipping amlogic-multistream player: need libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm")
