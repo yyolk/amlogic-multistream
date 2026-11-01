@@ -7,10 +7,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -160,6 +162,246 @@ int pump(StreamPlayer& player, int minPresented, int timeoutMs = 2000) {
         return last >= minPresented;
     }, timeoutMs);
     return last;
+}
+
+// SURVIVING4 T1: getaddrinfo ignores abort. This open() sleeps through
+// abort() the same way. remove/stop/restart/layout-hide must keep presenting
+// the other tile, and process exit must not sit out the sleep.
+struct StallGate {
+    std::atomic<int> entered{0};
+    std::atomic<int> aborts{0};
+    std::atomic<bool> release{false};
+    std::chrono::milliseconds blockFor{1200};
+};
+
+class StallingDecoder : public DecoderBackend {
+public:
+    explicit StallingDecoder(std::shared_ptr<StallGate> gate) : gate_(std::move(gate)) {
+        y_.assign(16 * 16, 235);
+        u_.assign(8 * 8, 128);
+        v_.assign(8 * 8, 128);
+    }
+
+    bool open(const std::string& url) override {
+        if (url.find("stall") == std::string::npos) {
+            opened_ = true;
+            return true;
+        }
+        gate_->entered.fetch_add(1);
+        const auto until = std::chrono::steady_clock::now() + gate_->blockFor;
+        while (std::chrono::steady_clock::now() < until && !gate_->release.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+
+    void close() override { opened_ = false; }
+
+    bool isHardware() const override { return false; }
+
+    void abort() override { gate_->aborts.fetch_add(1); }
+
+    bool readFrame(DecodedFrame& frame) override {
+        if (!opened_) {
+            return false;
+        }
+        frame = DecodedFrame{};
+        frame.format = FramePixelFormat::Yuv420p;
+        frame.width = 16;
+        frame.height = 16;
+        frame.data[0] = y_.data();
+        frame.data[1] = u_.data();
+        frame.data[2] = v_.data();
+        frame.linesize[0] = 16;
+        frame.linesize[1] = 8;
+        frame.linesize[2] = 8;
+        return true;
+    }
+
+private:
+    std::shared_ptr<StallGate> gate_;
+    bool opened_ = false;
+    std::vector<uint8_t> y_;
+    std::vector<uint8_t> u_;
+    std::vector<uint8_t> v_;
+};
+
+struct TickSample {
+    int presents = 0;
+    int maxTickMs = 0;
+    int ticks = 0;
+};
+
+TickSample samplePlaying(StreamPlayer& player, int windowMs, int tickBoundMs) {
+    TickSample sample;
+    const auto start = std::chrono::steady_clock::now();
+    const auto window = std::chrono::milliseconds(windowMs);
+    while (std::chrono::steady_clock::now() - start < window) {
+        const auto tickStart = std::chrono::steady_clock::now();
+        sample.presents += player.tick(true);
+        const int tickMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 std::chrono::steady_clock::now() - tickStart)
+                                                 .count());
+        if (tickMs > sample.maxTickMs) {
+            sample.maxTickMs = tickMs;
+        }
+        ++sample.ticks;
+        if (tickMs >= tickBoundMs) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return sample;
+}
+
+void checkSample(const TickSample& sample, int tickBoundMs, const char* what) {
+    CHECK(sample.maxTickMs < tickBoundMs);
+    CHECK(sample.presents >= 5);
+    CHECK(sample.ticks >= 5);
+    if (sample.maxTickMs >= tickBoundMs || sample.presents < 5) {
+        std::cerr << "slow present during " << what << " maxTickMs=" << sample.maxTickMs
+                  << " presents=" << sample.presents << " ticks=" << sample.ticks << "\n";
+    }
+}
+
+// Child process: closeAll + exitIfBusy must _exit(0) while open() is still
+// asleep. Returns only if that did not happen.
+[[noreturn]] void stuckExitChild() {
+    auto gate = std::make_shared<StallGate>();
+    gate->blockFor = std::chrono::milliseconds(5000);
+    StreamManager streams;
+    SoftwareRenderer renderer;
+    StreamPlayer player(
+        streams, renderer,
+        [gate]() -> std::unique_ptr<DecoderBackend> { return std::make_unique<StallingDecoder>(gate); },
+        32, 16);
+    if (!player.init()) {
+        _exit(4);
+    }
+    if (!streams.addStream("left", "http://example/left.ts") ||
+        !streams.addStream("stall", "http://example/stall.ts")) {
+        _exit(5);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    while (gate->entered.load() < 1 &&
+           std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
+        player.tick(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (gate->entered.load() < 1) {
+        _exit(3);
+    }
+    player.closeAll();
+    player.exitIfBusy(std::chrono::milliseconds(150));
+    _exit(2);
+}
+
+void testUninterruptibleOpen() {
+    constexpr int kTickBoundMs = 250;
+    constexpr int kWindowMs = 300;
+
+    auto gate = std::make_shared<StallGate>();
+    StreamManager streams;
+    SoftwareRenderer renderer;
+    StreamPlayer player(
+        streams, renderer,
+        [gate]() -> std::unique_ptr<DecoderBackend> { return std::make_unique<StallingDecoder>(gate); },
+        32, 16);
+    struct ReleaseGate {
+        std::shared_ptr<StallGate> gate;
+        ~ReleaseGate() {
+            if (gate) {
+                gate->release.store(true);
+            }
+        }
+    } release{gate};
+
+    CHECK(player.init());
+    CHECK(streams.addStream("left", "http://example/left.ts"));
+    CHECK(streams.addStream("stall", "http://example/stall.ts"));
+    CHECK(until([&] {
+        player.tick(true);
+        return renderer.framesPresented() >= 1 && gate->entered.load() >= 1;
+    }));
+    CHECK(gate->entered.load() >= 1);
+
+    const int presentedBeforeRemove = renderer.framesPresented();
+    CHECK(streams.removeStream("stall"));
+    const TickSample removed = samplePlaying(player, kWindowMs, kTickBoundMs);
+    checkSample(removed, kTickBoundMs, "remove");
+    CHECK(renderer.framesPresented() > presentedBeforeRemove);
+    CHECK(gate->aborts.load() >= 1);
+    CHECK(!gate->release.load());
+
+    CHECK(streams.addStream("stall", "http://example/stall.ts"));
+    const int enteredBeforeRestart = gate->entered.load();
+    CHECK(until([&] {
+        player.tick(true);
+        return gate->entered.load() > enteredBeforeRestart;
+    }));
+    const int abortsBeforeRestart = gate->aborts.load();
+    CHECK(streams.restartStream("stall"));
+    checkSample(samplePlaying(player, kWindowMs, kTickBoundMs), kTickBoundMs, "restart");
+    CHECK(gate->aborts.load() > abortsBeforeRestart);
+
+    CHECK(streams.setLayout("1x1"));
+    checkSample(samplePlaying(player, kWindowMs, kTickBoundMs), kTickBoundMs, "layout hide");
+
+    const auto stopStart = std::chrono::steady_clock::now();
+    CHECK(player.tick(false) == 0);
+    const int stopMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - stopStart)
+                                             .count());
+    CHECK(stopMs < kTickBoundMs);
+    CHECK(allZero(renderer));
+    if (stopMs >= kTickBoundMs) {
+        std::cerr << "stop blocked for " << stopMs << " ms\n";
+    }
+
+    const int presentedBeforeResume = renderer.framesPresented();
+    CHECK(until([&] {
+        player.tick(true);
+        return renderer.framesPresented() > presentedBeforeResume;
+    }));
+    checkSample(samplePlaying(player, kWindowMs, kTickBoundMs), kTickBoundMs, "resume after stop");
+
+    gate->release.store(true);
+    const bool drained = player.drain(std::chrono::milliseconds(2000));
+    CHECK(drained);
+    // exitIfBusy _exit(0)s when a worker is still blocked. Only call it after
+    // the sleep has been released, so a failed drain cannot hide check failures.
+    if (drained) {
+        player.exitIfBusy(std::chrono::milliseconds(200));
+    }
+
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        stuckExitChild();
+    }
+    if (pid > 0) {
+        int status = 0;
+        bool exited = false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const pid_t got = waitpid(pid, &status, WNOHANG);
+            if (got == pid) {
+                exited = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!exited) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+        }
+        CHECK(exited);
+        CHECK(WIFEXITED(status));
+        CHECK(WEXITSTATUS(status) == 0);
+        if (!exited || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            std::cerr << "stuck open did not _exit promptly status=" << status << "\n";
+        }
+    }
 }
 
 }  // namespace
@@ -395,6 +637,8 @@ int main() {
         CHECK(harness.renderer.framesPresented() == presented);
         CHECK(allZero(harness.renderer));
     }
+
+    testUninterruptibleOpen();
 
     if (g_failed != 0) {
         std::cerr << g_failed << " check(s) failed\n";
