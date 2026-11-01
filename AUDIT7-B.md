@@ -258,3 +258,57 @@ absent. On this VM the daemon was installed and the test ran.
 - **Reaper ceiling.** Unchanged: a start requires fewer than 9 busy retired
   workers and the table holds at most 9 live sessions, so the running decode
   threads stay at or under 17. The churn test still stops at 9 stuck opens.
+
+---
+
+## CROSSCHECK-B
+
+Peer: [AUDIT7.md](https://github.com/yyolk/amlogic-multistream/pull/50) on
+draft [#50](https://github.com/yyolk/amlogic-multistream/pull/50), audited
+`main` @ `25bfa8d`. This file was written against `c597b16`. `git diff
+c597b16..25bfa8d` has no production changes (audit write-ups and
+`docs/research/` only), so the host-side code is the same tree. Nothing
+below is a fix.
+
+The N5 paragraph above stands as the first-pass rating. This section revises
+it.
+
+### Their findings
+
+| ID | Their rating | This pass | Reason |
+| --- | --- | --- | --- |
+| **B1** | should-fix | **Agree, should-fix.** Same defect as N5. Revise N5 from nit to should-fix | Both runs saw SIGTERM before `MQTT running` arm the empty startup will and replace a seeded retained status, with no `MQTT status` line. Their 40-launch sample is 29 kept / 3 replaced / 8 already in `finishProcess`, and all 3 replacements were the 30 ms delay (3 of 4). My 20 ms localhost run is one of those replacements. Not must-fix: `online` stays false, the exit is a few milliseconds, and a signal after `MQTT running` publishes the same empty object |
+| **B2** | should-fix | **Agree, should-fix.** I missed it | `[repro]` on `c597b16`: `--url http://127.0.0.1:8766/file_seg.m3u8` whose only segment is `file:///tmp/audit7b-secret.mp4` exits **rc 0, `codec=mpeg4`**. The same URL with `setAllowLocalFile(false)` is rejected (`Protocol 'file' not on whitelist`). `decodeUrl` sets the flag for every `--url` (`src/app.cpp:181-183`), including `http://`. `docs/mqtt.md` says `file` is only for the `--url` local-file path. Not must-fix: MQTT `add` never sets the flag, and a 302 to `file://` still fails |
+
+No other findings. Their carried-nit list is N2, N3, N4, F4, F5, F6, F7.
+
+**Refine B1's fix, and drop mine.** Re-checking `connectReady` and then
+calling `finishProcess` does not keep the previous status: the new process's
+table is empty, so the explicit offline publish wipes the sentinel too. The
+preserving fix is to leave `getaddrinfo` on the helper and not call
+`mosquitto_connect_async` until the main thread has committed to
+`loop_start`. A signal before that call still `_exit`s, and CONNECT has not
+been written. Rewording the "has not published yet" sentence without moving
+CONNECT leaves the window in place.
+
+### My findings
+
+| ID | First pass | Peer | After this pass |
+| --- | --- | --- | --- |
+| **N5** | nit | Filed as **B1**, should-fix. Not missed | **Revise to should-fix.** Same item as B1. The first-pass comparison to `finishProcess` was the wrong exit: the pre-loop `_exit` is supposed to leave the broker alone, and the lookup path does |
+| **N2** | nit | Kept nit. Blackhole from launch **516 ms** (my 515 ms) | **Keep nit** |
+| **N3** | nit | Kept nit. Healthy `add` under a full cap waited **6.95 s**. `restart` of an already-open tile was not re-timed; it uses the same `continue` | **Keep nit** |
+| **N4** | nit | Kept nit. Same header lines | **Keep nit** |
+| **F4** | nit | Kept nit. Re-add opened **5.61 s** later (remainder of their 10 s stall; AUDIT6 was 8.58 s) | **Keep nit** |
+| **F5** | nit | Kept nit, and confirmed it on the MQTT path as well as `--url` | **Keep nit.** Not B2: the cover is an allowed `http`/`mov`/`mjpeg` open, not a `file` segment |
+| **F6** | nit | Kept nit | **Keep nit** |
+| **F7** | nit | Kept nit. Notes `mqtt_exit_test` is now also the N1 guard | **Keep nit** |
+
+### Agreed survivors
+
+No must-fix. Both passes keep two should-fix items:
+
+| ID | Severity | Summary |
+| --- | --- | --- |
+| **B1** (N5) | should-fix | SIGTERM in the ~20 ms after the startup helper has written CONNECT, and before `MQTT running`, `_exit`s without DISCONNECT. The broker publishes the empty startup will and drops the previous retained status. Delay CONNECT until the main thread commits to `loop_start`. |
+| **B2** | should-fix | `--url http://…` turns on the `file` protocol allowlist, so a playlist segment of `file:///…` decodes a local file. MQTT `add` of that URL does not. Set the flag only for a non-HTTP `--url`. |
