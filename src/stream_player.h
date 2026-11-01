@@ -20,14 +20,21 @@
 // talk to MQTT. Each visible stream is opened and decoded on its own thread.
 // tick() presents at most one frame that thread has already produced and
 // does not wait on socket I/O, so one stalled or live-edge read cannot
-// freeze the other tiles. stop, remove, restart, and shutdown call
-// DecoderBackend::abort() so a blocked open or read returns, then join
-// that thread.
+// freeze the other tiles.
+//
+// stop, remove, restart, a layout cell that hides a tile, and shutdown call
+// DecoderBackend::abort() and move that worker onto a reaper list. tick()
+// joins a worker only after its loop has returned. It never joins an
+// in-flight open or read. FFmpeg's getaddrinfo ignores AVIOInterruptCB, so
+// abort() does not unblock a stuck lookup; that worker stays on the reaper
+// until the libc call returns. Process exit publishes offline status first,
+// waits kExitJoinDeadline, then flushes and _exit(0) if a worker is still
+// inside that call.
 //
 // Only http:// and https:// URLs are opened. A local file URL never reaches
 // the factory, and a backend that reports isHardware() is closed.
-// restartGeneration on a stream closes and reopens that decoder.
-// playing == false closes every decoder and clears the viewport.
+// restartGeneration on a stream retires that decoder and opens another.
+// playing == false retires every decoder and clears the viewport.
 class StreamPlayer {
 public:
     static constexpr int kDefaultViewportWidth = 1280;
@@ -55,8 +62,23 @@ public:
     // this call; it does not mean the decoders are stopped.
     int tick(bool playing);
 
-    // Abort and join every decoder thread. Safe to call more than once.
+    // Abort every decoder and move it onto the reaper. Does not join a worker
+    // whose loop has not returned. Safe to call more than once.
     void closeAll();
+
+    // Join workers already on the reaper. Wait up to deadline for any whose
+    // loop has not returned. False means one is still inside open or read.
+    // Sessions still in the map are left alone; call closeAll() first.
+    bool drain(std::chrono::milliseconds deadline);
+
+    // drain(). If a worker is still blocked, flush stdio and _exit(0).
+    // Call this on process exit after the offline status has been published.
+    void exitIfBusy(std::chrono::milliseconds deadline);
+
+    // Shorter than scripts/launch-coreelec.sh's 10s SIGTERM poll. A glibc
+    // resolver stall is about 10s per nameserver, so waiting that poll out
+    // is what turns into SIGKILL.
+    static constexpr std::chrono::milliseconds kExitJoinDeadline{2000};
 
     bool ready() const { return ready_; }
 
@@ -91,38 +113,55 @@ private:
 
     enum class WorkerFail { None, Open, Read, Hardware };
 
-    struct Session {
-        Session() = default;
-        ~Session();
-        Session(const Session&) = delete;
-        Session& operator=(const Session&) = delete;
+    // One decode thread. The object stays put for the life of the thread:
+    // the thread holds a raw pointer, and the unique_ptr that owns it moves
+    // from the session onto the reaper.
+    struct Worker {
+        std::string id;
+        std::unique_ptr<DecoderBackend> decoder;
+        std::thread thread;
+        std::mutex mu;
+        std::condition_variable cv;
+        bool stop = false;
+        // Set only after sessionLoop has returned, on every path.
+        bool done = false;
+        bool announcedOpen = false;
+        bool frameReady = false;
+        WorkerFail failed = WorkerFail::None;
+        OwnedFrame frame;
 
+        ~Worker() {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+
+        Worker() = default;
+        Worker(const Worker&) = delete;
+        Worker& operator=(const Worker&) = delete;
+    };
+
+    // Bookkeeping that stays with the stream id across decoder restarts.
+    // The worker is null once it has been retired.
+    struct Session {
         std::string url;
         uint64_t appliedGeneration = 0;
         bool haveGeneration = false;
-        std::unique_ptr<DecoderBackend> decoder;
         bool backoff = false;
         bool loggedRefusal = false;
         int framesPresented = 0;
         std::chrono::steady_clock::time_point retryAfter{};
-
-        std::thread worker;
-        std::mutex mu;
-        std::condition_variable cv;
-        bool workerStop = false;
-        bool workerRunning = false;
-        bool announcedOpen = false;
-        bool frameReady = false;
-        WorkerFail workerFailed = WorkerFail::None;
-        OwnedFrame frame;
+        std::unique_ptr<Worker> worker;
     };
 
     static bool urlAllowed(const std::string& url);
     static bool copyOwned(const DecodedFrame& src, OwnedFrame& dst);
-    void requestStop(Session& session);
-    void finishWorker(const std::string& id, Session& session);
+    void requestStop(Worker& worker);
+    void retireWorker(Session& session);
+    void reapFinished();
+    void releaseDecoder(Worker& worker);
     void startWorker(const StreamInfo& info, Session& session);
-    void sessionLoop(Session* session, std::string id, std::string url);
+    void sessionLoop(Worker* worker, const std::string& id, const std::string& url);
     void dropMissing(const std::vector<StreamInfo>& streams);
     static std::string topologyKey(const LayoutEngine::Result& layout,
                                    const std::vector<StreamInfo>& streams);
@@ -137,4 +176,5 @@ private:
     bool layoutErrorLogged_ = false;
     std::string topology_;
     std::unordered_map<std::string, std::unique_ptr<Session>> sessions_;
+    std::vector<std::unique_ptr<Worker>> reaper_;
 };

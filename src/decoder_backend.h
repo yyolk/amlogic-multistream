@@ -42,8 +42,9 @@ struct DecodedFrame {
 // different thread may call it while open() or readFrame() is blocked in
 // I/O. abort() latches for the life of the object. The in-flight open() or
 // readFrame() then returns, and a later open() or readFrame() fails without
-// blocking. close() still runs on the decode thread, after that call has
-// returned.
+// blocking. close() runs after that call has returned, on the thread that
+// owns the session. A libc call that ignores abort(), such as getaddrinfo
+// inside FFmpeg's TCP open, does not return until the call itself finishes.
 class DecoderBackend {
 public:
     virtual ~DecoderBackend() = default;

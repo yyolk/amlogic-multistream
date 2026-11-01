@@ -421,7 +421,13 @@ Sample sampleTicks(StreamPlayer& player, std::chrono::milliseconds window) {
 
 int shutdownMs(StreamPlayer& player) {
     const auto start = std::chrono::steady_clock::now();
+    // Stop must return without joining an in-flight open. drain() then waits
+    // only until abort() has unblocked the worker, which a socket stall does
+    // and a stuck getaddrinfo does not.
     player.tick(false);
+    if (!player.drain(std::chrono::milliseconds(kShutdownBoundMs))) {
+        return kShutdownBoundMs + 1;
+    }
     return static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
             .count());
