@@ -165,6 +165,8 @@ Put a 32-bit ARM build at `/storage/amlogic-multistream` before running it. The 
 
 `kodi-addon/plugin.program.amlogic-multistream/` is a Kodi launcher add-on. It **requires GS-King X / CoreELEC** to run. Its **Launch** entry starts the bundled copy of `scripts/launch-coreelec.sh` as a transient systemd unit (`systemd-run --unit=amlogic-multistream-launch`). The unit lets the script survive its own `systemctl stop kodi`, run the player, and start Kodi again. To return to Kodi early, run `systemctl stop amlogic-multistream-launch`.
 
+**The add-on does not bundle or download the player AppImage/binary; it is only a thin `systemd-run` launcher, so you must install `PLAYER_BIN` separately** (see [The player binary is not included](docs/kodi-addon.md#the-player-binary-is-not-included), tracking issue [#14](https://github.com/yyolk/amlogic-multistream/issues/14)).
+
 ```bash
 ./scripts/package-kodi-addon.sh                       # dist/plugin.program.amlogic-multistream-<version>.zip
 ./scripts/install-kodi-addon.sh --host root@coreelec  # or Kodi: Add-ons → Install from zip file
