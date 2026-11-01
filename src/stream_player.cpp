@@ -61,8 +61,10 @@ StreamPlayer::StreamPlayer(StreamManager& streams,
 
 StreamPlayer::~StreamPlayer() {
     closeAll();
-    // A worker still inside getaddrinfo cannot be joined here. Process exit
-    // calls exitIfBusy() and _exit(0) before this destructor runs.
+    // A worker still inside getaddrinfo cannot be joined here. Signal exit,
+    // a failed sigtimedwait, and authentication give-up all call exitIfBusy()
+    // and _exit before this destructor runs. The joins below only see workers
+    // that have already returned.
     for (auto& worker : reaper_) {
         if (worker && worker->thread.joinable()) {
             worker->thread.join();
@@ -278,14 +280,14 @@ bool StreamPlayer::drain(std::chrono::milliseconds deadline) {
     }
 }
 
-void StreamPlayer::exitIfBusy(std::chrono::milliseconds deadline) {
+void StreamPlayer::exitIfBusy(std::chrono::milliseconds deadline, int exitCode) {
     if (drain(deadline)) {
         return;
     }
     std::cout.flush();
     std::cerr.flush();
     std::fflush(nullptr);
-    _exit(0);
+    _exit(exitCode);
 }
 
 void StreamPlayer::dropMissing(const std::vector<StreamInfo>& streams) {

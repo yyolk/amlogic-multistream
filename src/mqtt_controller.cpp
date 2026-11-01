@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -127,7 +128,8 @@ bool parseViewport(const std::string& text, int& width, int& height) {
 
 }  // namespace
 
-MqttController::MqttController(StreamManager& manager) : manager_(manager) {
+MqttController::MqttController(StreamManager& manager, DecoderFactory decoderFactory)
+    : manager_(manager), decoderFactory_(std::move(decoderFactory)) {
     static_assert(StreamPlayer::kDefaultViewportWidth == 1280, "MQTT default viewport width");
     static_assert(StreamPlayer::kDefaultViewportHeight == 720, "MQTT default viewport height");
     config_.viewportWidth = StreamPlayer::kDefaultViewportWidth;
@@ -150,10 +152,11 @@ int MqttController::start(int argc, char* argv[]) {
     }
 
     SoftwareRenderer renderer(config_.renderDir);
-    StreamPlayer player(
-        manager_, renderer,
-        []() -> std::unique_ptr<DecoderBackend> { return std::make_unique<FfmpegDecoder>(); },
-        config_.viewportWidth, config_.viewportHeight);
+    DecoderFactory factory = decoderFactory_;
+    if (!factory) {
+        factory = []() -> std::unique_ptr<DecoderBackend> { return std::make_unique<FfmpegDecoder>(); };
+    }
+    StreamPlayer player(manager_, renderer, std::move(factory), config_.viewportWidth, config_.viewportHeight);
     if (!player.init()) {
         std::cerr << "Software presenter init failed\n";
         return 1;
@@ -254,24 +257,33 @@ int MqttController::start(int argc, char* argv[]) {
               << config_.prefix << "/cmd/# . Waiting for SIGINT, SIGTERM, or SIGHUP.\n";
     std::cout << "This build does not start DRM/KMS or Amlogic hardware decode.\n";
 
-    // Abort, queue the offline status, then join. getaddrinfo ignores abort,
-    // so the publish has to be queued before the wait. exitIfBusy leaves
-    // with _exit(0) if a worker is still inside that call after the deadline,
-    // which is shorter than the launch script's SIGTERM poll.
-    auto finishProcess = [&]() {
+    // Abort, queue the offline status, then join up to the deadline.
+    // getaddrinfo ignores abort, so the publish is queued before the wait.
+    // Disconnect before _exit only when that publish was queued on a live
+    // connection (AUDIT4 A1 / R1). Otherwise mosquitto_loop_stop joins a
+    // reconnect stuck in getaddrinfo and the exit passes the launch script's
+    // 10s SIGTERM poll. exitCode is 0 for a signal and 1 for authentication
+    // give-up or a failed sigtimedwait, and it is applied inside this lambda
+    // so a later exitIfBusy cannot turn a 1 into 0 (AUDIT4 A2).
+    auto finishProcess = [&](int exitCode) {
         player.closeAll();
         const std::string statusTopic = config_.prefix + "/status";
         const std::string offline = buildStatusJson(false, playing_.load(), manager_.layout(),
                                                     manager_.layoutSetting(), manager_.list());
-        publishRaw(statusTopic, offline, true);
-        player.exitIfBusy(StreamPlayer::kExitJoinDeadline);
+        const bool sent = publishRaw(statusTopic, offline, true);
+        if (!player.drain(StreamPlayer::kExitJoinDeadline)) {
+            if (sent) {
+                shutdown();
+            }
+            player.exitIfBusy(std::chrono::milliseconds(0), exitCode);
+        }
     };
 
     while (true) {
         if (authGiveUp_.load()) {
             std::cerr << "MQTT authentication failed after " << authRejects_.load()
                       << " attempts; exiting\n";
-            player.closeAll();
+            finishProcess(1);
             shutdown();
             return 1;
         }
@@ -288,13 +300,13 @@ int MqttController::start(int argc, char* argv[]) {
         }
         if (sig < 0 && errno != EAGAIN && errno != EINTR) {
             std::cerr << "sigtimedwait failed: " << std::strerror(errno) << "\n";
-            finishProcess();
+            finishProcess(1);
             shutdown();
             return 1;
         }
     }
 
-    finishProcess();
+    finishProcess(0);
     shutdown();
     return 0;
 }
@@ -409,7 +421,7 @@ void MqttController::printUsage() const {
         << "SIGINT, SIGTERM, or SIGHUP. If the broker is down it retries with backoff\n"
         << "from 1s to 30s. A CONNACK of not authorised or bad user name or password\n"
         << "exits non-zero after three attempts. Broker I/O runs on a background thread.\n"
-        << "start/play opens decoders and presents; stop closes them. restart with an id\n"
+        << "start/play opens decoders and presents; stop retires them. restart with an id\n"
         << "reopens that decoder. An unknown id does not restart other streams.\n"
         << "Software mode does not drive a display. DRM/KMS and Amlogic hardware\n"
         << "decode are not started, so nothing is shown until a DRM backend exists.\n"
@@ -491,21 +503,22 @@ bool MqttController::refreshWill(bool fatal) {
     return true;
 }
 
-void MqttController::publishRaw(const std::string& topic, const std::string& payload, bool retain) {
+bool MqttController::publishRaw(const std::string& topic, const std::string& payload, bool retain) {
     if (!mosq_) {
-        return;
+        return false;
     }
     const int rc = mosquitto_publish(mosq_, nullptr, topic.c_str(), static_cast<int>(payload.size()),
                                      payload.data(), 1, retain);
     if (rc != MOSQ_ERR_SUCCESS) {
         std::cerr << "MQTT publish failed (" << topic << "): " << mosquitto_strerror(rc) << "\n";
-        return;
+        return false;
     }
     // One insertion so the line is flushed (stdout is unit-buffered). A
     // later SIGKILL still leaves this last retained payload in the log.
     if (retain) {
         std::cout << "MQTT status " + payload + "\n";
     }
+    return true;
 }
 
 void MqttController::shutdown() {
