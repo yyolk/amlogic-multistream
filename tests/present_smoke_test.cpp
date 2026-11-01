@@ -394,6 +394,127 @@ int main() {
             }
         }
 
+        // AUDIT10 D2: a PSI-less 12000x12000 H.264 TS creates its stream
+        // during find_stream_info. Probe max_pixels must still apply.
+        {
+            const std::filesystem::path hugeTs = tmp.path() / "huge.ts";
+            const std::filesystem::path hugePsi = tmp.path() / "huge-psiless.ts";
+            const int genHugeTs = run({ffmpegBinary(), "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                                       "color=c=red:s=12000x12000:d=0.04", "-frames:v", "1", "-c:v",
+                                       "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+                                       "-crf", "51", "-pix_fmt", "yuv420p", "-f", "mpegts",
+                                       hugeTs.string()},
+                                      empty, log);
+            if (genHugeTs != 0) {
+                std::cerr << "failed to generate 12000x12000 mpegts fixture (exit " << genHugeTs
+                          << ")\n"
+                          << readFile(log);
+                return 1;
+            }
+            {
+                std::ifstream in(hugeTs, std::ios::binary);
+                std::ofstream out(hugePsi, std::ios::binary);
+                char pkt[188];
+                bool kept = false;
+                while (in.read(pkt, 188) && in.gcount() == 188) {
+                    if (static_cast<unsigned char>(pkt[0]) != 0x47) {
+                        std::cerr << "huge mpegts fixture is not 188-byte packets\n";
+                        return 1;
+                    }
+                    const int pid = ((static_cast<unsigned char>(pkt[1]) & 0x1f) << 8) |
+                                    static_cast<unsigned char>(pkt[2]);
+                    if (pid >= 0x20 && pid != 0x1000) {
+                        out.write(pkt, 188);
+                        kept = true;
+                    }
+                }
+                if (!kept) {
+                    std::cerr << "failed to strip PSI from 12000x12000 mpegts fixture\n";
+                    return 1;
+                }
+            }
+            long maxRssKb = 0;
+            const int hugeTsRc =
+                run({player, "--url", hugePsi.string(), "--frames", "1"}, out, err, &maxRssKb);
+            const std::string hugeTsOut = readFile(out);
+            const std::string hugeTsErr = readFile(err);
+            constexpr long kConvertRssKb = 300000;
+            if (hugeTsRc == 0 || hugeTsOut.find("presented ") != std::string::npos ||
+                hugeTsOut.find("Decoded ") != std::string::npos ||
+                hugeTsOut.find("layout ") != std::string::npos ||
+                hugeTsOut.find("-> yuv420p") != std::string::npos || maxRssKb >= kConvertRssKb) {
+                std::cerr << "psi-less oversize --url must fail before convert (exit " << hugeTsRc
+                          << " rss_kb=" << maxRssKb << ")\n"
+                          << hugeTsOut << hugeTsErr;
+                return 1;
+            }
+
+            // HLS of a PMT 160x120 plus an undeclared 12000x12000 PID. The
+            // extra stream is born after open_input; probe max_pixels must
+            // still apply (AUDIT10 D2).
+            const std::filesystem::path smallTs = tmp.path() / "small.ts";
+            const int genSmallTs = run({ffmpegBinary(), "-y", "-loglevel", "error", "-f", "lavfi",
+                                        "-i", "testsrc=size=160x120:rate=10:duration=0.4", "-c:v",
+                                        "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                                        "-f", "mpegts", smallTs.string()},
+                                       empty, log);
+            if (genSmallTs != 0) {
+                std::cerr << "failed to generate small mpegts fixture (exit " << genSmallTs << ")\n"
+                          << readFile(log);
+                return 1;
+            }
+            const std::filesystem::path extraPid = tmp.path() / "extra-pid.ts";
+            {
+                std::ifstream base(smallTs, std::ios::binary);
+                std::ifstream more(hugeTs, std::ios::binary);
+                std::ofstream extra(extraPid, std::ios::binary);
+                extra << base.rdbuf();
+                char pkt[188];
+                bool kept = false;
+                while (more.read(pkt, 188) && more.gcount() == 188) {
+                    if (static_cast<unsigned char>(pkt[0]) != 0x47) {
+                        std::cerr << "huge mpegts fixture is not 188-byte packets\n";
+                        return 1;
+                    }
+                    const int pid = ((static_cast<unsigned char>(pkt[1]) & 0x1f) << 8) |
+                                    static_cast<unsigned char>(pkt[2]);
+                    if (pid == 0x100) {
+                        pkt[1] = static_cast<char>((pkt[1] & 0xE0) | 0x01);
+                        pkt[2] = 0x01;
+                        extra.write(pkt, 188);
+                        kept = true;
+                    }
+                }
+                if (!kept) {
+                    std::cerr << "failed to build extra-PID mpegts fixture\n";
+                    return 1;
+                }
+            }
+            const std::filesystem::path extraHls = tmp.path() / "extra-pid.m3u8";
+            {
+                std::ofstream playlist(extraHls);
+                playlist << "#EXTM3U\n"
+                         << "#EXT-X-VERSION:3\n"
+                         << "#EXT-X-TARGETDURATION:1\n"
+                         << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                         << "#EXTINF:0.400,\n"
+                         << extraPid.filename().string() << "\n"
+                         << "#EXT-X-ENDLIST\n";
+            }
+            long extraRssKb = 0;
+            const int extraRc =
+                run({player, "--url", extraHls.string(), "--frames", "1"}, out, err, &extraRssKb);
+            const std::string extraOut = readFile(out);
+            const std::string extraErr = readFile(err);
+            if (extraRc != 0 || extraOut.find("presented ") == std::string::npos ||
+                extraOut.find("160x120") == std::string::npos || extraRssKb >= kConvertRssKb) {
+                std::cerr << "extra-PID HLS --url must present the small stream (exit " << extraRc
+                          << " rss_kb=" << extraRssKb << ")\n"
+                          << extraOut << extraErr;
+                return 1;
+            }
+        }
+
         // AUDIT9 D1: a 12000x12000 MJPEG still must fail without the ~425 MB convert.
         {
             const std::filesystem::path hugeMp4 = tmp.path() / "huge.mp4";

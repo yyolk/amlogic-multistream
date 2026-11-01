@@ -3,15 +3,18 @@
 #include "software_renderer.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <iostream>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avstring.h>
+#include <libavutil/avutil.h>
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/log.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
@@ -102,6 +105,193 @@ void freeStreamOptions(AVDictionary** stream_opts, unsigned count) {
         av_dict_free(&stream_opts[i]);
     }
     av_freep(&stream_opts);
+}
+
+// FFmpeg 6.1.1's avformat_find_stream_info snapshots orig_nb_streams and
+// applies options[i] only while i < that count (libavformat/demux.c). There
+// is no format-wide codec-option default for streams created later.
+bool formatNameIs(const AVFormatContext* fmt, const char* name) {
+    const char* got = fmt != nullptr && fmt->iformat != nullptr ? fmt->iformat->name : nullptr;
+    return got != nullptr && name != nullptr && av_match_list(got, name, ',') > 0;
+}
+
+bool formatMayAddStreams(const AVFormatContext* fmt) {
+    if (fmt == nullptr) {
+        return false;
+    }
+    // mpegts auto_guess and HLS of a PMT segment can add a PID after some
+    // streams already exist. A headerless input starts at nb_streams == 0.
+    return formatNameIs(fmt, "mpegts") || formatNameIs(fmt, "hls") || fmt->nb_streams == 0;
+}
+
+int64_t probeAnalyzeDuration(const AVFormatContext* fmt) {
+    if (fmt != nullptr && fmt->max_analyze_duration > 0) {
+        return fmt->max_analyze_duration;
+    }
+    // Same defaults as FFmpeg 6.1.1 avformat_find_stream_info.
+    if (formatNameIs(fmt, "mpegts") || formatNameIs(fmt, "mpeg")) {
+        return 7 * static_cast<int64_t>(AV_TIME_BASE);
+    }
+    return 5 * static_cast<int64_t>(AV_TIME_BASE);
+}
+
+int64_t packetTimeUs(const AVFormatContext* fmt, const AVPacket* pkt) {
+    if (fmt == nullptr || pkt == nullptr || pkt->stream_index < 0 ||
+        static_cast<unsigned>(pkt->stream_index) >= fmt->nb_streams) {
+        return AV_NOPTS_VALUE;
+    }
+    const AVStream* st = fmt->streams[pkt->stream_index];
+    if (st == nullptr || st->time_base.num <= 0 || st->time_base.den <= 0) {
+        return AV_NOPTS_VALUE;
+    }
+    const int64_t ts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+    if (ts == AV_NOPTS_VALUE) {
+        return AV_NOPTS_VALUE;
+    }
+    return av_rescale_q(ts, st->time_base, AV_TIME_BASE_Q);
+}
+
+int firstVideoStreamIndex(const AVFormatContext* fmt) {
+    if (fmt == nullptr) {
+        return AVERROR_STREAM_NOT_FOUND;
+    }
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const AVStream* st = fmt->streams[i];
+        if (st != nullptr && st->codecpar != nullptr &&
+            st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            return static_cast<int>(i);
+        }
+    }
+    return AVERROR_STREAM_NOT_FOUND;
+}
+
+void freePacketQueue(AVPacket*** pkts, unsigned* count, unsigned* pos) {
+    if (pkts == nullptr) {
+        return;
+    }
+    if (*pkts != nullptr) {
+        const unsigned n = count != nullptr ? *count : 0;
+        for (unsigned i = 0; i < n; ++i) {
+            av_packet_free(&(*pkts)[i]);
+        }
+        av_freep(pkts);
+    }
+    if (count != nullptr) {
+        *count = 0;
+    }
+    if (pos != nullptr) {
+        *pos = 0;
+    }
+}
+
+int pushPacketQueue(AVPacket*** pkts, unsigned* count, const AVPacket* src) {
+    AVPacket* copy = av_packet_alloc();
+    if (copy == nullptr || av_packet_ref(copy, src) < 0) {
+        av_packet_free(&copy);
+        return AVERROR(ENOMEM);
+    }
+    AVPacket** grown = static_cast<AVPacket**>(av_realloc_array(*pkts, *count + 1, sizeof(*grown)));
+    if (grown == nullptr) {
+        av_packet_free(&copy);
+        return AVERROR(ENOMEM);
+    }
+    *pkts = grown;
+    (*pkts)[(*count)++] = copy;
+    return 0;
+}
+
+int rewindAfterDiscovery(AVFormatContext* fmt, int64_t start) {
+    int seek_rc = AVERROR(ENOSYS);
+    if (fmt->nb_streams > 0) {
+        seek_rc = av_seek_frame(fmt, 0, 0, AVSEEK_FLAG_BACKWARD);
+        if (seek_rc < 0) {
+            seek_rc = avformat_seek_file(fmt, 0, INT64_MIN, 0, INT64_MAX, 0);
+        }
+    }
+    if (seek_rc < 0) {
+        seek_rc = avformat_seek_file(fmt, -1, INT64_MIN, 0, INT64_MAX, 0);
+    }
+    if (seek_rc < 0) {
+        seek_rc = av_seek_frame(fmt, -1, 0, AVSEEK_FLAG_BACKWARD);
+    }
+    if (seek_rc < 0 && start >= 0) {
+        seek_rc = av_seek_frame(fmt, -1, start, AVSEEK_FLAG_BYTE);
+    }
+    // Do not fall back to avio_seek on fmt->pb: HLS's pb is the playlist
+    // file, so that seek can succeed while the segment stays at EOF.
+    return seek_rc;
+}
+
+// Demux-only: av_read_frame creates AVStreams for PIDs that appear after
+// avformat_open_input (PSI-less MPEG-TS, extra PIDs, HLS of those files)
+// without opening a decoder. The window matches find_stream_info
+// (probesize and max_analyze_duration) so a normal HLS master is not
+// drained past the usual probe. If the container can rewind, seek back
+// so find_stream_info can apply max_pixels to every index that now
+// exists (AUDIT10 D2). Local HLS cannot rewind; those packets are queued
+// for readFrame() and find_stream_info is not allowed to read further.
+void discoverStreamsForProbeOptions(AVFormatContext* fmt,
+                                    AVPacket*** queued,
+                                    unsigned* queued_count,
+                                    unsigned* queued_pos) {
+    freePacketQueue(queued, queued_count, queued_pos);
+    if (!formatMayAddStreams(fmt) || queued == nullptr || queued_count == nullptr) {
+        return;
+    }
+    AVPacket* pkt = av_packet_alloc();
+    if (pkt == nullptr) {
+        return;
+    }
+    const int64_t start = fmt->pb != nullptr ? avio_tell(fmt->pb) : 0;
+    const int64_t probesize = fmt->probesize > 0 ? fmt->probesize : 5000000;
+    const int64_t max_analyze = probeAnalyzeDuration(fmt);
+    int64_t read_size = 0;
+    int64_t first_ts = AV_NOPTS_VALUE;
+    bool stash_ok = true;
+    while (read_size < probesize) {
+        if (fmt->interrupt_callback.callback != nullptr &&
+            fmt->interrupt_callback.callback(fmt->interrupt_callback.opaque) != 0) {
+            break;
+        }
+        const int rc = av_read_frame(fmt, pkt);
+        if (rc < 0) {
+            break;
+        }
+        read_size += pkt->size > 0 ? pkt->size : 1;
+        const int64_t ts = packetTimeUs(fmt, pkt);
+        if (ts != AV_NOPTS_VALUE) {
+            if (first_ts == AV_NOPTS_VALUE) {
+                first_ts = ts;
+            }
+            if (ts - first_ts >= max_analyze) {
+                if (stash_ok && pushPacketQueue(queued, queued_count, pkt) < 0) {
+                    stash_ok = false;
+                    freePacketQueue(queued, queued_count, queued_pos);
+                }
+                av_packet_unref(pkt);
+                break;
+            }
+        }
+        if (stash_ok && pushPacketQueue(queued, queued_count, pkt) < 0) {
+            stash_ok = false;
+            freePacketQueue(queued, queued_count, queued_pos);
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+
+    // HLS seek is not trustworthy here: av_seek_frame is often EPERM, and
+    // a successful avio_seek only rewinds the playlist file. Always keep
+    // the queue for hls. MPEG-TS can rewind, so drop the copies.
+    if (!formatNameIs(fmt, "hls") && rewindAfterDiscovery(fmt, start) >= 0) {
+        freePacketQueue(queued, queued_count, queued_pos);
+    } else {
+        // Already consumed the probe window. find_stream_info must not
+        // keep reading or it would fetch past a master playlist's usual
+        // probe and decode a late PID without options.
+        fmt->probesize = 1;
+        fmt->max_analyze_duration = 1;
+    }
 }
 
 }  // namespace
@@ -213,8 +403,12 @@ bool FfmpegDecoder::open(const std::string& url) {
         return false;
     }
 
-    // Probe decoders use their own AVCodecContext. Pass the same pixel cap
-    // so find_stream_info does not materialize an oversize still (AUDIT9 D1).
+    // Probe decoders use their own AVCodecContext. Discover streams that
+    // MPEG-TS / HLS will add during the probe, then pass the same pixel cap
+    // so find_stream_info does not materialize an oversize still
+    // (AUDIT9 D1, AUDIT10 D2). FFmpeg 6.1.1 will not apply these options to
+    // a stream that does not exist yet.
+    discoverStreamsForProbeOptions(fmt_, &probe_pkts_, &probe_pkt_count_, &probe_pkt_pos_);
     AVDictionary** stream_opts = nullptr;
     const unsigned stream_count = fmt_->nb_streams;
     if (stream_count > 0) {
@@ -235,16 +429,18 @@ bool FfmpegDecoder::open(const std::string& url) {
         return failOpen("avformat_find_stream_info", info_rc);
     }
 
-    video_index_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    // First video in playlist / PMT order, not av_find_best_stream. The D2
+    // pre-pass gives every HLS variant codec parameters, and
+    // av_find_best_stream then prefers the higher-resolution one. Extra
+    // PIDs born after the program stream also lose if "best" wins.
+    video_index_ = firstVideoStreamIndex(fmt_);
     if (video_index_ < 0) {
         return failOpen("no video stream", video_index_);
     }
 
-    // Keep the first video stream av_find_best_stream selected (HLS master:
-    // the first variant in playlist order). AVDISCARD_ALL on every other
-    // stream makes hls.c playlist_needed() drop the rest, so later segments
-    // of those variants are not fetched. Probe reads that already happened
-    // inside avformat_find_stream_info stay fetched.
+    // AVDISCARD_ALL on every other stream makes hls.c playlist_needed()
+    // drop the rest, so later segments of those variants are not fetched.
+    // Probe reads that already happened stay fetched.
     for (unsigned i = 0; i < fmt_->nb_streams; ++i) {
         AVStream* candidate = fmt_->streams[i];
         if (candidate == nullptr) {
@@ -318,8 +514,27 @@ bool FfmpegDecoder::open(const std::string& url) {
     return true;
 }
 
+void FfmpegDecoder::freeProbePackets() {
+    freePacketQueue(&probe_pkts_, &probe_pkt_count_, &probe_pkt_pos_);
+}
+
+int FfmpegDecoder::readDemuxPacket() {
+    if (probe_pkt_pos_ < probe_pkt_count_) {
+        av_packet_unref(pkt_);
+        const int ref_rc = av_packet_ref(pkt_, probe_pkts_[probe_pkt_pos_]);
+        av_packet_free(&probe_pkts_[probe_pkt_pos_]);
+        ++probe_pkt_pos_;
+        if (probe_pkt_pos_ >= probe_pkt_count_) {
+            freePacketQueue(&probe_pkts_, &probe_pkt_count_, &probe_pkt_pos_);
+        }
+        return ref_rc;
+    }
+    return av_read_frame(fmt_, pkt_);
+}
+
 void FfmpegDecoder::close() {
     // abort_ stays latched so a stopped decoder cannot open again.
+    freeProbePackets();
     sws_freeContext(sws_);
     sws_ = nullptr;
     av_frame_free(&decoded_);
@@ -470,7 +685,7 @@ bool FfmpegDecoder::readFrame(DecodedFrame& out) {
             return false;
         }
 
-        const int read_rc = av_read_frame(fmt_, pkt_);
+        const int read_rc = readDemuxPacket();
         if (abort_.load()) {
             av_packet_unref(pkt_);
             return false;

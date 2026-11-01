@@ -17,12 +17,11 @@ struct SwsContext;
 // hardware backend has an obvious insertion point that is not this class.
 //
 // An HLS master lists every variant as its own program. open() keeps the
-// video stream av_find_best_stream() returns and sets AVDISCARD_ALL on the
-// others. For a master playlist that stream is the first variant in
-// playlist order, not the highest bitrate. Later segments of the discarded
-// variants are not requested. Segments already read inside
-// avformat_find_stream_info() are not rewound. A tile-size bitrate picker
-// is a later change.
+// first video stream in playlist order and sets AVDISCARD_ALL on the
+// others, not the highest bitrate. Later segments of the discarded
+// variants are not requested. Segments already read inside the probe
+// pre-pass or avformat_find_stream_info() are not rewound. A tile-size
+// bitrate picker is a later change.
 //
 // open() drops any previous stream first. On failure it returns false and
 // leaves the object closed (safe to destroy or open() again).
@@ -51,9 +50,14 @@ public:
     // mp3float; mp3 stays for a build that registers that name (AUDIT4 A5).
     // gif and image demuxers are rejected on every path, including `--url`.
     // open() sets decoder max_pixels to SoftwareRenderer::kMaxExtent squared
-    // so FFmpeg can refuse an oversize still before it materializes.
-    // readFrame() also refuses to convert a frame that fails those extent
-    // and stride caps (AUDIT9 D1).
+    // so FFmpeg can refuse an oversize still before it materializes. Streams
+    // created during avformat_find_stream_info (PSI-less MPEG-TS, extra
+    // PIDs after a PMT, HLS of those files) are demuxed into existence
+    // first so the same cap reaches those probe decoders (AUDIT10 D2).
+    // The pre-pass uses the same probesize / max_analyze_duration window
+    // as find_stream_info so a normal HLS master is not drained. readFrame()
+    // also refuses to convert a frame that fails those extent and stride
+    // caps (AUDIT9 D1).
     void setAllowLocalFile(bool allow);
 
     bool open(const std::string& url) override;
@@ -69,12 +73,17 @@ private:
     bool failOpen(const char* what, int err);
     bool failRead(const char* what, int err);
     bool publishYuv420(const AVFrame* src, DecodedFrame& out);
+    int readDemuxPacket();
+    void freeProbePackets();
 
     AVFormatContext* fmt_ = nullptr;
     AVCodecContext* codec_ = nullptr;
     AVFrame* decoded_ = nullptr;
     AVFrame* yuv_ = nullptr;
     AVPacket* pkt_ = nullptr;
+    AVPacket** probe_pkts_ = nullptr;
+    unsigned probe_pkt_count_ = 0;
+    unsigned probe_pkt_pos_ = 0;
     SwsContext* sws_ = nullptr;
     std::string url_;
     int video_index_ = -1;
