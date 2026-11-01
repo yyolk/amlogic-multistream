@@ -143,6 +143,9 @@ void expectYuv420(const DecodedFrame& frame) {
 void testDecode(const std::string& url) {
     FfmpegDecoder decoder;
     CHECK(decoder.isHardware() == false);
+    // Without the CLI allowance a local path must not reach the demuxer.
+    CHECK(!decoder.open(url));
+    decoder.setAllowLocalFile(true);
 
     const bool opened = decoder.open(url);
     CHECK(opened);
@@ -176,6 +179,7 @@ void testDecode(const std::string& url) {
 void testMissingFile(const std::filesystem::path& dir) {
     g_case = "missing file";
     FfmpegDecoder decoder;
+    decoder.setAllowLocalFile(true);
     const std::string url = (dir / "no-such-file.mp4").string();
     CHECK(!decoder.open(url));
     CHECK(decoder.isHardware() == false);

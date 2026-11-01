@@ -201,6 +201,38 @@ int main() {
     CHECK(buildStatusJson(true, playing, streams.layout(), streams.layoutSetting(), streams.list())
               .find("\"id\":\"cam2\"") != std::string::npos);
 
+    // add must not store a URL the decoder could open as a local or raw protocol.
+    const size_t beforeReject = streams.list().size();
+    const char* rejected[] = {
+        "file:///etc/hostname",
+        "pipe:0",
+        "tcp://127.0.0.1:9",
+        "concat:file:///etc/hostname",
+        "HTTP://example/a.m3u8",
+    };
+    int rejectIndex = 0;
+    for (const char* url : rejected) {
+        const std::string payload =
+            std::string("{\"id\":\"bad") + std::to_string(rejectIndex) + "\",\"url\":\"" + url + "\"}";
+        auto denied = executeCommand(streams, playing, "add", mustParse(payload));
+        CHECK(!denied.ok);
+        CHECK(denied.message == "url must be http:// or https://");
+        ++rejectIndex;
+    }
+    auto nulUrl = executeCommand(
+        streams, playing, "add",
+        mustParse("{\"id\":\"badnul\",\"url\":\"http://example/a\\u0000.m3u8\"}"));
+    CHECK(!nulUrl.ok);
+    CHECK(nulUrl.message == "url must be http:// or https://");
+    CHECK(streams.list().size() == beforeReject);
+
+    auto https = executeCommand(
+        streams, playing, "add",
+        mustParse(R"({"id":"secure","url":"https://example/live.m3u8"})"));
+    CHECK(https.ok && https.message == "added");
+    CHECK(streams.list().size() == beforeReject + 1);
+    CHECK(streams.list().back().url == "https://example/live.m3u8");
+
     if (g_failed != 0) {
         std::cerr << g_failed << " check(s) failed\n";
         return 1;

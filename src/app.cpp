@@ -176,6 +176,9 @@ bool frameLooksComplete(const DecodedFrame& frame) {
 int decodeUrl(const std::string& url, int frames, PresenterKind presenter, const std::string& renderDir) {
     std::cout << "Software decode isHardware=0 url=" << url << "\n";
     FfmpegDecoder decoder;
+    // CLI --url is the local-file allowance (fixture tests, a path on disk).
+    // MQTT add never reaches this call with a file URL.
+    decoder.setAllowLocalFile(true);
     if (!decoder.open(url)) {
         return 1;
     }

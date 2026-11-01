@@ -22,6 +22,15 @@ CommandOutcome fail(std::string command, std::string id, std::string message) {
     return out;
 }
 
+// MQTT add stores the URL for a later decoder. Accept only http and https,
+// and reject a NUL so a prefix check cannot disagree with a C string.
+bool mqttUrlAllowed(const std::string& url) {
+    if (url.find('\0') != std::string::npos) {
+        return false;
+    }
+    return url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0;
+}
+
 }  // namespace
 
 TopicCommand commandFromTopic(const std::string& prefix, const std::string& topic) {
@@ -93,6 +102,9 @@ CommandOutcome executeCommand(StreamManager& streams, bool& playing, const std::
         const std::string url = payload.getString("url");
         if (id.empty() || url.empty()) {
             return fail(command, id, "id and url are required");
+        }
+        if (!mqttUrlAllowed(url)) {
+            return fail(command, id, "url must be http:// or https://");
         }
         const size_t before = streams.list().size();
         if (!streams.addStream(id, url)) {

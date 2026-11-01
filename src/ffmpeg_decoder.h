@@ -27,6 +27,11 @@ public:
     FfmpegDecoder(FfmpegDecoder&&) = delete;
     FfmpegDecoder& operator=(FfmpegDecoder&&) = delete;
 
+    // `--url` passes true so local fixture files open. The default is false:
+    // avformat_open_input then allows only http, https, tls, tcp, crypto, and
+    // hls. MQTT must not set this; `add` already rejects non-HTTP URLs.
+    void setAllowLocalFile(bool allow);
+
     bool open(const std::string& url) override;
     void close() override;
     bool isHardware() const override { return false; }
@@ -52,4 +57,5 @@ private:
     bool decode_eof_ = false;
     bool failed_ = false;
     bool logged_format_ = false;
+    bool allow_local_file_ = false;
 };

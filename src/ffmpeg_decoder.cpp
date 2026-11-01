@@ -60,10 +60,20 @@ bool FfmpegDecoder::failRead(const char* what, int err) {
     return false;
 }
 
+void FfmpegDecoder::setAllowLocalFile(bool allow) {
+    allow_local_file_ = allow;
+}
+
 bool FfmpegDecoder::open(const std::string& url) {
     close();
     if (url.empty()) {
         std::cerr << "FfmpegDecoder::open failed: empty url\n";
+        return false;
+    }
+    // avformat_open_input takes a C string. A NUL would hide the tail from
+    // the whitelist check below and from libavformat.
+    if (url.find('\0') != std::string::npos) {
+        std::cerr << "FfmpegDecoder::open failed: url contains NUL\n";
         return false;
     }
     url_ = url;
@@ -75,6 +85,12 @@ bool FfmpegDecoder::open(const std::string& url) {
     AVDictionary* opts = nullptr;
     av_dict_set(&opts, "rw_timeout", kRwTimeoutUs, 0);
     av_dict_set(&opts, "user_agent", "amlogic-multistream/0.1", 0);
+    // file is only on the explicit --url local-file allowance. hls is the
+    // protocol name libavformat registers; crypto covers AES-128 media.
+    av_dict_set(&opts, "protocol_whitelist",
+                allow_local_file_ ? "file,http,https,tls,tcp,crypto,hls"
+                                  : "http,https,tls,tcp,crypto,hls",
+                0);
 
     // libavformat initializes network libraries itself. Do not call
     // avformat_network_init(); it is optional and not recommended.
