@@ -62,9 +62,9 @@ StreamPlayer::StreamPlayer(StreamManager& streams,
 StreamPlayer::~StreamPlayer() {
     closeAll();
     // A worker still inside getaddrinfo cannot be joined here. Signal exit,
-    // a failed sigtimedwait, and authentication give-up all call exitIfBusy()
-    // and _exit before this destructor runs. The joins below only see workers
-    // that have already returned.
+    // a failed sigtimedwait, and authentication give-up in MQTT mode all
+    // _exit from MqttController::finishProcess, so this destructor does not
+    // run there. The joins below only see workers that have already returned.
     for (auto& worker : reaper_) {
         if (worker && worker->thread.joinable()) {
             worker->thread.join();

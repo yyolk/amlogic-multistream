@@ -12,14 +12,17 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <pthread.h>
 #include <string>
+#include <unistd.h>
 
 namespace {
 
@@ -91,6 +94,11 @@ constexpr int kMaxViewportSide = 8192;
 // Signals are blocked process-wide and delivered here, same as the old
 // sigwait, so the mosquitto thread does not race the handler.
 constexpr long kTickWaitNs = 20L * 1000L * 1000L;
+
+// libmosquitto calls on_disconnect once the DISCONNECT packet is written.
+// A broker that stops reading can hold that past the launch poll, so the
+// exit does not wait longer than this.
+constexpr std::chrono::milliseconds kDisconnectWait{500};
 
 bool parseViewport(const std::string& text, int& width, int& height) {
     const auto lower = text.find('x');
@@ -257,35 +265,11 @@ int MqttController::start(int argc, char* argv[]) {
               << config_.prefix << "/cmd/# . Waiting for SIGINT, SIGTERM, or SIGHUP.\n";
     std::cout << "This build does not start DRM/KMS or Amlogic hardware decode.\n";
 
-    // Abort, queue the offline status, then join up to the deadline.
-    // getaddrinfo ignores abort, so the publish is queued before the wait.
-    // Disconnect before _exit only when that publish was queued on a live
-    // connection (AUDIT4 A1 / R1). Otherwise mosquitto_loop_stop joins a
-    // reconnect stuck in getaddrinfo and the exit passes the launch script's
-    // 10s SIGTERM poll. exitCode is 0 for a signal and 1 for authentication
-    // give-up or a failed sigtimedwait, and it is applied inside this lambda
-    // so a later exitIfBusy cannot turn a 1 into 0 (AUDIT4 A2).
-    auto finishProcess = [&](int exitCode) {
-        player.closeAll();
-        const std::string statusTopic = config_.prefix + "/status";
-        const std::string offline = buildStatusJson(false, playing_.load(), manager_.layout(),
-                                                    manager_.layoutSetting(), manager_.list());
-        const bool sent = publishRaw(statusTopic, offline, true);
-        if (!player.drain(StreamPlayer::kExitJoinDeadline)) {
-            if (sent) {
-                shutdown();
-            }
-            player.exitIfBusy(std::chrono::milliseconds(0), exitCode);
-        }
-    };
-
     while (true) {
         if (authGiveUp_.load()) {
             std::cerr << "MQTT authentication failed after " << authRejects_.load()
                       << " attempts; exiting\n";
-            finishProcess(1);
-            shutdown();
-            return 1;
+            finishProcess(player, 1);
         }
 
         player.tick(playing_.load());
@@ -300,15 +284,49 @@ int MqttController::start(int argc, char* argv[]) {
         }
         if (sig < 0 && errno != EAGAIN && errno != EINTR) {
             std::cerr << "sigtimedwait failed: " << std::strerror(errno) << "\n";
-            finishProcess(1);
-            shutdown();
-            return 1;
+            finishProcess(player, 1);
         }
     }
 
-    finishProcess(0);
-    shutdown();
-    return 0;
+    finishProcess(player, 0);
+}
+
+// Abort, queue the offline status, then join up to the deadline. getaddrinfo
+// ignores abort, so the publish is queued before the wait (AUDIT4 A1 / R1).
+// closing_ is set under closeMu_ with that publish, so a command or reconnect
+// on the mosquitto thread cannot republish "online": true after it (AUDIT5
+// F1). DISCONNECT only when the publish was queued on a live connection, so
+// the broker discards the CONNECT will instead of overwriting the table. Then
+// _exit without mosquitto_loop_stop: the network thread may be inside a
+// reconnect's getaddrinfo or a blocking connect() to a broker that drops
+// packets, whether the broker went away before the signal or during the
+// drain (AUDIT5 X1). exitCode is 0 for a signal and 1 for authentication
+// give-up or a failed sigtimedwait (AUDIT4 A2).
+void MqttController::finishProcess(StreamPlayer& player, int exitCode) {
+    bool sent = false;
+    {
+        std::lock_guard<std::mutex> lock(closeMu_);
+        closing_ = true;
+        player.closeAll();
+        const std::string offline = buildStatusJson(false, playing_.load(), manager_.layout(),
+                                                    manager_.layoutSetting(), manager_.list());
+        sent = publishRaw(config_.prefix + "/status", offline, true);
+    }
+    player.drain(StreamPlayer::kExitJoinDeadline);
+    if (sent) {
+        {
+            std::lock_guard<std::mutex> lock(disconnectMu_);
+            disconnected_ = false;
+        }
+        if (mosquitto_disconnect(mosq_) == MOSQ_ERR_SUCCESS) {
+            std::unique_lock<std::mutex> lock(disconnectMu_);
+            disconnectCv_.wait_for(lock, kDisconnectWait, [this] { return disconnected_; });
+        }
+    }
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(nullptr);
+    _exit(exitCode);
 }
 
 void MqttController::loadConfig(int argc, char* argv[]) {
@@ -440,6 +458,10 @@ void MqttController::handleConnect(struct mosquitto* mosq, int rc) {
         return;
     }
     authRejects_.store(0);
+    std::lock_guard<std::mutex> lock(closeMu_);
+    if (closing_) {
+        return;
+    }
     const std::string filter = config_.prefix + "/cmd/#";
     const int sub = mosquitto_subscribe(mosq, nullptr, filter.c_str(), 1);
     if (sub != MOSQ_ERR_SUCCESS) {
@@ -465,6 +487,13 @@ void MqttController::handleMessage(const std::string& topic, const std::string& 
     }
 
     const std::string command = resolveCommandName(routed, body);
+    std::lock_guard<std::mutex> lock(closeMu_);
+    if (closing_) {
+        publishRaw(config_.prefix + "/response", buildResponseJson(false, command, "", "shutting down"),
+                   false);
+        std::cout << "MQTT " << command << " ignored: shutting down\n";
+        return;
+    }
     bool playing = playing_.load();
     const CommandOutcome outcome = executeCommand(manager_, playing, command, body);
     playing_.store(playing);
@@ -564,6 +593,14 @@ void MqttController::onMessage(struct mosquitto*, void* obj, const struct mosqui
 }
 
 void MqttController::onDisconnect(struct mosquitto*, void* obj, int rc) {
+    if (obj != nullptr) {
+        auto* self = static_cast<MqttController*>(obj);
+        {
+            std::lock_guard<std::mutex> lock(self->disconnectMu_);
+            self->disconnected_ = true;
+        }
+        self->disconnectCv_.notify_all();
+    }
     if (rc == 0) {
         std::cout << "MQTT disconnected\n";
         return;

@@ -3,12 +3,15 @@
 #include "stream_manager.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 struct mosquitto;
 struct mosquitto_message;
+class StreamPlayer;
 
 // Connects to an MQTT broker and applies command topics to StreamManager.
 // Broker I/O runs on the mosquitto thread. start() presents on the calling
@@ -32,10 +35,11 @@ public:
     MqttController& operator=(const MqttController&) = delete;
 
     // Read env and CLI, then connect, subscribe, and tick until SIGINT,
-    // SIGTERM, or SIGHUP. Returns 0 after a clean shutdown or --help, and 1
-    // if the client cannot start or the broker refuses authentication. An
-    // unreachable broker is retried. A worker still blocked at exit does not
-    // change that code: signals _exit 0 and authentication give-up _exit 1.
+    // SIGTERM, or SIGHUP. Returns 0 for --help or a signal before the first
+    // connect is queued, and 1 if the client cannot start. Once the network
+    // thread is running, start() does not return: a signal _exits 0, and
+    // authentication give-up or a failed sigtimedwait _exits 1, whether or not
+    // a worker is still blocked. An unreachable broker is retried.
     int start(int argc, char* argv[]);
 
 private:
@@ -67,6 +71,12 @@ private:
     // the previous session. A SIGKILL before that reconnect still publishes
     // the will from the last CONNECT.
     bool refreshWill(bool fatal);
+    // Final offline publish, bounded drain, then _exit(exitCode). It never
+    // calls mosquitto_loop_stop, which joins a reconnect that can sit in
+    // getaddrinfo or a blocking connect() well past launch-coreelec.sh's 10s
+    // SIGTERM poll. DISCONNECT is sent only when the offline publish was
+    // queued, and its wait is capped at 500ms.
+    [[noreturn]] void finishProcess(StreamPlayer& player, int exitCode);
     void shutdown();
 
     static void onConnect(struct mosquitto* mosq, void* obj, int rc);
@@ -87,4 +97,13 @@ private:
     // mosquitto thread stores these; the main thread loads authGiveUp_.
     std::atomic<int> authRejects_{0};
     std::atomic<bool> authGiveUp_{false};
+    // Set by finishProcess before the offline publish. handleMessage and
+    // handleConnect hold closeMu_ and stop at closing_, so nothing republishes
+    // "online": true that the exit DISCONNECT would then keep retained.
+    std::mutex closeMu_;
+    bool closing_ = false;
+    // onDisconnect sets disconnected_ for finishProcess's bounded wait.
+    std::mutex disconnectMu_;
+    std::condition_variable disconnectCv_;
+    bool disconnected_ = false;
 };
