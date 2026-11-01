@@ -3,14 +3,62 @@
 #include "layout_engine.h"
 
 #include <iostream>
+#include <new>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 namespace {
 
 constexpr std::chrono::milliseconds kRetryDelay{1000};
+constexpr int kMaxPlaneStride = 65536;
+constexpr int kMaxPlaneRows = 8192;
 
 }  // namespace
+
+bool StreamPlayer::copyOwned(const DecodedFrame& src, OwnedFrame& dst) {
+    if (src.format != FramePixelFormat::Yuv420p || src.width <= 0 || src.height <= 0) {
+        return false;
+    }
+    const int chromaRows = (src.height + 1) / 2;
+    const int rows[3] = {src.height, chromaRows, chromaRows};
+    OwnedFrame copy;
+    copy.width = src.width;
+    copy.height = src.height;
+    copy.pts = src.pts;
+    copy.time_base_num = src.time_base_num;
+    copy.time_base_den = src.time_base_den;
+    try {
+        for (int i = 0; i < 3; ++i) {
+            if (src.data[i] == nullptr || src.linesize[i] <= 0 || src.linesize[i] > kMaxPlaneStride ||
+                rows[i] <= 0 || rows[i] > kMaxPlaneRows) {
+                return false;
+            }
+            const auto bytes = static_cast<size_t>(src.linesize[i]) * static_cast<size_t>(rows[i]);
+            copy.plane[i].assign(src.data[i], src.data[i] + bytes);
+            copy.linesize[i] = src.linesize[i];
+        }
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    dst = std::move(copy);
+    return true;
+}
+
+StreamPlayer::Session::~Session() {
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        workerStop = true;
+    }
+    cv.notify_all();
+    if (decoder) {
+        decoder->abort();
+    }
+    if (worker.joinable()) {
+        worker.join();
+    }
+    decoder.reset();
+}
 
 StreamPlayer::StreamPlayer(StreamManager& streams,
                            SoftwareRenderer& renderer,
@@ -53,22 +101,133 @@ bool StreamPlayer::urlAllowed(const std::string& url) {
     return url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0;
 }
 
-void StreamPlayer::closeSession(const std::string& id, Session& session) {
-    if (!session.decoder) {
-        session.open = false;
+void StreamPlayer::requestStop(Session& session) {
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        session.workerStop = true;
+    }
+    session.cv.notify_all();
+    if (session.decoder) {
+        session.decoder->abort();
+    }
+}
+
+void StreamPlayer::finishWorker(const std::string& id, Session& session) {
+    requestStop(session);
+    if (session.worker.joinable()) {
+        session.worker.join();
+    }
+    const bool announced = session.announcedOpen;
+    session.announcedOpen = false;
+    session.workerRunning = false;
+    session.workerFailed = WorkerFail::None;
+    session.frameReady = false;
+    session.frame = OwnedFrame{};
+    session.workerStop = false;
+    if (session.decoder) {
+        if (announced) {
+            std::cout << "StreamPlayer close " << id << "\n";
+        }
+        session.decoder->close();
+        session.decoder.reset();
+    }
+}
+
+void StreamPlayer::sessionLoop(Session* session, std::string id, std::string url) {
+    DecoderBackend* decoder = session->decoder.get();
+    const bool opened = decoder != nullptr && decoder->open(url);
+    const bool hardware = opened && decoder->isHardware();
+    if (!opened || hardware) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (!session->workerStop) {
+            session->workerFailed = hardware ? WorkerFail::Hardware : WorkerFail::Open;
+        }
+        session->cv.notify_all();
         return;
     }
-    if (session.open) {
-        std::cout << "StreamPlayer close " << id << "\n";
+    {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->workerStop) {
+            return;
+        }
+        session->announcedOpen = true;
     }
-    session.decoder->close();
-    session.decoder.reset();
-    session.open = false;
+    std::cout << "StreamPlayer open " << id << "\n";
+
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(session->mu);
+            session->cv.wait(lock, [&] { return session->workerStop || !session->frameReady; });
+            if (session->workerStop) {
+                return;
+            }
+        }
+
+        DecodedFrame frame;
+        const bool got = decoder->readFrame(frame);
+        OwnedFrame copy;
+        const bool copied = got && copyOwned(frame, copy);
+        {
+            std::lock_guard<std::mutex> lock(session->mu);
+            if (session->workerStop) {
+                return;
+            }
+            if (!copied) {
+                session->workerFailed = WorkerFail::Read;
+                session->cv.notify_all();
+                return;
+            }
+            session->frame = std::move(copy);
+            session->frameReady = true;
+        }
+        session->cv.notify_all();
+    }
+}
+
+void StreamPlayer::startWorker(const StreamInfo& info, Session& session) {
+    if (session.worker.joinable()) {
+        finishWorker(info.id, session);
+    }
+    session.url = info.url;
+    session.haveGeneration = true;
+    session.appliedGeneration = info.restartGeneration;
+    session.framesPresented = 0;
+    session.workerStop = false;
+    session.workerFailed = WorkerFail::None;
+    session.announcedOpen = false;
+    session.frameReady = false;
+    session.frame = OwnedFrame{};
+    session.decoder = factory_ ? factory_() : nullptr;
+    if (!session.decoder) {
+        std::cerr << "StreamPlayer: open failed for " << info.id << "\n";
+        session.backoff = true;
+        session.retryAfter = std::chrono::steady_clock::now() + kRetryDelay;
+        session.workerRunning = false;
+        return;
+    }
+    Session* raw = &session;
+    const std::string url = info.url;
+    const std::string id = info.id;
+    try {
+        session.worker = std::thread([this, raw, url, id] { sessionLoop(raw, id, url); });
+    } catch (const std::system_error& ex) {
+        std::cerr << "StreamPlayer: thread failed for " << id << ": " << ex.what() << "\n";
+        session.decoder->close();
+        session.decoder.reset();
+        session.backoff = true;
+        session.retryAfter = std::chrono::steady_clock::now() + kRetryDelay;
+        session.workerRunning = false;
+        return;
+    }
+    session.workerRunning = true;
 }
 
 void StreamPlayer::closeAll() {
     for (auto& entry : sessions_) {
-        closeSession(entry.first, entry.second);
+        requestStop(*entry.second);
+    }
+    for (auto& entry : sessions_) {
+        finishWorker(entry.first, *entry.second);
     }
     sessions_.clear();
 }
@@ -92,7 +251,7 @@ void StreamPlayer::dropMissing(const std::vector<StreamInfo>& streams) {
         if (it == sessions_.end()) {
             continue;
         }
-        closeSession(id, it->second);
+        finishWorker(id, *it->second);
         sessions_.erase(it);
     }
 }
@@ -116,59 +275,6 @@ std::string StreamPlayer::topologyKey(const LayoutEngine::Result& layout,
         key.push_back(';');
     }
     return key;
-}
-
-bool StreamPlayer::ensureOpen(const StreamInfo& info, Session& session) {
-    const bool generationChanged =
-        !session.haveGeneration || session.appliedGeneration != info.restartGeneration;
-    const bool urlChanged = session.url != info.url;
-    if (session.open && !generationChanged && !urlChanged) {
-        return true;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (!generationChanged && !urlChanged && session.backoff && now < session.retryAfter) {
-        return false;
-    }
-
-    closeSession(info.id, session);
-    session.url = info.url;
-    session.haveGeneration = true;
-    session.appliedGeneration = info.restartGeneration;
-    session.framesPresented = 0;
-    if (generationChanged) {
-        session.loggedRefusal = false;
-    }
-
-    if (!urlAllowed(info.url)) {
-        if (!session.loggedRefusal) {
-            std::cerr << "StreamPlayer: refusing url for " << info.id
-                      << " (http:// or https:// required)\n";
-            session.loggedRefusal = true;
-        }
-        session.backoff = true;
-        session.retryAfter = now + kRetryDelay;
-        return false;
-    }
-
-    session.decoder = factory_ ? factory_() : nullptr;
-    if (!session.decoder || !session.decoder->open(info.url) || session.decoder->isHardware()) {
-        if (session.decoder && session.decoder->isHardware()) {
-            std::cerr << "StreamPlayer: refusing hardware decoder for " << info.id
-                      << " (requires GS-King X / CoreELEC)\n";
-        } else {
-            std::cerr << "StreamPlayer: open failed for " << info.id << "\n";
-        }
-        closeSession(info.id, session);
-        session.backoff = true;
-        session.retryAfter = std::chrono::steady_clock::now() + kRetryDelay;
-        return false;
-    }
-
-    session.open = true;
-    session.backoff = false;
-    std::cout << "StreamPlayer open " << info.id << "\n";
-    return true;
 }
 
 int StreamPlayer::tick(bool playing) {
@@ -214,42 +320,100 @@ int StreamPlayer::tick(bool playing) {
     const std::string key = topologyKey(layout, streams);
     if (key != topology_) {
         renderer_.clearViewport();
-        topology_ = std::move(key);
+        topology_ = key;
     }
 
     dropMissing(streams);
 
     int presented = 0;
+    const auto now = std::chrono::steady_clock::now();
     for (size_t i = 0; i < streams.size(); ++i) {
         const StreamInfo& info = streams[i];
-        Session& session = sessions_[info.id];
+        auto it = sessions_.find(info.id);
+        if (it == sessions_.end()) {
+            it = sessions_.emplace(info.id, std::make_unique<Session>()).first;
+        }
+        Session& session = *it->second;
+
         if (i >= layout.tiles.size()) {
-            closeSession(info.id, session);
+            finishWorker(info.id, session);
             continue;
         }
-        if (!ensureOpen(info, session)) {
+
+        const bool generationChanged =
+            !session.haveGeneration || session.appliedGeneration != info.restartGeneration;
+        const bool urlChanged = session.haveGeneration && session.url != info.url;
+        if (session.workerRunning && (generationChanged || urlChanged)) {
+            finishWorker(info.id, session);
+        }
+
+        if (!session.workerRunning) {
+            if (!generationChanged && !urlChanged && session.backoff && now < session.retryAfter) {
+                continue;
+            }
+            if (generationChanged) {
+                session.loggedRefusal = false;
+            }
+            session.url = info.url;
+            session.haveGeneration = true;
+            session.appliedGeneration = info.restartGeneration;
+            if (!urlAllowed(info.url)) {
+                if (!session.loggedRefusal) {
+                    std::cerr << "StreamPlayer: refusing url for " << info.id
+                              << " (http:// or https:// required)\n";
+                    session.loggedRefusal = true;
+                }
+                session.backoff = true;
+                session.retryAfter = now + kRetryDelay;
+                continue;
+            }
+            startWorker(info, session);
+        }
+
+        OwnedFrame taken;
+        bool haveFrame = false;
+        WorkerFail failed = WorkerFail::None;
+        {
+            std::lock_guard<std::mutex> lock(session.mu);
+            if (session.frameReady) {
+                taken = std::move(session.frame);
+                session.frameReady = false;
+                haveFrame = true;
+            } else if (session.workerFailed != WorkerFail::None) {
+                failed = session.workerFailed;
+            }
+        }
+        if (haveFrame) {
+            session.cv.notify_all();
+            const LayoutEngine::Rect& dest = layout.tiles[i].rect;
+            const DecodedFrame view = taken.view();
+            if (!renderer_.present(view, dest)) {
+                std::cerr << "StreamPlayer: present failed for " << info.id << "\n";
+                continue;
+            }
+            if (session.framesPresented % 60 == 0) {
+                std::cout << "presented " << info.id << " frame " << session.framesPresented << " "
+                          << view.width << "x" << view.height << " tile " << dest.x << "," << dest.y
+                          << "+" << dest.width << "x" << dest.height << "\n";
+            }
+            ++session.framesPresented;
+            ++presented;
             continue;
         }
-        DecodedFrame frame;
-        if (!session.decoder->readFrame(frame)) {
+        if (failed == WorkerFail::None) {
+            continue;
+        }
+        if (failed == WorkerFail::Hardware) {
+            std::cerr << "StreamPlayer: refusing hardware decoder for " << info.id
+                      << " (requires GS-King X / CoreELEC)\n";
+        } else if (failed == WorkerFail::Open) {
+            std::cerr << "StreamPlayer: open failed for " << info.id << "\n";
+        } else {
             std::cerr << "StreamPlayer: no frame from " << info.id << " (will retry)\n";
-            closeSession(info.id, session);
-            session.backoff = true;
-            session.retryAfter = std::chrono::steady_clock::now() + kRetryDelay;
-            continue;
         }
-        const LayoutEngine::Rect& dest = layout.tiles[i].rect;
-        if (!renderer_.present(frame, dest)) {
-            std::cerr << "StreamPlayer: present failed for " << info.id << "\n";
-            continue;
-        }
-        if (session.framesPresented % 60 == 0) {
-            std::cout << "presented " << info.id << " frame " << session.framesPresented << " "
-                      << frame.width << "x" << frame.height << " tile " << dest.x << "," << dest.y
-                      << "+" << dest.width << "x" << dest.height << "\n";
-        }
-        ++session.framesPresented;
-        ++presented;
+        finishWorker(info.id, session);
+        session.backoff = true;
+        session.retryAfter = std::chrono::steady_clock::now() + kRetryDelay;
     }
     return presented;
 }

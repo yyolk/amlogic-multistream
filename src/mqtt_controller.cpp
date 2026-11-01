@@ -56,9 +56,11 @@ void stripTrailingSlashes(std::string& prefix) {
 // fails before the broker connect.
 constexpr int kMaxViewportSide = 8192;
 
-// Pause between decode ticks while waiting for SIGINT/SIGTERM. Signals are
-// blocked process-wide and delivered here, same as the old sigwait, so the
-// mosquitto thread does not race the handler.
+// Pause between present ticks while waiting for SIGINT, SIGTERM, or SIGHUP.
+// Decode runs on each stream's thread, so this wait is not stuck behind a
+// socket read.
+// Signals are blocked process-wide and delivered here, same as the old
+// sigwait, so the mosquitto thread does not race the handler.
 constexpr long kTickWaitNs = 20L * 1000L * 1000L;
 
 bool parseViewport(const std::string& text, int& width, int& height) {
@@ -219,8 +221,8 @@ int MqttController::start(int argc, char* argv[]) {
     }
     loopStarted_ = true;
 
-    std::cout << "MQTT running. Software decode ticks on this thread; broker I/O stays on the "
-                 "mosquitto thread. Commands on "
+    std::cout << "MQTT running. Each stream decodes on its own thread; this thread presents. "
+                 "Broker I/O stays on the mosquitto thread. Commands on "
               << config_.prefix << "/cmd/# . Waiting for SIGINT, SIGTERM, or SIGHUP.\n";
     std::cout << "This build does not start DRM/KMS or Amlogic hardware decode.\n";
 

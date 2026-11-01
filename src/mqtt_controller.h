@@ -8,11 +8,11 @@ struct mosquitto;
 struct mosquitto_message;
 
 // Connects to an MQTT broker and applies command topics to StreamManager.
-// Broker I/O runs on the mosquitto thread. start() ticks software decode and
-// present on the calling thread until SIGINT, SIGTERM, or SIGHUP, so the
-// process is not blocked in sigwait with no decode loop. A broker that is
-// down at startup is retried with backoff instead of exiting. Hardware
-// decode and DRM/KMS are not started.
+// Broker I/O runs on the mosquitto thread. start() presents on the calling
+// thread until SIGINT, SIGTERM, or SIGHUP. Each stream is decoded on its own
+// thread, so a stalled read does not block the other tiles or the signal
+// wait. A broker that is down at startup is retried with backoff instead of
+// exiting. Hardware decode and DRM/KMS are not started.
 class MqttController {
 public:
     explicit MqttController(StreamManager& manager);

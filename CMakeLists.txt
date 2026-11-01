@@ -4,6 +4,8 @@ project(amlogic-multistream VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+find_package(Threads REQUIRED)
+
 # Layout math, the in-memory stream table, MQTT command parsing, the
 # software renderer, and StreamPlayer's fake-decoder test have no FFmpeg,
 # libmosquitto, or DRM dependency, so CI can build and run them on a normal
@@ -58,6 +60,7 @@ add_executable(stream_player_test
     src/mqtt_json.cpp
 )
 target_include_directories(stream_player_test PRIVATE src)
+target_link_libraries(stream_player_test PRIVATE Threads::Threads)
 target_compile_options(stream_player_test PRIVATE -Wall -Wextra -Wpedantic)
 
 enable_testing()
@@ -142,7 +145,7 @@ if(FFMPEG_FOUND)
     if(FFMPEG_LIBRARY_DIRS)
         target_link_directories(stream_player_http_test PRIVATE ${FFMPEG_LIBRARY_DIRS})
     endif()
-    target_link_libraries(stream_player_http_test PRIVATE ${FFMPEG_LIBRARIES})
+    target_link_libraries(stream_player_http_test PRIVATE ${FFMPEG_LIBRARIES} Threads::Threads)
     target_compile_options(stream_player_http_test PRIVATE -Wall -Wextra -Wpedantic ${FFMPEG_CFLAGS_OTHER})
     if(FFMPEG_CLI)
         target_compile_definitions(stream_player_http_test PRIVATE FFMPEG_CLI="${FFMPEG_CLI}")
@@ -151,6 +154,31 @@ if(FFMPEG_FOUND)
     endif()
     add_test(NAME stream_player_http COMMAND stream_player_http_test)
     set_tests_properties(stream_player_http PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
+    # Healthy stream beside a blackhole and a trickle, then a live HLS stream
+    # beside VOD. Both must keep presenting, and close must stay bounded.
+    add_executable(stream_player_stall_test
+        tests/stream_player_stall_test.cpp
+        src/stream_player.cpp
+        src/stream_manager.cpp
+        src/layout_engine.cpp
+        src/software_renderer.cpp
+        src/ffmpeg_decoder.cpp
+    )
+    target_include_directories(stream_player_stall_test SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
+    target_include_directories(stream_player_stall_test PRIVATE src)
+    if(FFMPEG_LIBRARY_DIRS)
+        target_link_directories(stream_player_stall_test PRIVATE ${FFMPEG_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(stream_player_stall_test PRIVATE ${FFMPEG_LIBRARIES} Threads::Threads)
+    target_compile_options(stream_player_stall_test PRIVATE -Wall -Wextra -Wpedantic ${FFMPEG_CFLAGS_OTHER})
+    if(FFMPEG_CLI)
+        target_compile_definitions(stream_player_stall_test PRIVATE FFMPEG_CLI="${FFMPEG_CLI}")
+    else()
+        target_compile_definitions(stream_player_stall_test PRIVATE FFMPEG_CLI="")
+    endif()
+    add_test(NAME stream_player_stall COMMAND stream_player_stall_test)
+    set_tests_properties(stream_player_stall PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 else()
     message(STATUS
         "Skipping ffmpeg_decoder test: need libavformat, libavcodec, libavutil, and libswscale")
@@ -195,6 +223,7 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
         ${FFMPEG_LIBRARIES}
         ${MOSQUITTO_LIBRARIES}
         ${DRM_LIBRARIES}
+        Threads::Threads
     )
 
     target_compile_options(amlogic-multistream PRIVATE ${FFMPEG_CFLAGS_OTHER} ${MOSQUITTO_CFLAGS_OTHER})

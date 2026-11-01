@@ -16,7 +16,9 @@ extern "C" {
 namespace {
 
 // Socket read timeout passed to protocols that understand rw_timeout
-// (microseconds). File inputs ignore it.
+// (microseconds). File inputs ignore it. This bounds one silent socket
+// operation on this decoder's thread. It does not bound a peer that keeps
+// the connection just alive; DecoderBackend::abort() does.
 constexpr const char* kRwTimeoutUs = "15000000";
 
 // HLS and the segment demuxers it opens (mpegts, fMP4/mov). mpegts is also
@@ -60,6 +62,23 @@ FfmpegDecoder::~FfmpegDecoder() {
     close();
 }
 
+// Polled by libavformat on the decode thread during socket waits and the HLS
+// live-edge sleep (100ms slices). A read deadline is not installed: on
+// FFmpeg 6.1, interrupting that wait surfaces as EOF / AVERROR_EXIT and the
+// HLS demuxer does not deliver the next segment. Each stream therefore has
+// its own thread, and this callback is only the stop/shutdown latch.
+int FfmpegDecoder::interruptCallback(void* opaque) {
+    if (opaque == nullptr) {
+        return 0;
+    }
+    const auto* self = static_cast<const FfmpegDecoder*>(opaque);
+    return self->abort_.load() ? 1 : 0;
+}
+
+void FfmpegDecoder::abort() {
+    abort_.store(true);
+}
+
 bool FfmpegDecoder::failOpen(const char* what, int err) {
     logAvError("FfmpegDecoder::open failed", url_, what, err);
     close();
@@ -89,6 +108,9 @@ bool FfmpegDecoder::open(const std::string& url) {
         return false;
     }
     url_ = url;
+    if (abort_.load()) {
+        return false;
+    }
 
     // av_log_set_level is process-wide. Decoder failures are still reported
     // with av_strerror, so libav's own info and warning lines stay quiet.
@@ -108,13 +130,28 @@ bool FfmpegDecoder::open(const std::string& url) {
 
     // libavformat initializes network libraries itself. Do not call
     // avformat_network_init(); it is optional and not recommended.
+    // A context allocated here keeps interrupt_callback across open.
+    // On failure FFmpeg frees that context and nulls the pointer.
+    fmt_ = avformat_alloc_context();
+    if (fmt_ == nullptr) {
+        av_dict_free(&opts);
+        return failOpen("avformat_alloc_context", AVERROR(ENOMEM));
+    }
+    fmt_->interrupt_callback.callback = &FfmpegDecoder::interruptCallback;
+    fmt_->interrupt_callback.opaque = this;
+
     const int open_rc = avformat_open_input(&fmt_, url_.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     if (open_rc < 0) {
-        // Failed open frees a context it allocated and nulls *ps.
         fmt_ = nullptr;
+        if (abort_.load()) {
+            close();
+            return false;
+        }
         return failOpen("avformat_open_input", open_rc);
     }
+    fmt_->interrupt_callback.callback = &FfmpegDecoder::interruptCallback;
+    fmt_->interrupt_callback.opaque = this;
 
     fmt_->flags |= AVFMT_FLAG_GENPTS;
     if (fmt_->iformat == nullptr || fmt_->iformat->name == nullptr ||
@@ -128,6 +165,10 @@ bool FfmpegDecoder::open(const std::string& url) {
 
     const int info_rc = avformat_find_stream_info(fmt_, nullptr);
     if (info_rc < 0) {
+        if (abort_.load()) {
+            close();
+            return false;
+        }
         return failOpen("avformat_find_stream_info", info_rc);
     }
 
@@ -213,6 +254,7 @@ bool FfmpegDecoder::open(const std::string& url) {
 }
 
 void FfmpegDecoder::close() {
+    // abort_ stays latched so a stopped decoder cannot open again.
     sws_freeContext(sws_);
     sws_ = nullptr;
     av_frame_free(&decoded_);
@@ -317,6 +359,9 @@ bool FfmpegDecoder::publishYuv420(const AVFrame* src, DecodedFrame& out) {
 
 bool FfmpegDecoder::readFrame(DecodedFrame& out) {
     out = DecodedFrame{};
+    if (abort_.load()) {
+        return false;
+    }
     if (!opened_) {
         std::cerr << "FfmpegDecoder::readFrame: decoder is not open\n";
         return false;
@@ -327,6 +372,9 @@ bool FfmpegDecoder::readFrame(DecodedFrame& out) {
 
     int skipped_non_video = 0;
     while (true) {
+        if (abort_.load()) {
+            return false;
+        }
         const int recv = avcodec_receive_frame(codec_, decoded_);
         if (recv == 0) {
             const bool ok = publishYuv420(decoded_, out);
@@ -351,6 +399,10 @@ bool FfmpegDecoder::readFrame(DecodedFrame& out) {
         }
 
         const int read_rc = av_read_frame(fmt_, pkt_);
+        if (abort_.load()) {
+            av_packet_unref(pkt_);
+            return false;
+        }
         if (read_rc == AVERROR_EOF) {
             input_eof_ = true;
             const int flush_rc = avcodec_send_packet(codec_, nullptr);

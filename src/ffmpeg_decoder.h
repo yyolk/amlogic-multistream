@@ -2,6 +2,8 @@
 
 #include "decoder_backend.h"
 
+#include <atomic>
+
 struct AVFormatContext;
 struct AVCodecContext;
 struct AVFrame;
@@ -49,7 +51,11 @@ public:
     bool isHardware() const override { return false; }
     bool readFrame(DecodedFrame& frame) override;
 
+    // Latches an interrupt for FFmpeg's AVIOInterruptCB. See abort_ below.
+    void abort() override;
+
 private:
+    static int interruptCallback(void* opaque);
     bool failOpen(const char* what, int err);
     bool failRead(const char* what, int err);
     bool publishYuv420(const AVFrame* src, DecodedFrame& out);
@@ -70,4 +76,8 @@ private:
     bool failed_ = false;
     bool logged_format_ = false;
     bool allow_local_file_ = false;
+    // Set by abort() from the player thread. The decode thread's
+    // interruptCallback reads it. close() does not clear it: a decoder that
+    // has been aborted is not reused.
+    std::atomic<bool> abort_{false};
 };
