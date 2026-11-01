@@ -11,6 +11,12 @@ Multi-stream HLS viewer for Amlogic S922X (GS-King X / CoreELEC).
 
 ### Near-term milestone (product floor)
 - **Minimum product floor:** at least **2×2 (4 concurrent hardware-accelerated streams)** on GS-King X / CoreELEC 22. Prefer tile-sized HLS **480/720**; allow **1080p** when Mpx/s and `codec_mm` admit. The UI may still target up to **9** on CE22 (EGL compose); 9 is aspirational, not the floor. CE21 stays limited (instance cap 2) — do not promise a nine-tile CE21 wall; 2×2 is the CE22-oriented floor.
+- Plan order ([milestones](https://github.com/yyolk/amlogic-multistream/milestones)): **1-stream → 2 instances → 2×2 floor → 3×3 goal**.
+  - [Milestone #3](https://github.com/yyolk/amlogic-multistream/milestone/3) CE22 stage-1: 1-stream amcodec spike — [#65](https://github.com/yyolk/amlogic-multistream/issues/65)
+  - [Milestone #4](https://github.com/yyolk/amlogic-multistream/milestone/4) CE22 stage-2: dual instance — [#66](https://github.com/yyolk/amlogic-multistream/issues/66)
+  - [Milestone #1](https://github.com/yyolk/amlogic-multistream/milestone/1) 2×2 hardware wall (4 streams) product floor — [#67](https://github.com/yyolk/amlogic-multistream/issues/67)
+  - [Milestone #2](https://github.com/yyolk/amlogic-multistream/milestone/2) 3×3 hardware wall (9 streams) aspirational goal — [#68](https://github.com/yyolk/amlogic-multistream/issues/68)
+  - [Milestone #5](https://github.com/yyolk/amlogic-multistream/milestone/5) CE21: software wall + optional 1–2 amvideo — [#69](https://github.com/yyolk/amlogic-multistream/issues/69)
 
 ## Status
 Grid layout selection is implemented and unit-tested. MQTT command control keeps an in-memory stream table and, while `start` / `play` is set, software-decodes each visible `http://` or `https://` stream and presents it. `FfmpegDecoder` opens HLS, HTTP, or (on the `--url` path only) a file URL with libavformat/libavcodec, decodes on the CPU, and pulls 8-bit YUV420P frames through `DecoderBackend::readFrame`. `isHardware()` is false for this backend. An HLS master keeps the video stream `av_find_best_stream` returns — the first variant in playlist order, not the highest bitrate — and sets `AVDISCARD_ALL` on the others so later segments of the remaining variants are not downloaded.

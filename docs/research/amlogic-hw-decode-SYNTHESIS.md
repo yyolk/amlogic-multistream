@@ -41,9 +41,19 @@ V5** on a GS-King X.
 (4 concurrent hardware-accelerated streams)**, not 3×3. Prefer tile-sized
 HLS **480/720**; allow **1080p** when Mpx/s and `codec_mm` admit. The UI
 may still target up to 9 on CE22 (EGL compose); 9 is aspirational. Stage
-planning is: **1-stream spike → 2 instances → 2×2 before chasing 3×3**.
+planning is: **1-stream spike → 2 instances → 2×2 floor → 3×3 goal**.
 CE21 stays limited (instance cap 2) — do not promise a nine-tile CE21
 wall; 2×2 is the CE22-oriented floor.
+
+Filed trackers ([milestones](https://github.com/yyolk/amlogic-multistream/milestones)):
+
+| Order | Milestone | Issue |
+| --- | --- | --- |
+| 1 | [#3 CE22 stage-1: 1-stream amcodec spike](https://github.com/yyolk/amlogic-multistream/milestone/3) | [#65](https://github.com/yyolk/amlogic-multistream/issues/65) |
+| 2 | [#4 CE22 stage-2: dual instance](https://github.com/yyolk/amlogic-multistream/milestone/4) | [#66](https://github.com/yyolk/amlogic-multistream/issues/66) |
+| 3 | [#1 2×2 hardware wall (4 streams) product floor](https://github.com/yyolk/amlogic-multistream/milestone/1) | [#67](https://github.com/yyolk/amlogic-multistream/issues/67) |
+| 4 | [#2 3×3 hardware wall (9 streams) aspirational goal](https://github.com/yyolk/amlogic-multistream/milestone/2) | [#68](https://github.com/yyolk/amlogic-multistream/issues/68) |
+| (CE21) | [#5 CE21: software wall + optional 1–2 amvideo](https://github.com/yyolk/amlogic-multistream/milestone/5) | [#69](https://github.com/yyolk/amlogic-multistream/issues/69) |
 
 ---
 
@@ -142,9 +152,11 @@ growth. Not `amlogic_v4l2_decoder.*`.
 
 ### 3.6 Stage-2 (after stage-1, not this spike)
 
-**Product floor first.** After the 1-stream spike and a second instance,
-prove **2×2 (4 concurrent hardware-accelerated streams)** on CE22 before
-chasing 3×3. Prefer tile-sized HLS **480/720**; allow **1080p** when
+**Product floor first.** After the 1-stream spike ([#65](https://github.com/yyolk/amlogic-multistream/issues/65) / [milestone #3](https://github.com/yyolk/amlogic-multistream/milestone/3)) and a second instance ([#66](https://github.com/yyolk/amlogic-multistream/issues/66) / [milestone #4](https://github.com/yyolk/amlogic-multistream/milestone/4)),
+prove **2×2 (4 concurrent hardware-accelerated streams)** on CE22
+([#67](https://github.com/yyolk/amlogic-multistream/issues/67) / [milestone #1](https://github.com/yyolk/amlogic-multistream/milestone/1))
+before chasing 3×3 ([#68](https://github.com/yyolk/amlogic-multistream/issues/68) / [milestone #2](https://github.com/yyolk/amlogic-multistream/milestone/2)).
+Prefer tile-sized HLS **480/720**; allow **1080p** when
 Mpx/s and `codec_mm` admit. Nine tiles remain the UI / EGL-compose
 target, not the shipping minimum.
 
