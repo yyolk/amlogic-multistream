@@ -26,5 +26,7 @@ TopicCommand commandFromTopic(const std::string& prefix, const std::string& topi
 std::string resolveCommandName(const TopicCommand& topic, const JsonObject& payload);
 
 // Apply one command to in-memory stream state. `playing` is the player-loop flag.
+// `add` stores only http:// and https:// URLs, and rejects a NUL in the URL,
+// so a non-network URL never enters the table a decoder would open.
 CommandOutcome executeCommand(StreamManager& streams, bool& playing, const std::string& command,
                               const JsonObject& payload);

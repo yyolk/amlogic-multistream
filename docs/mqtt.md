@@ -42,7 +42,7 @@ Retained messages on command topics are ignored. A command is applied only when 
 
 ## Commands
 
-JSON objects. An empty payload is treated as `{}`. Field names and command names are case-insensitive for the command (`Add` and `add` are the same). Stream ids and URLs are case-sensitive. Unknown object fields are ignored. Nested objects and arrays are ignored.
+JSON objects. An empty payload is treated as `{}`. Command names are case-insensitive (`Add` and `add` are the same). Field names, stream ids, and URLs are case-sensitive. Unknown object fields are ignored. Nested objects and arrays are ignored.
 
 `play` is an alias of `start`.
 
@@ -52,7 +52,7 @@ Publish either to `<prefix>/cmd/<command>` or to `<prefix>/cmd` with `"action"` 
 | --- | --- | --- |
 | `start`, `play` | none | Set the player-loop flag. MQTT stays connected. |
 | `stop` | none | Clear the player-loop flag. MQTT stays connected. |
-| `add` | `id`, `url` (strings) | Insert a stream. Same id and url again is success (`already present`). Same id with a different url is rejected. |
+| `add` | `id`, `url` (strings) | Insert a stream. `url` must start with `http://` or `https://` (lowercase scheme). A NUL byte in the URL is rejected, and so is any other scheme (`file`, `tcp`, `pipe`, `concat`, …). The rejected URL is not stored. Same id and url again is success (`already present`). Same id with a different url is rejected. |
 | `remove` | `id` | Remove that stream. |
 | `list` | none | Republish `<prefix>/status`. The response message is `ok`. |
 | `layout` | `layout` optional | With no `layout` field, respond with the effective layout and do not change state. Otherwise store the token. `auto` picks a grid from the stream count (`1x1`, `1x2`, `2x2`, `2x3`, `3x3`). Any other non-empty string is stored and echoed back. |
@@ -69,7 +69,7 @@ Published to `<prefix>/response`:
 {"ok":true,"command":"add","id":"cam1","message":"added"}
 ```
 
-`id` is `""` when the command has no stream id. `ok` is `false` for unknown commands, malformed JSON, a missing stream, or a duplicate id with a different url. Messages used today include `playing`, `stopped`, `added`, `already present`, `stream already exists`, `removed`, `stream not found`, `ok`, `muted`, `unmuted`, `restart requested`, `restarted N`, `command is required`, `unknown command`, `id and url are required`, `id is required`, `muted is required`, `layout must be a non-empty string`, `invalid json`, and `payload too large`.
+`id` is `""` when the command has no stream id. `ok` is `false` for unknown commands, malformed JSON, a missing stream, a duplicate id with a different url, or a URL that is not `http://` or `https://`. Messages used today include `playing`, `stopped`, `added`, `already present`, `stream already exists`, `removed`, `stream not found`, `ok`, `muted`, `unmuted`, `restart requested`, `restarted N`, `command is required`, `unknown command`, `id and url are required`, `url must be http:// or https://`, `id is required`, `muted is required`, `layout must be a non-empty string`, `invalid json`, and `payload too large`.
 
 A successful `layout` command uses the effective layout string as `message` (for example `2x2` or `1x2`).
 
