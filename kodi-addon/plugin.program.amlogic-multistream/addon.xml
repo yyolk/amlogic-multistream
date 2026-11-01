@@ -10,8 +10,8 @@
     <provides>executable game</provides>
   </extension>
   <extension point="xbmc.addon.metadata">
-    <summary lang="en_GB">Stop Kodi, run amlogic-multistream, start Kodi again</summary>
-    <description lang="en_GB">RetroArch-style launcher for the amlogic-multistream player on CoreELEC. Launch stops Kodi, runs the player binary (default /storage/amlogic-multistream), and starts Kodi when the player exits. The player binary is not part of this add-on. Install the device AppImage for the box's CoreELEC line: coreelec21-ng-armv7hf (32-bit ARM) on CoreELEC 21 Amlogic-ng, or coreelec22-no-aarch64 (64-bit ARM) on CoreELEC 22 Amlogic-no. The x86_64 and Ubuntu aarch64 CI AppImages are host smoke builds and do not run there.</description>
+    <summary lang="en_GB">Stop Kodi, run amlogic-multistream, start Kodi again (player not included)</summary>
+    <description lang="en_GB">RetroArch-style launcher for the amlogic-multistream player on CoreELEC. Launch stops Kodi, runs the player binary (default /storage/amlogic-multistream), and starts Kodi when the player exits. This add-on does not bundle or download the player AppImage/binary; install it at the Player binary path yourself. Use the device AppImage for the box's CoreELEC line: coreelec21-ng-armv7hf (32-bit ARM) on CoreELEC 21 Amlogic-ng, or coreelec22-no-aarch64 (64-bit ARM) on CoreELEC 22 Amlogic-no. The x86_64 and Ubuntu aarch64 CI AppImages are host smoke builds and do not run there.</description>
     <disclaimer lang="en_GB">Kodi is stopped while the player runs. Return to Kodi by stopping the player, for example: systemctl stop amlogic-multistream-launch</disclaimer>
     <platform>linux</platform>
     <assets>

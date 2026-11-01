@@ -6,6 +6,9 @@ Running it **requires GS-King X / CoreELEC**. CI checks the add-on on a host onl
 
 ## The player binary is not included
 
+> [!IMPORTANT]
+> **This add-on does not bundle, download, or update the player AppImage or binary.** Some fuller RetroArch add-ons for CoreELEC download or ship an AppImage; this one does not. It is only a thin `systemd-run` launcher for `scripts/launch-coreelec.sh`. You must install the player at `PLAYER_BIN` yourself. Tracking issue: [#14](https://github.com/yyolk/amlogic-multistream/issues/14).
+
 The add-on runs whatever is at `PLAYER_BIN`, which defaults to `/storage/amlogic-multistream`. Put the device AppImage for the box's CoreELEC line there (see "Device AppImages" in the README):
 
 | CoreELEC on the box | `/etc/os-release` | Device AppImage |
