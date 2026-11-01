@@ -1,4 +1,7 @@
 build/
+dist/
+.cache/
+squashfs-root/
 *.o
 *.so
 *.a

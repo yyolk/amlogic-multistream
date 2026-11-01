@@ -1,0 +1,28 @@
+{
+  "name": "amlogic-multistream",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  "containerEnv": {
+    "CC": "gcc",
+    "CXX": "g++"
+  },
+  // Leaves build/ configured so `ctest --test-dir build --output-on-failure` works.
+  "postCreateCommand": "bash scripts/run-tests.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools"
+      ],
+      "settings": {
+        "cmake.buildDirectory": "${workspaceFolder}/build",
+        "cmake.configureArgs": [
+          "-DCMAKE_CXX_COMPILER=g++"
+        ],
+        "cmake.ctest.testExplorerIntegrationEnabled": true
+      }
+    }
+  }
+}

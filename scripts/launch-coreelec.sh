@@ -1,4 +1,5 @@
 #!/bin/sh
+# requires GS-King X / CoreELEC
 # RetroArch-style launch for CoreELEC
 # Stop Kodi, run the multistream app, restart Kodi
 #

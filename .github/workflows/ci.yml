@@ -1,0 +1,119 @@
+# Two native builds. Neither job calls scripts/launch-coreelec.sh
+# (that script requires GS-King X / CoreELEC).
+#
+# - ubuntu-24.04: x86_64 host/Codespaces smoke AppImage
+# - ubuntu-24.04-arm: aarch64 AppImage for Amlogic S922X
+#
+# Both runners execute the player and the unit tests natively, so this
+# workflow does not cross-compile.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    env:
+      CMAKE_BUILD_TYPE: Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('CMakeLists.txt', 'src/**', 'tests/**') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: Cache AppImage tools
+        uses: actions/cache@v6
+        with:
+          path: .cache/appimage-tools
+          key: appimage-tools-${{ runner.os }}-${{ matrix.arch }}-v1
+
+      # Library list matches .devcontainer/Dockerfile, plus ccache and the
+      # ffmpeg CLI (ffmpeg_decoder_tests synthesizes a local fixture).
+      # layout_engine_tests itself only needs a C++ compiler.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            ca-certificates \
+            ccache \
+            cmake \
+            curl \
+            ffmpeg \
+            file \
+            g++ \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libdrm-dev \
+            libfuse2t64 \
+            libmosquitto-dev \
+            libswscale-dev \
+            patchelf \
+            pkg-config
+
+      - name: Run unit tests
+        run: ./scripts/run-tests.sh
+
+      - name: Build AppImage
+        run: ./scripts/build-appimage.sh
+
+      - name: Check AppImage architecture
+        run: |
+          set -euo pipefail
+          mapfile -t images < <(find dist -maxdepth 1 -type f -name '*.AppImage' | sort)
+          if [[ "${#images[@]}" -ne 1 ]]; then
+            echo "expected one AppImage, found ${#images[@]}" >&2
+            printf '%s\n' "${images[@]}" >&2
+            exit 1
+          fi
+          name="$(basename "${images[0]}")"
+          case "$name" in
+            *-"${{ matrix.arch }}".AppImage) ;;
+            *)
+              echo "expected ${{ matrix.arch }} in ${name}" >&2
+              exit 1
+              ;;
+          esac
+          file "${images[0]}"
+          if [[ "${{ matrix.arch }}" == "aarch64" ]]; then
+            file "${images[0]}" | grep -E -i -q 'aarch64'
+          else
+            file "${images[0]}" | grep -E -i -q 'x86-64|x86_64'
+          fi
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: amlogic-multistream-appimage-${{ matrix.arch }}
+          path: dist/*.AppImage
+          if-no-files-found: error
+          compression-level: 0

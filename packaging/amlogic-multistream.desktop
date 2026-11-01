@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=amlogic-multistream
+GenericName=Multi-stream viewer
+Comment=Multi-stream HLS viewer
+Exec=amlogic-multistream
+Icon=amlogic-multistream
+Terminal=false
+Categories=AudioVideo;Video;Player;
+StartupNotify=false
