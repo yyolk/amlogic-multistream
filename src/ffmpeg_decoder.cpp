@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -127,14 +128,22 @@ bool endsWithIgnoreCase(const std::string& s, const char* suffix) {
     return true;
 }
 
-// Peek only playlist-looking URLs. A .ts / .mp4 open must not pay an extra
-// read; D4's master and the ADTS-audio master are .m3u8 (or hls+).
-bool urlLooksLikeHlsPlaylist(const std::string& url) {
-    if (url.compare(0, 4, "hls+") == 0 || url.compare(0, 4, "HLS+") == 0) {
-        return true;
-    }
+// Skip the extra preview on known media files so a .ts / .mp4 open does
+// not pay another read. Extensionless http(s) still peeks.
+bool urlLooksLikeMediaSegment(const std::string& url) {
     const std::string path = stripUrlQuery(url);
-    return endsWithIgnoreCase(path, ".m3u8") || endsWithIgnoreCase(path, ".m3u");
+    static const char* const kExt[] = {".ts",  ".mp4", ".m4s",  ".m4v", ".mov",
+                                       ".aac", ".ac3", ".eac3", ".mp3", ".gif"};
+    for (const char* ext : kExt) {
+        if (endsWithIgnoreCase(path, ext)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool shouldPeekForHls(const std::string& url) {
+    return !urlLooksLikeMediaSegment(url);
 }
 
 std::string trimCopy(const std::string& s) {
@@ -285,6 +294,38 @@ std::string resolvePlaylistUrl(const std::string& base, const std::string& ref) 
     return root.substr(0, slash + 1) + rel;
 }
 
+void stripUtf8Bom(std::string* text) {
+    if (text != nullptr && text->size() >= 3 && static_cast<unsigned char>((*text)[0]) == 0xEF &&
+        static_cast<unsigned char>((*text)[1]) == 0xBB &&
+        static_cast<unsigned char>((*text)[2]) == 0xBF) {
+        text->erase(0, 3);
+    }
+}
+
+bool firstLineIsExtm3u(const std::string& text) {
+    const auto nl = text.find('\n');
+    const std::string start = trimCopy(text.substr(0, nl == std::string::npos ? text.size() : nl));
+    return start.compare(0, 7, "#EXTM3U") == 0;
+}
+
+bool samePlaylistUrl(const std::string& a, const std::string& b) {
+    if (a == b) {
+        return true;
+    }
+    const std::string sa = stripUrlQuery(a);
+    const std::string sb = stripUrlQuery(b);
+    return !sa.empty() && sa == sb;
+}
+
+bool urlAlreadyVisited(const std::vector<std::string>& seen, const std::string& url) {
+    for (const std::string& prev : seen) {
+        if (samePlaylistUrl(prev, url)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string readHlsPlaylistPreview(const std::string& url, bool allow_local, AVIOInterruptCB* cb) {
     AVDictionary* opts = nullptr;
     setDecoderIoOptions(&opts, allow_local);
@@ -296,6 +337,7 @@ std::string readHlsPlaylistPreview(const std::string& url, bool allow_local, AVI
     }
     std::string out;
     unsigned char buf[4096];
+    constexpr size_t kSniff = 256;
     constexpr size_t kMax = 1024 * 1024;
     while (out.size() < kMax) {
         const int n = avio_read(pb, buf, sizeof(buf));
@@ -303,6 +345,13 @@ std::string readHlsPlaylistPreview(const std::string& url, bool allow_local, AVI
             break;
         }
         out.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
+        if (out.size() >= kSniff) {
+            std::string sniff = out;
+            stripUtf8Bom(&sniff);
+            if (!firstLineIsExtm3u(sniff)) {
+                break;
+            }
+        }
     }
     avio_closep(&pb);
     return out;
@@ -311,29 +360,38 @@ std::string readHlsPlaylistPreview(const std::string& url, bool allow_local, AVI
 // FFmpeg 6.1.1 hls_read_header calls avformat_find_stream_info(pls->ctx, NULL)
 // for an ID3-timestamped or TYPE=AUDIO rendition (AUDIT12 D4). There is no
 // format-wide codec option, so that nested probe keeps max_pixels == INT_MAX.
-// This player only presents video: open the first STREAM-INF playlist instead
-// of a master that names an external audio group. Packed-audio renditions
-// (the ADTS H1 case) stay unused, same as AVDISCARD_ALL after a full open.
-void preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AVIOInterruptCB* cb) {
-    if (url == nullptr || url->empty() || !urlLooksLikeHlsPlaylist(*url)) {
-        return;
+// This player only presents video: follow STREAM-INF while the playlist names
+// an external audio group, and refuse when there is no safe video playlist
+// (no STREAM-INF, a self-loop, or rewrite depth exceeded). Packed-audio
+// renditions (the ADTS H1 case) stay unused, same as AVDISCARD_ALL.
+//
+// Returns false if avformat_open_input must not run on the current URL.
+bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AVIOInterruptCB* cb) {
+    if (url == nullptr || url->empty()) {
+        return true;
     }
-    std::string body = readHlsPlaylistPreview(*url, allow_local, cb);
-    if (body.size() >= 3 && static_cast<unsigned char>(body[0]) == 0xEF &&
-        static_cast<unsigned char>(body[1]) == 0xBB &&
-        static_cast<unsigned char>(body[2]) == 0xBF) {
-        body.erase(0, 3);
-    }
-    const auto nl = body.find('\n');
-    const std::string start = trimCopy(body.substr(0, nl == std::string::npos ? body.size() : nl));
-    if (start.compare(0, 7, "#EXTM3U") != 0 || !hlsMasterHasExternalAudio(body)) {
-        return;
-    }
-    const std::string rel = firstHlsStreamInfUri(body);
-    const std::string resolved = resolvePlaylistUrl(*url, rel);
-    if (!resolved.empty() && resolved != *url) {
+    constexpr int kMaxRewrites = 8;
+    std::vector<std::string> seen;
+    seen.reserve(static_cast<size_t>(kMaxRewrites) + 1);
+    seen.push_back(*url);
+    for (int depth = 0; depth < kMaxRewrites; ++depth) {
+        if (!shouldPeekForHls(*url)) {
+            return true;
+        }
+        std::string body = readHlsPlaylistPreview(*url, allow_local, cb);
+        stripUtf8Bom(&body);
+        if (!firstLineIsExtm3u(body) || !hlsMasterHasExternalAudio(body)) {
+            return true;
+        }
+        const std::string rel = firstHlsStreamInfUri(body);
+        const std::string resolved = resolvePlaylistUrl(*url, rel);
+        if (rel.empty() || resolved.empty() || urlAlreadyVisited(seen, resolved)) {
+            return false;
+        }
         *url = resolved;
+        seen.push_back(resolved);
     }
+    return false;
 }
 
 void freeStreamOptions(AVDictionary** stream_opts, unsigned count) {
@@ -625,10 +683,15 @@ bool FfmpegDecoder::open(const std::string& url) {
     fmt_->interrupt_callback.opaque = this;
 
     // AUDIT12 D4: a master with TYPE=AUDIO URI= is probed inside
-    // avformat_open_input with find_stream_info(NULL). Open the first
-    // video playlist instead so that nested decode never runs uncapped.
+    // avformat_open_input with find_stream_info(NULL). Follow STREAM-INF
+    // to a playlist that does not name that group. Refuse when there is
+    // no safe video playlist so the nested probe never runs uncapped.
     std::string open_url = url_;
-    preferFirstHlsVariantIfExternalAudio(&open_url, allow_local_file_, &fmt_->interrupt_callback);
+    if (!preferFirstHlsVariantIfExternalAudio(&open_url, allow_local_file_,
+                                             &fmt_->interrupt_callback)) {
+        av_dict_free(&opts);
+        return failOpen("HLS master audio rendition has no safe video playlist", AVERROR(EINVAL));
+    }
     const int open_rc = avformat_open_input(&fmt_, open_url.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     if (open_rc < 0) {

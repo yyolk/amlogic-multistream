@@ -254,6 +254,99 @@ struct LocalHttp {
     }
 };
 
+[[noreturn]] void serveDirLoop(int listenFd, std::filesystem::path root) {
+    ::signal(SIGPIPE, SIG_IGN);
+    while (true) {
+        const int client = ::accept(listenFd, nullptr, nullptr);
+        if (client < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            _exit(0);
+        }
+        const std::string path = requestPath(readRequest(client));
+        std::filesystem::path rel;
+        bool ok = !path.empty() && path[0] == '/';
+        if (ok) {
+            rel = std::filesystem::path(path.substr(1));
+            for (const std::filesystem::path& part : rel) {
+                if (part == "..") {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        std::string body;
+        if (ok) {
+            std::ifstream in(root / rel, std::ios::binary);
+            if (!in) {
+                ok = false;
+            } else {
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                body = ss.str();
+            }
+        }
+        if (!ok) {
+            const char* missing =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, missing, std::char_traits<char>::length(missing));
+            ::close(client);
+            continue;
+        }
+        const char* type = "application/octet-stream";
+        const std::string ext = rel.extension().string();
+        if (ext == ".m3u8" || ext == ".m3u" ||
+            (ext.empty() && body.compare(0, 7, "#EXTM3U") == 0)) {
+            type = "application/vnd.apple.mpegurl";
+        }
+        std::ostringstream hdr;
+        hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << body.size()
+            << "\r\nContent-Type: " << type << "\r\nConnection: close\r\n\r\n";
+        const std::string header = hdr.str();
+        sendAll(client, header.data(), header.size());
+        sendAll(client, body.data(), body.size());
+        ::close(client);
+    }
+}
+
+LocalHttp startDirServer(const std::filesystem::path& root) {
+    LocalHttp server;
+    const int listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listenFd < 0) {
+        return server;
+    }
+    const int yes = 1;
+    ::setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0);
+    if (::bind(listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(listenFd, 16) != 0) {
+        ::close(listenFd);
+        return server;
+    }
+    sockaddr_in bound{};
+    socklen_t boundLen = sizeof(bound);
+    if (::getsockname(listenFd, reinterpret_cast<sockaddr*>(&bound), &boundLen) != 0) {
+        ::close(listenFd);
+        return server;
+    }
+    const pid_t pid = fork();
+    if (pid < 0) {
+        ::close(listenFd);
+        return server;
+    }
+    if (pid == 0) {
+        serveDirLoop(listenFd, root);
+    }
+    ::close(listenFd);
+    server.pid = pid;
+    server.port = ntohs(bound.sin_port);
+    return server;
+}
+
 LocalHttp startPlaylistServer(const std::string& body) {
     LocalHttp server;
     const int listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -666,24 +759,140 @@ int main() {
                           "CODECS=\"avc1.42e01e,mp4a.40.2\",AUDIO=\"aud\"\n"
                        << videoHls.filename().string() << "\n";
             }
+            auto d4MustStayCapped = [&](const char* label, int rc, long rss, const std::string& gotOut,
+                                        const std::string& gotErr, bool mustPresent) {
+                constexpr long kD4RssKb = 100000;
+                if (rss >= kD4RssKb || gotOut.find("12000x12000") != std::string::npos ||
+                    (gotOut.find("presented ") != std::string::npos &&
+                     gotOut.find("160x120") == std::string::npos)) {
+                    std::cerr << "AUDIT12 D4 " << label << " must stay under " << kD4RssKb
+                              << " KB (exit " << rc << " rss_kb=" << rss << ")\n"
+                              << gotOut << gotErr;
+                    return false;
+                }
+                if (mustPresent &&
+                    (rc != 0 || gotOut.find("presented ") == std::string::npos ||
+                     gotOut.find("160x120") == std::string::npos)) {
+                    std::cerr << "AUDIT12 D4 " << label << " must present 160x120 (exit " << rc
+                              << " rss_kb=" << rss << ")\n"
+                              << gotOut << gotErr;
+                    return false;
+                }
+                if (!mustPresent &&
+                    (rc == 0 || gotOut.find("presented ") != std::string::npos ||
+                     gotOut.find("Decoded ") != std::string::npos)) {
+                    std::cerr << "AUDIT12 D4 " << label << " must refuse open (exit " << rc
+                              << " rss_kb=" << rss << ")\n"
+                              << gotOut << gotErr;
+                    return false;
+                }
+                return true;
+            };
+
             long d4RssKb = 0;
             const int d4Rc =
                 run({player, "--url", masterAudio.string(), "--frames", "1"}, out, err, &d4RssKb);
-            const std::string d4Out = readFile(out);
-            const std::string d4Err = readFile(err);
-            constexpr long kD4RssKb = 100000;
-            if (d4RssKb >= kD4RssKb || d4Out.find("12000x12000") != std::string::npos ||
-                (d4Out.find("presented ") != std::string::npos &&
-                 d4Out.find("160x120") == std::string::npos)) {
-                std::cerr << "AUDIT12 D4 master-audio --url must stay under " << kD4RssKb
-                          << " KB (exit " << d4Rc << " rss_kb=" << d4RssKb << ")\n"
-                          << d4Out << d4Err;
+            if (!d4MustStayCapped("master-audio", d4Rc, d4RssKb, readFile(out), readFile(err),
+                                  true)) {
                 return 1;
             }
-            if (d4Rc == 0 && (d4Out.find("presented ") == std::string::npos ||
-                              d4Out.find("160x120") == std::string::npos)) {
-                std::cerr << "AUDIT12 D4 master-audio --url opened but did not present 160x120\n"
-                          << d4Out << d4Err;
+
+            // No STREAM-INF: rewrite used to keep the master and the nested
+            // probe still ran at INT_MAX (~381 MB). Refuse instead.
+            const std::filesystem::path mediaOnly = tmp.path() / "d4-media-only.m3u8";
+            {
+                std::ofstream playlist(mediaOnly);
+                playlist << "#EXTM3U\n"
+                         << "#EXT-X-VERSION:4\n"
+                         << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\","
+                            "DEFAULT=YES,URI=\""
+                         << audioHls.filename().string() << "\"\n"
+                         << "#EXT-X-TARGETDURATION:1\n"
+                         << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                         << "#EXTINF:0.400,\n"
+                         << smallTs.filename().string() << "\n"
+                         << "#EXT-X-ENDLIST\n";
+            }
+            long mediaRss = 0;
+            const int mediaRc =
+                run({player, "--url", mediaOnly.string(), "--frames", "1"}, out, err, &mediaRss);
+            if (!d4MustStayCapped("media-only AUDIO", mediaRc, mediaRss, readFile(out),
+                                  readFile(err), false)) {
+                return 1;
+            }
+
+            // STREAM-INF points at this playlist. The first rewrite used to
+            // skip (resolved == url) and FFmpeg then recursed (~1 GB).
+            const std::filesystem::path selfMaster = tmp.path() / "d4-self.m3u8";
+            {
+                std::ofstream playlist(selfMaster);
+                playlist << "#EXTM3U\n"
+                         << "#EXT-X-VERSION:4\n"
+                         << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\","
+                            "DEFAULT=YES,URI=\""
+                         << audioHls.filename().string() << "\"\n"
+                         << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                         << selfMaster.filename().string() << "\n";
+            }
+            long selfRss = 0;
+            const int selfRc =
+                run({player, "--url", selfMaster.string(), "--frames", "1"}, out, err, &selfRss);
+            if (!d4MustStayCapped("self-loop STREAM-INF", selfRc, selfRss, readFile(out),
+                                  readFile(err), false)) {
+                return 1;
+            }
+
+            // One-level rewrite used to stop on the inner master, which still
+            // names the same audio group.
+            const std::filesystem::path nestedInner = tmp.path() / "d4-nested-inner.m3u8";
+            const std::filesystem::path nestedOuter = tmp.path() / "d4-nested-outer.m3u8";
+            {
+                std::ofstream inner(nestedInner);
+                inner << "#EXTM3U\n"
+                      << "#EXT-X-VERSION:4\n"
+                      << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\","
+                         "DEFAULT=YES,URI=\""
+                      << audioHls.filename().string() << "\"\n"
+                      << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                      << videoHls.filename().string() << "\n";
+                std::ofstream outer(nestedOuter);
+                outer << "#EXTM3U\n"
+                      << "#EXT-X-VERSION:4\n"
+                      << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\","
+                         "DEFAULT=YES,URI=\""
+                      << audioHls.filename().string() << "\"\n"
+                      << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                      << nestedInner.filename().string() << "\n";
+            }
+            long nestedRss = 0;
+            const int nestedRc =
+                run({player, "--url", nestedOuter.string(), "--frames", "1"}, out, err, &nestedRss);
+            if (!d4MustStayCapped("nested master", nestedRc, nestedRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+
+            // Extensionless HTTP URL, Content-Type mpegurl. The first peek
+            // only ran for .m3u8 / hls+.
+            const std::filesystem::path extless = tmp.path() / "playlist";
+            {
+                std::ifstream src(masterAudio);
+                std::ofstream dst(extless);
+                dst << src.rdbuf();
+            }
+            LocalHttp d4http = startDirServer(tmp.path());
+            if (d4http.pid <= 0 || d4http.port <= 0) {
+                std::cerr << "D4 extensionless playlist server failed to start\n";
+                return 1;
+            }
+            const std::string extlessUrl =
+                "http://127.0.0.1:" + std::to_string(d4http.port) + "/playlist";
+            long extlessRss = 0;
+            const int extlessRc =
+                run({player, "--url", extlessUrl, "--frames", "1"}, out, err, &extlessRss);
+            d4http.stop();
+            if (!d4MustStayCapped("extensionless HTTP", extlessRc, extlessRss, readFile(out),
+                                  readFile(err), true)) {
                 return 1;
             }
         }

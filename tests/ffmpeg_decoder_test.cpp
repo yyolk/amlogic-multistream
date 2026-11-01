@@ -981,6 +981,91 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
                << d4video.filename().string() << "\n";
     }
     testDecode(d4master.string());
+
+    g_case = "hls media-only AUDIO no STREAM-INF refuses";
+    const std::filesystem::path d4media = dir / "d4-media-only.m3u8";
+    {
+        std::ofstream playlist(d4media);
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\"\n"
+                 << "#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                 << "#EXTINF:0.400,\n"
+                 << smallPmt.filename().string() << "\n"
+                 << "#EXT-X-ENDLIST\n";
+    }
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open(d4media.string()));
+        decoder.close();
+    }
+
+    g_case = "hls self-loop STREAM-INF refuses";
+    const std::filesystem::path d4self = dir / "d4-self.m3u8";
+    {
+        std::ofstream playlist(d4self);
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4self.filename().string() << "\n";
+    }
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open(d4self.string()));
+        decoder.close();
+    }
+
+    g_case = "hls nested master audio presents small stream";
+    const std::filesystem::path d4inner = dir / "d4-nested-inner.m3u8";
+    const std::filesystem::path d4outer = dir / "d4-nested-outer.m3u8";
+    {
+        std::ofstream inner(d4inner);
+        inner << "#EXTM3U\n"
+              << "#EXT-X-VERSION:4\n"
+              << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+              << d4audio.filename().string() << "\"\n"
+              << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+              << d4video.filename().string() << "\n";
+        std::ofstream outer(d4outer);
+        outer << "#EXTM3U\n"
+              << "#EXT-X-VERSION:4\n"
+              << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+              << d4audio.filename().string() << "\"\n"
+              << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+              << d4inner.filename().string() << "\n";
+    }
+    testDecode(d4outer.string());
+
+    g_case = "hls extensionless http master audio";
+    {
+        std::ifstream src(d4master);
+        std::ofstream dst(dir / "playlist");
+        dst << src.rdbuf();
+    }
+    const std::filesystem::path get_log = dir / "d4-extless-gets.log";
+    LocalHttp server = startLocalHttp(dir, get_log);
+    CHECK(server.pid > 0);
+    CHECK(server.port > 0);
+    if (server.pid > 0 && server.port > 0) {
+        FfmpegDecoder decoder;
+        const std::string url =
+            "http://127.0.0.1:" + std::to_string(server.port) + "/playlist";
+        const bool opened = decoder.open(url);
+        CHECK(opened);
+        if (opened) {
+            DecodedFrame frame;
+            CHECK(decoder.readFrame(frame));
+            expectYuv420(frame);
+        }
+        decoder.close();
+    }
+    server.stop();
 }
 
 void testMissingFile(const std::filesystem::path& dir) {
