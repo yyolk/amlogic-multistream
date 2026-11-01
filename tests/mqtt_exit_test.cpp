@@ -17,6 +17,10 @@
 // reconnect is stuck in getaddrinfo (broker gone before SIGTERM, or during
 // the drain after the offline publish went out) or in connect() to a broker
 // that drops packets.
+//
+// AUDIT6 N1: SIGTERM while the first mosquitto_connect_async is stuck in
+// getaddrinfo must exit without waiting out that lookup. The main thread
+// stays in sigtimedwait; the helper is abandoned on _exit.
 
 #include "decoder_backend.h"
 #include "mqtt_controller.h"
@@ -827,6 +831,61 @@ void testAuthGiveUpBounded(Broker& broker, int port, const std::string& dir) {
     }
 }
 
+// AUDIT6 N1. The stall file is already present, so the first
+// mosquitto_connect_async never returns from getaddrinfo. SIGTERM must
+// not wait for that lookup; nothing has been published yet.
+void testStartupStalledLookup(const std::string& dir) {
+    g_dnsStallPath = dir + "/dns-stall";
+    g_dnsEnteredPath = dir + "/dns-entered";
+    unlink(g_dnsStallPath.c_str());
+    unlink(g_dnsEnteredPath.c_str());
+    touch(g_dnsStallPath);
+    const std::string outPath = dir + "/startup-dns.out";
+    const std::string errPath = dir + "/startup-dns.err";
+    const pid_t pid = spawnPlayer(1, "audit6-n1", "audit6-n1-client", dir + "/stall-n1",
+                                  outPath, errPath, kStallHost);
+    if (pid <= 0) {
+        fail("startup-dns: fork failed");
+        unlink(g_dnsStallPath.c_str());
+        return;
+    }
+    if (!waitUntil([&] { return access(g_dnsEnteredPath.c_str(), F_OK) == 0; }, 5000)) {
+        fail("startup-dns: first connect did not reach the stalled lookup");
+        dumpFile(outPath);
+        dumpFile(errPath);
+        kill(pid, SIGKILL);
+        waitExit(pid, 1000);
+        unlink(g_dnsStallPath.c_str());
+        return;
+    }
+    if (kill(pid, SIGTERM) != 0) {
+        fail("startup-dns: kill failed");
+        waitExit(pid, 1000);
+        unlink(g_dnsStallPath.c_str());
+        return;
+    }
+    const Exit result = waitExit(pid, 5000);
+    std::cout << "startup-dns elapsedMs=" << result.elapsedMs << " code=" << result.code << "\n";
+    if (!result.exited || result.code != 0 || result.elapsedMs > 1500) {
+        fail("startup-dns: expected exit 0 within 1500 ms, got exited=" +
+             std::to_string(result.exited) + " code=" + std::to_string(result.code) +
+             " elapsedMs=" + std::to_string(result.elapsedMs));
+        dumpFile(outPath);
+        dumpFile(errPath);
+    }
+    if (!fileContains(outPath, "MQTT shutting down on signal 15")) {
+        fail("startup-dns: did not log signal 15");
+        dumpFile(outPath);
+        dumpFile(errPath);
+    }
+    if (fileContains(outPath, "MQTT running") || fileContains(outPath, "MQTT status")) {
+        fail("startup-dns: reached the post-connect path before SIGTERM");
+        dumpFile(outPath);
+        dumpFile(errPath);
+    }
+    unlink(g_dnsStallPath.c_str());
+}
+
 void testStartupAuthExitCode(Broker& broker, int port, const std::string& dir) {
     if (!broker.start(port, false)) {
         fail("startup auth: broker did not start");
@@ -903,6 +962,7 @@ int main() {
         testBrokerDropDuringDrain(broker, port, dir);
         testAuthGiveUpBounded(broker, port, dir);
         testStartupAuthExitCode(broker, port, dir);
+        testStartupStalledLookup(dir);
     }
     mosquitto_lib_cleanup();
     if (g_failures != 0) {

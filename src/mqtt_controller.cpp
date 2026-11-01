@@ -8,6 +8,7 @@
 
 #include <mosquitto.h>
 
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include <mutex>
 #include <pthread.h>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -221,36 +223,63 @@ int MqttController::start(int argc, char* argv[]) {
                  "Stop this process to return to Kodi.\n";
 
     // libmosquitto 2.0's threaded loop does not recover when the first
-    // connect_async fails (connection refused or a lookup error). Retry here
-    // with the same 1s..30s backoff, and keep accepting SIGINT/SIGTERM/SIGHUP
-    // so the launch script can still start Kodi.
-    int backoffSec = 1;
-    while (true) {
-        rc = mosquitto_connect_async(mosq_, config_.host.c_str(), config_.port, config_.keepalive);
-        if (rc == MOSQ_ERR_SUCCESS || rc == MOSQ_ERR_CONN_PENDING) {
-            break;
-        }
-        std::cerr << "MQTT connect failed: " << mosquitto_strerror(rc) << " (will retry)\n";
+    // connect_async fails (connection refused or a lookup error). Retry on a
+    // helper with the same 1s..30s backoff. connect_async still calls
+    // getaddrinfo on that thread; a silent nameserver would otherwise hold
+    // this thread past launch-coreelec.sh's 10s SIGTERM poll (AUDIT6 N1).
+    // The helper is not joined on a signal: nothing has been published yet,
+    // so flush and _exit. After mosquitto_loop_start the post-connect path
+    // in finishProcess already covers a reconnect stuck in getaddrinfo.
+    std::atomic<bool> connectReady{false};
+    std::thread connector;
+    try {
+        connector = std::thread([this, &connectReady]() {
+            int backoffSec = 1;
+            while (true) {
+                const int attempt = mosquitto_connect_async(mosq_, config_.host.c_str(),
+                                                            config_.port, config_.keepalive);
+                if (attempt == MOSQ_ERR_SUCCESS || attempt == MOSQ_ERR_CONN_PENDING) {
+                    connectReady.store(true);
+                    return;
+                }
+                std::cerr << "MQTT connect failed: " << mosquitto_strerror(attempt)
+                          << " (will retry)\n";
+                std::this_thread::sleep_for(std::chrono::seconds(backoffSec));
+                if (backoffSec < 30) {
+                    backoffSec *= 2;
+                    if (backoffSec > 30) {
+                        backoffSec = 30;
+                    }
+                }
+            }
+        });
+    } catch (const std::exception& ex) {
+        std::cerr << "MQTT connect thread failed: " << ex.what() << "\n";
+        shutdown();
+        return 1;
+    }
+
+    while (!connectReady.load()) {
         timespec timeout{};
-        timeout.tv_sec = backoffSec;
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = kTickWaitNs;
         const int sig = sigtimedwait(&signals, nullptr, &timeout);
         if (sig > 0) {
             std::cout << "MQTT shutting down on signal " << sig << "\n";
-            shutdown();
-            return 0;
+            std::cout.flush();
+            std::cerr.flush();
+            std::fflush(nullptr);
+            _exit(0);
         }
         if (sig < 0 && errno != EAGAIN && errno != EINTR) {
             std::cerr << "sigtimedwait failed: " << std::strerror(errno) << "\n";
-            shutdown();
-            return 1;
-        }
-        if (backoffSec < 30) {
-            backoffSec *= 2;
-            if (backoffSec > 30) {
-                backoffSec = 30;
-            }
+            std::cout.flush();
+            std::cerr.flush();
+            std::fflush(nullptr);
+            _exit(1);
         }
     }
+    connector.join();
 
     rc = mosquitto_loop_start(mosq_);
     if (rc != MOSQ_ERR_SUCCESS) {
