@@ -160,3 +160,14 @@ CoreELEC has no `fusermount`. A type-2 AppImage is extracted once to `/storage/a
 CI runs `scripts/test-launch-coreelec.sh` with a stand-in runtime, and again against the packaged AppImage. It does not boot a GS-King X.
 
 Put a 32-bit ARM build at `/storage/amlogic-multistream` before running it. The aarch64 CI artifact is the wrong binary for that path.
+
+## Kodi plugin install
+
+`kodi-addon/plugin.program.amlogic-multistream/` is a Kodi launcher add-on. It **requires GS-King X / CoreELEC** to run. Its **Launch** entry starts the bundled copy of `scripts/launch-coreelec.sh` as a transient systemd unit (`systemd-run --unit=amlogic-multistream-launch`). The unit lets the script survive its own `systemctl stop kodi`, run the player, and start Kodi again. To return to Kodi early, run `systemctl stop amlogic-multistream-launch`.
+
+```bash
+./scripts/package-kodi-addon.sh                       # dist/plugin.program.amlogic-multistream-<version>.zip
+./scripts/install-kodi-addon.sh --host root@coreelec  # or Kodi: Add-ons → Install from zip file
+```
+
+The add-on does not contain the player. Put a 32-bit ARM build at `/storage/amlogic-multistream`, or change **Player binary** (`PLAYER_BIN`) in the add-on settings. The x86_64 and aarch64 CI AppImages do not run on the GS-King X. `install-kodi-addon.sh --player FILE` refuses a binary that is not 32-bit ARM. CI uploads the zip as the `plugin.program.amlogic-multistream` artifact. Install steps, settings, and the list of host-only checks are in [docs/kodi-addon.md](docs/kodi-addon.md). Loading the add-on in Kodi and the display handover have not been verified on a device.
