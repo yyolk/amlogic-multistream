@@ -171,6 +171,22 @@ bool frameLooksComplete(const DecodedFrame& frame) {
            frame.linesize[2] >= chroma_w;
 }
 
+// FFmpeg opens a scheme-less path and file: / file:// as the file protocol.
+// Only those --url forms may enable that protocol. Inverting the MQTT
+// http(s) prefix check is wrong: hls+http:// is already on the whitelist
+// and is not a local file source (AUDIT7 B2).
+bool urlIsLocalFileSource(const std::string& url) {
+    if (url.compare(0, 5, "file:") == 0) {
+        return true;
+    }
+    const auto colon = url.find(':');
+    if (colon == std::string::npos) {
+        return true;
+    }
+    const auto slash = url.find('/');
+    return slash != std::string::npos && slash < colon;
+}
+
 // Single-stream software decode, then one Renderer::present() per frame.
 // The default presenter is SoftwareRenderer, which does not open /dev/dri.
 // DrmRenderer is selected only with --renderer drm and requires GS-King X /
@@ -178,9 +194,13 @@ bool frameLooksComplete(const DecodedFrame& frame) {
 int decodeUrl(const std::string& url, int frames, PresenterKind presenter, const std::string& renderDir) {
     std::cout << "Software decode isHardware=0 url=" << url << "\n";
     FfmpegDecoder decoder;
-    // CLI --url is the local-file allowance (fixture tests, a path on disk).
-    // MQTT add never reaches this call with a file URL.
-    decoder.setAllowLocalFile(true);
+    // CLI --url is the local-file allowance only for a scheme-less path or
+    // file: / file:// (fixture tests, a path on disk). Nested remote forms
+    // such as hls+http:// leave the flag off so a playlist file:// segment
+    // stays rejected, same as MQTT add.
+    if (urlIsLocalFileSource(url)) {
+        decoder.setAllowLocalFile(true);
+    }
     if (!decoder.open(url)) {
         return 1;
     }

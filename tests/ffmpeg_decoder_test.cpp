@@ -732,6 +732,58 @@ void testMissingFile(const std::filesystem::path& dir) {
     decoder.close();
 }
 
+// AUDIT7 B2: an HTTP playlist whose only segment is file:///… must not
+// decode unless the caller set the local-file allowance. MQTT add and an
+// http(s) --url leave that flag off. The allowance-on case proves the
+// fixture is a real file segment, not a broken playlist.
+void testHttpPlaylistFileSegment(const std::filesystem::path& mp4, const std::filesystem::path& dir) {
+    g_case = "http playlist file:// segment";
+    const std::filesystem::path playlist = dir / "file_seg.m3u8";
+    {
+        std::ofstream out(playlist);
+        out << "#EXTM3U\n"
+            << "#EXT-X-VERSION:3\n"
+            << "#EXT-X-TARGETDURATION:1\n"
+            << "#EXT-X-MEDIA-SEQUENCE:0\n"
+            << "#EXTINF:0.400,\n"
+            << "file://" << mp4.string() << "\n"
+            << "#EXT-X-ENDLIST\n";
+    }
+
+    const std::filesystem::path get_log = dir / "file-seg-gets.log";
+    LocalHttp server = startLocalHttp(dir, get_log);
+    CHECK(server.pid > 0);
+    CHECK(server.port > 0);
+    if (server.pid <= 0 || server.port <= 0) {
+        return;
+    }
+    const std::string hostPath = "127.0.0.1:" + std::to_string(server.port) + "/file_seg.m3u8";
+    const std::string url = "http://" + hostPath;
+    const std::string hlsUrl = "hls+http://" + hostPath;
+
+    FfmpegDecoder remote;
+    CHECK(!remote.open(url));
+    remote.close();
+
+    g_case = "hls+http playlist file:// segment";
+    FfmpegDecoder nested;
+    CHECK(!nested.open(hlsUrl));
+    nested.close();
+    g_case = "http playlist file:// segment";
+
+    FfmpegDecoder local;
+    local.setAllowLocalFile(true);
+    const bool opened = local.open(url);
+    CHECK(opened);
+    if (opened) {
+        DecodedFrame frame;
+        CHECK(local.readFrame(frame));
+        expectYuv420(frame);
+    }
+    local.close();
+    server.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -762,6 +814,7 @@ int main() {
         testMissingFile(tmp.path());
         testRejectGif(ffmpeg, tmp.path());
         testRejectCoverMp3(ffmpeg, tmp.path());
+        testHttpPlaylistFileSegment(mp4, tmp.path());
 
         g_case = "generate hls";
         const std::filesystem::path hls_dir = tmp.path() / "hls";

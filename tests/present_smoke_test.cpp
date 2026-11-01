@@ -1,7 +1,14 @@
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -12,7 +19,10 @@
 // Black-box check of the --url presenter. Generates a tiny local file with
 // the ffmpeg CLI, presents two frames through the software renderer, and
 // checks that --renderer drm fails without opening a successful scanout.
-// Exit 77 when the ffmpeg CLI is missing so ctest can skip.
+// AUDIT7 B2: an HTTP playlist whose only segment is file:///… must be
+// rejected on --url, including hls+http:// (same as MQTT add). A path or
+// file:// of the fixture must still present. Exit 77 when the ffmpeg CLI
+// is missing so ctest can skip.
 
 #ifndef PLAYER_BIN
 #define PLAYER_BIN ""
@@ -120,6 +130,159 @@ bool ppmLooksValid(const std::filesystem::path& path) {
            std::filesystem::file_size(path) > 32;
 }
 
+void sendAll(int fd, const char* data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        const ssize_t n = ::write(fd, data + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        if (n == 0) {
+            return;
+        }
+        off += static_cast<size_t>(n);
+    }
+}
+
+std::string readRequest(int fd) {
+    std::string data;
+    char buf[2048];
+    while (data.find("\r\n\r\n") == std::string::npos && data.size() < 65536) {
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        if (::poll(&pfd, 1, 2000) <= 0) {
+            break;
+        }
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+        data.append(buf, static_cast<size_t>(n));
+    }
+    return data;
+}
+
+std::string requestPath(const std::string& headers) {
+    const auto lineEnd = headers.find("\r\n");
+    const std::string line = headers.substr(0, lineEnd == std::string::npos ? headers.size() : lineEnd);
+    if (line.compare(0, 4, "GET ") != 0) {
+        return {};
+    }
+    const auto sp = line.find(' ', 4);
+    if (sp == std::string::npos) {
+        return {};
+    }
+    std::string url = line.substr(4, sp - 4);
+    const auto query = url.find('?');
+    if (query != std::string::npos) {
+        url.resize(query);
+    }
+    return url;
+}
+
+[[noreturn]] void serveLoop(int listenFd, std::string body) {
+    ::signal(SIGPIPE, SIG_IGN);
+    while (true) {
+        const int client = ::accept(listenFd, nullptr, nullptr);
+        if (client < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            _exit(0);
+        }
+        const std::string path = requestPath(readRequest(client));
+        if (path != "/file_seg.m3u8") {
+            const char* missing =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, missing, std::char_traits<char>::length(missing));
+            ::close(client);
+            continue;
+        }
+        std::ostringstream hdr;
+        hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << body.size()
+            << "\r\nContent-Type: application/vnd.apple.mpegurl\r\nConnection: close\r\n\r\n";
+        const std::string header = hdr.str();
+        sendAll(client, header.data(), header.size());
+        sendAll(client, body.data(), body.size());
+        ::close(client);
+    }
+}
+
+struct LocalHttp {
+    pid_t pid = -1;
+    int port = 0;
+
+    LocalHttp() = default;
+    LocalHttp(const LocalHttp&) = delete;
+    LocalHttp& operator=(const LocalHttp&) = delete;
+    LocalHttp(LocalHttp&& other) noexcept : pid(other.pid), port(other.port) {
+        other.pid = -1;
+        other.port = 0;
+    }
+    LocalHttp& operator=(LocalHttp&& other) noexcept {
+        if (this != &other) {
+            stop();
+            pid = other.pid;
+            port = other.port;
+            other.pid = -1;
+            other.port = 0;
+        }
+        return *this;
+    }
+    ~LocalHttp() { stop(); }
+
+    void stop() {
+        if (pid <= 0) {
+            return;
+        }
+        kill(pid, SIGTERM);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        pid = -1;
+    }
+};
+
+LocalHttp startPlaylistServer(const std::string& body) {
+    LocalHttp server;
+    const int listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listenFd < 0) {
+        return server;
+    }
+    const int yes = 1;
+    ::setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0);
+    if (::bind(listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(listenFd, 16) != 0) {
+        ::close(listenFd);
+        return server;
+    }
+    sockaddr_in bound{};
+    socklen_t boundLen = sizeof(bound);
+    if (::getsockname(listenFd, reinterpret_cast<sockaddr*>(&bound), &boundLen) != 0) {
+        ::close(listenFd);
+        return server;
+    }
+    const pid_t pid = fork();
+    if (pid < 0) {
+        ::close(listenFd);
+        return server;
+    }
+    if (pid == 0) {
+        serveLoop(listenFd, body);
+    }
+    ::close(listenFd);
+    server.pid = pid;
+    server.port = ntohs(bound.sin_port);
+    return server;
+}
+
 }  // namespace
 
 int main() {
@@ -168,6 +331,51 @@ int main() {
         }
         if (!ppmLooksValid(frames / "frame-000000.ppm") || !ppmLooksValid(frames / "frame-000001.ppm")) {
             std::cerr << "expected two PPM frames in " << frames << "\n";
+            return 1;
+        }
+
+        // AUDIT7 B2: --url of an HTTP playlist whose only segment is file:///…
+        // must reject the local file, same as MQTT add (flag stays off).
+        // hls+http:// is on the protocol whitelist and must not inherit file.
+        {
+            std::ostringstream playlist;
+            playlist << "#EXTM3U\n"
+                     << "#EXT-X-VERSION:3\n"
+                     << "#EXT-X-TARGETDURATION:1\n"
+                     << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                     << "#EXTINF:0.400,\n"
+                     << "file://" << mp4.string() << "\n"
+                     << "#EXT-X-ENDLIST\n";
+            LocalHttp server = startPlaylistServer(playlist.str());
+            if (server.pid <= 0 || server.port <= 0) {
+                std::cerr << "file-segment playlist server failed to start\n";
+                return 1;
+            }
+            const std::string hostPath =
+                "127.0.0.1:" + std::to_string(server.port) + "/file_seg.m3u8";
+            const char* prefixes[] = {"http://", "hls+http://"};
+            for (const char* prefix : prefixes) {
+                const std::string evilUrl = std::string(prefix) + hostPath;
+                const int leaked = run({player, "--url", evilUrl, "--frames", "1"}, out, err);
+                const std::string leakOut = readFile(out);
+                const std::string leakErr = readFile(err);
+                if (leaked == 0 || leakOut.find("Decoded ") != std::string::npos ||
+                    leakOut.find("fmt=yuv420p") != std::string::npos) {
+                    server.stop();
+                    std::cerr << prefix << " --url with file:// segment must be rejected (exit "
+                              << leaked << ")\n"
+                              << leakOut << leakErr;
+                    return 1;
+                }
+            }
+            server.stop();
+        }
+
+        const int fileScheme = run({player, "--url", "file://" + mp4.string(), "--frames", "1"}, out, err);
+        if (fileScheme != 0) {
+            std::cerr << "file:// --url of a local fixture should still present (exit " << fileScheme
+                      << ")\n"
+                      << readFile(out) << readFile(err);
             return 1;
         }
 

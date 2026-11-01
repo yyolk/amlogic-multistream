@@ -37,9 +37,11 @@ public:
     FfmpegDecoder(FfmpegDecoder&&) = delete;
     FfmpegDecoder& operator=(FfmpegDecoder&&) = delete;
 
-    // `--url` passes true so local fixture files open. The default is false:
-    // avformat_open_input then allows only http, https, tls, tcp, crypto, and
-    // hls. MQTT must not set this; `add` already rejects non-HTTP URLs.
+    // `--url` passes true only for a scheme-less path or file: / file:// so
+    // fixture files open. Nested remote forms (http://, https://,
+    // hls+http://, hls+https://) leave the default false (AUDIT7 B2):
+    // avformat_open_input then allows only http, https, tls, tcp, crypto,
+    // and hls. MQTT must not set this; `add` already rejects non-HTTP URLs.
     // open() sets format_whitelist to hls, mpegts, mov, mp4, mpeg, plus aac,
     // ac3, eac3, and mp3 so a packed-audio HLS rendition can open. The
     // demuxer accepted for this URL is only hls, mpegts, mov, mp4, or mpeg,
