@@ -9,6 +9,9 @@ Multi-stream HLS viewer for Amlogic S922X (GS-King X / CoreELEC).
 - AppImage packaging
 - RetroArch-style launch: stop Kodi → run app → restart Kodi
 
+### Near-term milestone (product floor)
+- **Minimum product floor:** at least **2×2 (4 concurrent hardware-accelerated streams)** on GS-King X / CoreELEC 22. Prefer tile-sized HLS **480/720**; allow **1080p** when Mpx/s and `codec_mm` admit. The UI may still target up to **9** on CE22 (EGL compose); 9 is aspirational, not the floor. CE21 stays limited (instance cap 2) — do not promise a nine-tile CE21 wall; 2×2 is the CE22-oriented floor.
+
 ## Status
 Grid layout selection is implemented and unit-tested. MQTT command control keeps an in-memory stream table and, while `start` / `play` is set, software-decodes each visible `http://` or `https://` stream and presents it. `FfmpegDecoder` opens HLS, HTTP, or (on the `--url` path only) a file URL with libavformat/libavcodec, decodes on the CPU, and pulls 8-bit YUV420P frames through `DecoderBackend::readFrame`. `isHardware()` is false for this backend. An HLS master keeps the video stream `av_find_best_stream` returns — the first variant in playlist order, not the highest bitrate — and sets `AVDISCARD_ALL` on the others so later segments of the remaining variants are not downloaded.
 
