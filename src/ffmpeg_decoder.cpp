@@ -226,10 +226,12 @@ int rewindAfterDiscovery(AVFormatContext* fmt, int64_t start) {
 // avformat_open_input (PSI-less MPEG-TS, extra PIDs, HLS of those files)
 // without opening a decoder. The window matches find_stream_info
 // (probesize and max_analyze_duration) so a normal HLS master is not
-// drained past the usual probe. If the container can rewind, seek back
-// so find_stream_info can apply max_pixels to every index that now
-// exists (AUDIT10 D2). Local HLS cannot rewind; those packets are queued
-// for readFrame() and find_stream_info is not allowed to read further.
+// drained past the usual probe. If the container can rewind and this
+// pass did not stop early, seek back so find_stream_info can apply
+// max_pixels to every index that now exists (AUDIT10 D2). Local HLS
+// cannot rewind, and a timestamp-gap stop is not a real end of the
+// probe (AUDIT11 D3): those packets are queued for readFrame() and
+// find_stream_info is not allowed to read further.
 void discoverStreamsForProbeOptions(AVFormatContext* fmt,
                                     AVPacket*** queued,
                                     unsigned* queued_count,
@@ -248,9 +250,14 @@ void discoverStreamsForProbeOptions(AVFormatContext* fmt,
     int64_t read_size = 0;
     int64_t first_ts = AV_NOPTS_VALUE;
     bool stash_ok = true;
+    // A 7 s PTS jump ends this window (mpegts default max_analyze_duration)
+    // but FFmpeg 6.1.1's find_stream_info does not stop on that gap
+    // (AUDIT11 D3). Keep the queue and clamp the probe in that case.
+    bool stopped_early = false;
     while (read_size < probesize) {
         if (fmt->interrupt_callback.callback != nullptr &&
             fmt->interrupt_callback.callback(fmt->interrupt_callback.opaque) != 0) {
+            stopped_early = true;
             break;
         }
         const int rc = av_read_frame(fmt, pkt);
@@ -269,6 +276,7 @@ void discoverStreamsForProbeOptions(AVFormatContext* fmt,
                     freePacketQueue(queued, queued_count, queued_pos);
                 }
                 av_packet_unref(pkt);
+                stopped_early = true;
                 break;
             }
         }
@@ -282,13 +290,15 @@ void discoverStreamsForProbeOptions(AVFormatContext* fmt,
 
     // HLS seek is not trustworthy here: av_seek_frame is often EPERM, and
     // a successful avio_seek only rewinds the playlist file. Always keep
-    // the queue for hls. MPEG-TS can rewind, so drop the copies.
-    if (!formatNameIs(fmt, "hls") && rewindAfterDiscovery(fmt, start) >= 0) {
+    // the queue for hls. A timestamp-gap stop is the same hole: MPEG-TS
+    // seek reports success, dropping the queue would let find_stream_info
+    // create a late PID without max_pixels (AUDIT11 D3). Only rewind and
+    // drop copies when this pass consumed its window (or hit EOF).
+    if (!stopped_early && !formatNameIs(fmt, "hls") && rewindAfterDiscovery(fmt, start) >= 0) {
         freePacketQueue(queued, queued_count, queued_pos);
     } else {
-        // Already consumed the probe window. find_stream_info must not
-        // keep reading or it would fetch past a master playlist's usual
-        // probe and decode a late PID without options.
+        // Already consumed the probe window, or stopped early and must
+        // not let find_stream_info read past it.
         fmt->probesize = 1;
         fmt->max_analyze_duration = 1;
     }

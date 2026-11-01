@@ -55,9 +55,11 @@ public:
     // PIDs after a PMT, HLS of those files) are demuxed into existence
     // first so the same cap reaches those probe decoders (AUDIT10 D2).
     // The pre-pass uses the same probesize / max_analyze_duration window
-    // as find_stream_info so a normal HLS master is not drained. readFrame()
-    // also refuses to convert a frame that fails those extent and stride
-    // caps (AUDIT9 D1).
+    // as find_stream_info so a normal HLS master is not drained. If that
+    // window ends on a timestamp gap, the queued packets are kept and
+    // the probe is clamped so a later PID cannot be born without the
+    // cap (AUDIT11 D3). readFrame() also refuses to convert a frame that
+    // fails those extent and stride caps (AUDIT9 D1).
     void setAllowLocalFile(bool allow);
 
     bool open(const std::string& url) override;
