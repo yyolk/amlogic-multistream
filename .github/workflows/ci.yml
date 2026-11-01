@@ -1,11 +1,13 @@
-# Two native builds. scripts/launch-coreelec.sh requires GS-King X /
+# Two native host builds. scripts/launch-coreelec.sh requires GS-King X /
 # CoreELEC. CI runs it only through scripts/test-launch-coreelec.sh
 # (a stand-in runtime, then the packaged AppImage against mosquitto).
 #
 # - ubuntu-24.04: x86_64 host/Codespaces smoke AppImage
-# - ubuntu-24.04-arm: native aarch64 AppImage. This is NOT the GS-King X
-#   binary. CoreELEC Amlogic-ng is a 32-bit ARM userspace, and this
-#   workflow does not cross-compile armv7 or use a CoreELEC sysroot.
+# - ubuntu-24.04-arm: native aarch64 smoke AppImage built against Ubuntu's
+#   FFmpeg. This is NOT a GS-King X binary for either CoreELEC line. The
+#   device AppImages (CoreELEC 21 Amlogic-ng armv7hf, CoreELEC 22 Amlogic-no
+#   aarch64) are cross-built against CoreELEC sysroots in
+#   .github/workflows/coreelec-appimage.yml.
 #
 # Both runners execute the player and the unit tests natively. The x86_64
 # runner also uploads the Kodi add-on zip (kodi-addon/), which launches
@@ -61,7 +63,8 @@ jobs:
 
       # Library list matches .devcontainer/Dockerfile, plus ccache, the
       # ffmpeg CLI (ffmpeg_decoder_tests synthesizes a local fixture), and
-      # mosquitto (the packaged AppImage launch-script check).
+      # mosquitto (the packaged AppImage launch-script check). squashfs-tools
+      # is for the kodi_addon device AppImage marker check.
       # layout_engine_tests itself only needs a C++ compiler.
       - name: Install build dependencies
         run: |
@@ -85,7 +88,8 @@ jobs:
             busybox-static \
             mosquitto \
             patchelf \
-            pkg-config
+            pkg-config \
+            squashfs-tools
 
       # The install step above provides libav*, libmosquitto, libdrm, and the
       # ffmpeg CLI. AMS_REQUIRE_DECODER_TESTS makes a green run that never

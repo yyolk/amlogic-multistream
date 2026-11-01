@@ -124,16 +124,20 @@ Rebuild after source changes with `cmake --build build`. The CMake Tools extensi
 
 ## AppImage
 
-`.github/workflows/ci.yml` runs on pull requests and on pushes to `main`. A push to any other branch is built when its pull request is opened.
+There are two kinds of AppImage. The **host smoke** AppImages run on a normal x86_64 or aarch64 Linux machine and bundle Ubuntu's FFmpeg. The **device** AppImages are cross-built against a CoreELEC sysroot for the GS-King X. Only a device AppImage runs on the box.
 
-The workflow is a two-runner matrix. Each runner installs the dev-container packages, runs `scripts/run-tests.sh`, then runs `scripts/build-appimage.sh`. linuxdeploy bundles the shared libraries it finds. The build is not statically linked.
-
-| Artifact | Runner | Role |
+| Artifact | Built by | Runs on |
 | --- | --- | --- |
-| `amlogic-multistream-appimage-x86_64` | `ubuntu-24.04` | Host and Codespaces smoke build |
-| `amlogic-multistream-appimage-aarch64` | `ubuntu-24.04-arm` | Native aarch64 build. **Not** the GS-King X / CoreELEC binary |
+| `amlogic-multistream-appimage-x86_64` | `ci.yml`, `ubuntu-24.04` | x86_64 host and Codespaces (smoke build) |
+| `amlogic-multistream-appimage-aarch64` | `ci.yml`, `ubuntu-24.04-arm` | aarch64 Ubuntu-like host (smoke build). **Not** a CoreELEC binary |
+| `amlogic-multistream-appimage-coreelec21-ng-armv7hf` | `coreelec-appimage.yml` | GS-King X on **CoreELEC 21 Amlogic-ng** (32-bit ARM) |
+| `amlogic-multistream-appimage-coreelec22-no-aarch64` | `coreelec-appimage.yml` | GS-King X on **CoreELEC 22 Amlogic-no** (64-bit ARM) |
 
-Download both from the workflow run's Artifacts list. The file inside each artifact is `amlogic-multistream-<version>-<arch>.AppImage`. The `aarch64` in that name is the runner architecture. It is not a CoreELEC Amlogic-ng image.
+Both workflows run on pull requests and on pushes to `main`. A push to any other branch is built when its pull request is opened. Download an artifact from the workflow run's Artifacts list. GitHub wraps it in a zip, so unzip it once to get the `.AppImage`.
+
+### Host smoke AppImages
+
+`ci.yml` is a two-runner matrix. Each runner installs the dev-container packages, runs `scripts/run-tests.sh`, then runs `scripts/build-appimage.sh`. linuxdeploy bundles the shared libraries it finds. The build is not statically linked. The file inside each artifact is `amlogic-multistream-<version>-<arch>.AppImage`, where `<arch>` is the runner architecture.
 
 On your own machine the same script follows `uname -m`:
 
@@ -141,15 +145,58 @@ On your own machine the same script follows `uname -m`:
 ./scripts/build-appimage.sh
 ```
 
-That needs the build packages above plus `curl`, `patchelf`, `binutils`, and `file`. An x86_64 host produces the smoke image. An aarch64 host produces another aarch64 image. Packaging does not need a GS-King X. Neither file is the GS-King X binary.
+That needs the build packages above plus `curl`, `patchelf`, `binutils`, and `file`. An x86_64 host produces the smoke image. An aarch64 host produces another aarch64 smoke image. Neither is a GS-King X binary: the aarch64 one is linked against Ubuntu's FFmpeg (`libavcodec.so.60` plus the X11 stack below), which CoreELEC 22 does not ship.
 
-The GS-King X runs CoreELEC **Amlogic-ng**, a 32-bit ARM userspace (`CoreELEC-Amlogic-ng.arm`, device tree `g12b_s922x_beelink_gs_king_x`). That kernel will not load an aarch64 userspace binary. CI does not cross-compile armv7. A full CoreELEC sysroot build is not part of this workflow.
+Ubuntu's FFmpeg is linked with libX11, VAAPI, VDPAU, and OpenCL. linuxdeploy's excludelist would omit `libX11.so.6` and the libraries behind it (`libxcb`, fontconfig, freetype, harfbuzz, and the rest of that closure), so `--help` fails on a machine that does not have them. `scripts/build-appimage.sh` copies those libraries into the AppDir. The script then runs `--help` in a chroot that only offers glibc, libstdc++, libgcc_s, zlib, and libdrm.
 
-linuxdeploy leaves glibc to the system and bundles the other shared libraries. Do not treat glibc 2.39 as the reason the device image fails. On Ubuntu 24.04 (the CI distro) the player's bundled libraries require `GLIBC_2.38` at most. `GLIBC_2.39` symbols are exports on the host `libc.so.6` and `libm.so.6`, which linuxdeploy does not bundle. CoreELEC 21.3-Omega pins glibc 2.38, so that floor matches. The mismatch is the 32-bit userspace, not a 2.39 requirement, and it is not a reason to retarget the build at Debian bullseye.
+### Device AppImages (GS-King X on CoreELEC)
 
-Ubuntu's FFmpeg is linked with libX11, VAAPI, VDPAU, and OpenCL. linuxdeploy's excludelist would omit `libX11.so.6` and the libraries behind it (`libxcb`, fontconfig, freetype, harfbuzz, and the rest of that closure), so `--help` fails on a machine that does not have them. `scripts/build-appimage.sh` copies those libraries into the AppDir. The script then runs `--help` in a chroot that only offers glibc, libstdc++, libgcc_s, zlib, and libdrm. A device AppImage should still link CoreELEC's FFmpeg, or one built without X11, VAAPI, VDPAU, and OpenCL, instead of shipping this Ubuntu stack.
+The GS-King X (S922X, device tree `g12b_s922x_beelink_gs_king_x`) is supported by two CoreELEC lines with different userspaces. Each CoreELEC image only has the dynamic loader and libraries for its own userspace, so an aarch64 binary does not run on CoreELEC 21 and a 32-bit ARM binary does not run on CoreELEC 22. Pick the artifact for the line the box runs. `/etc/os-release` on the box says which: `COREELEC_ARCH="Amlogic-ng.arm"` on CoreELEC 21, `DISTRO_ARCH="Amlogic-no.aarch64"` on CoreELEC 22.
 
-**TODO:** Build a real GS-King X AppImage as 32-bit ARM (armv7, hard-float) against a CoreELEC Amlogic-ng sysroot (glibc 2.38 on CoreELEC 21.3-Omega). The `ubuntu-24.04-arm` aarch64 artifact cannot be that file. This repository does not produce the device AppImage yet.
+| Target | CoreELEC line | Userspace | Sysroot (official update archive) | Links CoreELEC's |
+| --- | --- | --- | --- | --- |
+| `coreelec21-ng-armv7hf` | CoreELEC 21 (Omega) Amlogic-ng | 32-bit ARM, armv7 hard-float | `CoreELEC-Amlogic-ng.arm-21.3-Omega.tar` | glibc 2.38, FFmpeg 6.0.1 (`libavcodec.so.60`), libdrm, libstdc++ |
+| `coreelec22-no-aarch64` | CoreELEC 22 (Piers) Amlogic-no | 64-bit ARM | `CoreELEC-Amlogic-no.aarch64-22.0-Piers_rc1.tar` (pre-release) | glibc 2.44, FFmpeg 9.0.2 (`libavcodec.so.63`), libdrm, libstdc++ |
+
+The file inside each artifact is `amlogic-multistream-<version>-<target>.AppImage`.
+
+How a device AppImage is built (`scripts/build-coreelec-appimage.sh TARGET`, on an x86_64 host):
+
+1. `scripts/fetch-coreelec-sysroot.sh TARGET` downloads the pinned CoreELEC update archive from [github.com/CoreELEC/CoreELEC/releases](https://github.com/CoreELEC/CoreELEC/releases), checks its sha256, and unpacks the shared libraries in `/usr/lib` plus `/etc/os-release` from its `target/SYSTEM` squashfs into `.cache/coreelec/TARGET/sysroot` (79 MB for CoreELEC 21, 120 MB for CoreELEC 22). No root is needed. The archive is deleted afterwards unless `--keep-archive` is given. `--check` only reports whether the sysroot is there and exits 1 with the fetch command when it is not.
+2. The CoreELEC image has no headers, so FFmpeg's headers are generated from the upstream release that matches the image (`make install-headers`; nothing is compiled), and libdrm's headers come from libdrm 2.4.124. The script fails if the FFmpeg header major versions differ from the image's sonames.
+3. CoreELEC does not ship libmosquitto. libmosquitto 2.0.22 is cross-built as a client library without TLS (the player does not use TLS).
+4. The player is cross-compiled with Ubuntu's `g++-arm-linux-gnueabihf` or `g++-aarch64-linux-gnu` and linked against CoreELEC's own `libavformat`, `libavcodec`, `libavutil`, `libswscale`, and `libdrm`. glibc and libstdc++ symbols are linked through the cross toolchain (GCC 13, glibc 2.39) and then checked against CoreELEC's glibc and libstdc++, which are what load on the box. Only `libmosquitto.so.1` is bundled. Nothing from Ubuntu's FFmpeg, X11, VAAPI, VDPAU, or OpenCL stack is linked.
+5. appimagetool packs the AppDir with the pinned armhf or aarch64 type-2 runtime. `usr/share/amlogic-multistream/coreelec-target` inside the AppImage records the target and CoreELEC release; `install-kodi-addon.sh` reads it.
+6. `scripts/verify-coreelec-appimage.sh TARGET APPIMAGE` checks the result against the sysroot (below).
+
+Every download (CoreELEC archive, FFmpeg, libdrm, libmosquitto, appimagetool, runtime) is pinned by version and sha256 in `scripts/coreelec-targets.sh`. Moving to another CoreELEC release means changing its archive digest there, and the FFmpeg version too if the image's `libavcodec` soname changed. CoreELEC 22 is pinned to `22.0-Piers_rc1` because no final 22.0 exists yet. A device AppImage relies on the box having the same FFmpeg sonames as the sysroot it was built against. A CoreELEC update that bumps FFmpeg's major version needs a rebuild.
+
+Locally (x86_64 Ubuntu 24.04):
+
+```bash
+sudo apt-get install cmake make pkg-config curl xz-utils patchelf file squashfs-tools \
+  qemu-user-static ffmpeg mosquitto \
+  g++-arm-linux-gnueabihf g++-aarch64-linux-gnu
+./scripts/build-coreelec-appimage.sh coreelec21-ng-armv7hf   # dist/coreelec21-ng-armv7hf/*.AppImage
+./scripts/build-coreelec-appimage.sh coreelec22-no-aarch64   # dist/coreelec22-no-aarch64/*.AppImage
+```
+
+`--no-fetch` fails instead of downloading when the sysroot is missing. `COREELEC_CACHE` moves `.cache/coreelec`.
+
+What CI checks for each device AppImage, under qemu-user with the CoreELEC sysroot as the library root, so the dynamic loader, glibc, libstdc++, and FFmpeg are CoreELEC's own files:
+
+- The runtime and every ELF inside are the target architecture (`file` reports `ELF 32-bit LSB ... ARM, EABI5` or `ELF 64-bit LSB ... ARM aarch64`). The player's program interpreter is CoreELEC's (`/lib/ld-linux-armhf.so.3` or `/lib/ld-linux-aarch64.so.1`).
+- Every `NEEDED` library is either bundled (`libmosquitto.so.1`) or present in the CoreELEC image. None is X11, VAAPI, VDPAU, OpenCL, or desktop GL.
+- Every versioned symbol the player and libmosquitto use is defined by the CoreELEC library that provides it. Both builds need at most `GLIBC_2.38`.
+- `--appimage-extract` through the bundled runtime, as `scripts/launch-coreelec.sh` does on the box.
+- `AppRun --help`, `AppRun --url` software-decoding a local H.264 HLS fixture through CoreELEC's FFmpeg, and an MQTT connect, subscribe, and SIGTERM shutdown against a local mosquitto through the bundled libmosquitto.
+- `install-kodi-addon.sh --target TARGET` accepts the artifact.
+
+**Still requires a GS-King X / CoreELEC.** None of these has been run on a box yet:
+
+- The AppImage runtime under the CoreELEC kernel, `launch-coreelec.sh` with that runtime, and the Kodi stop/start handover.
+- Software decode speed on the S922X CPU, and MQTT against a real broker.
+- DRM/KMS output and Amlogic hardware decode. These are not implemented: the device AppImages are built with the default `AMLOGIC_DRM_KMS=OFF`, do not open `/dev/dri`, and decode on the CPU (`isHardware=0`), exactly like the host build.
 
 ## Launch on CoreELEC
 
@@ -157,9 +204,9 @@ Ubuntu's FFmpeg is linked with libX11, VAAPI, VDPAU, and OpenCL. linuxdeploy's e
 
 CoreELEC has no `fusermount`. A type-2 AppImage is extracted once to `/storage/amlogic-multistream.AppDir` (override with `PLAYER_EXTRACT_DIR`) and `AppRun` is executed directly. The type-2 runtime forks the player and does not forward SIGTERM, so the trap must not wait on the runtime. A bare ELF is executed as itself. `PLAYER_BIN` overrides `/storage/amlogic-multistream`. The script polls until that process has exited (up to 10 seconds, then SIGKILL) before it starts Kodi.
 
-CI runs `scripts/test-launch-coreelec.sh` with a stand-in runtime, and again against the packaged AppImage. It does not boot a GS-King X.
+CI runs `scripts/test-launch-coreelec.sh` with a stand-in runtime, and again against the packaged host AppImage. It does not boot a GS-King X.
 
-Put a 32-bit ARM build at `/storage/amlogic-multistream` before running it. The aarch64 CI artifact is the wrong binary for that path.
+Put the device AppImage for the box's CoreELEC line at `/storage/amlogic-multistream` before running it: `coreelec21-ng-armv7hf` on CoreELEC 21 Amlogic-ng, `coreelec22-no-aarch64` on CoreELEC 22 Amlogic-no. The host smoke artifacts are the wrong binaries for that path.
 
 ## Kodi plugin install
 
@@ -168,8 +215,17 @@ Put a 32-bit ARM build at `/storage/amlogic-multistream` before running it. The 
 **The add-on does not bundle or download the player AppImage/binary; it is only a thin `systemd-run` launcher, so you must install `PLAYER_BIN` separately** (see [The player binary is not included](docs/kodi-addon.md#the-player-binary-is-not-included), tracking issue [#14](https://github.com/yyolk/amlogic-multistream/issues/14)).
 
 ```bash
-./scripts/package-kodi-addon.sh                       # dist/plugin.program.amlogic-multistream-<version>.zip
-./scripts/install-kodi-addon.sh --host root@coreelec  # or Kodi: Add-ons → Install from zip file
+./scripts/package-kodi-addon.sh   # dist/plugin.program.amlogic-multistream-<version>.zip
+
+# CoreELEC 21 Amlogic-ng (default --target)
+./scripts/install-kodi-addon.sh --host root@coreelec \
+  --player amlogic-multistream-0.1.0-coreelec21-ng-armv7hf.AppImage
+
+# CoreELEC 22 Amlogic-no
+./scripts/install-kodi-addon.sh --host root@coreelec --target coreelec22-no-aarch64 \
+  --player amlogic-multistream-0.1.0-coreelec22-no-aarch64.AppImage
 ```
 
-The add-on does not contain the player. Put a 32-bit ARM build at `/storage/amlogic-multistream`, or change **Player binary** (`PLAYER_BIN`) in the add-on settings. The x86_64 and aarch64 CI AppImages do not run on the GS-King X. `install-kodi-addon.sh --player FILE` refuses a binary that is not 32-bit ARM. CI uploads the zip as the `plugin.program.amlogic-multistream` artifact. Install steps, settings, and the list of host-only checks are in [docs/kodi-addon.md](docs/kodi-addon.md). Loading the add-on in Kodi and the display handover have not been verified on a device.
+Or install the zip from Kodi (Add-ons → Install from zip file) and copy the device AppImage to `/storage/amlogic-multistream` yourself. The add-on does not contain the player; **Player binary** (`PLAYER_BIN`) in the add-on settings points at it.
+
+`install-kodi-addon.sh` checks the player against `--target` (default `coreelec21-ng-armv7hf`). For CoreELEC 21 it refuses anything that is not 32-bit ARM, which includes both host smoke AppImages. For CoreELEC 22 it refuses anything that is not aarch64. An AppImage must also carry the device marker for that target, so the Ubuntu aarch64 smoke AppImage is refused for CoreELEC 22 even though its architecture matches (reading the marker needs `unsquashfs`). With `--host`, the box's `/etc/os-release` architecture must match `--target` before anything is copied. `--allow-target-mismatch` (or the older `--allow-non-arm32`) overrides these checks. CI uploads the zip as the `plugin.program.amlogic-multistream` artifact. Install steps, settings, and the list of host-only checks are in [docs/kodi-addon.md](docs/kodi-addon.md). Loading the add-on in Kodi and the display handover have not been verified on a device.

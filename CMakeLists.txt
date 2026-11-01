@@ -185,6 +185,12 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
         src
     )
 
+    target_link_directories(amlogic-multistream PRIVATE
+        ${FFMPEG_LIBRARY_DIRS}
+        ${MOSQUITTO_LIBRARY_DIRS}
+        ${DRM_LIBRARY_DIRS}
+    )
+
     target_link_libraries(amlogic-multistream PRIVATE
         ${FFMPEG_LIBRARIES}
         ${MOSQUITTO_LIBRARIES}

@@ -9,7 +9,14 @@ Running it **requires GS-King X / CoreELEC**. CI checks the add-on on a host onl
 > [!IMPORTANT]
 > **This add-on does not bundle, download, or update the player AppImage or binary.** Some fuller RetroArch add-ons for CoreELEC download or ship an AppImage; this one does not. It is only a thin `systemd-run` launcher for `scripts/launch-coreelec.sh`. You must install the player at `PLAYER_BIN` yourself. Tracking issue: [#14](https://github.com/yyolk/amlogic-multistream/issues/14).
 
-The add-on runs whatever is at `PLAYER_BIN`, which defaults to `/storage/amlogic-multistream`. The GS-King X runs CoreELEC **Amlogic-ng**, a 32-bit ARM userspace. The CI AppImages are x86_64 and aarch64, and neither runs on that device. This repository does not build a 32-bit ARM player yet (see the TODO in the README's AppImage section). Until it does, put your own 32-bit ARM (armv7 hard-float) build, or a 32-bit ARM type-2 AppImage, at `PLAYER_BIN`.
+The add-on runs whatever is at `PLAYER_BIN`, which defaults to `/storage/amlogic-multistream`. Put the device AppImage for the box's CoreELEC line there (see "Device AppImages" in the README):
+
+| CoreELEC on the box | `/etc/os-release` | Device AppImage |
+| --- | --- | --- |
+| CoreELEC 21 Amlogic-ng (32-bit ARM userspace) | `COREELEC_ARCH="Amlogic-ng.arm"` | `amlogic-multistream-<version>-coreelec21-ng-armv7hf.AppImage` |
+| CoreELEC 22 Amlogic-no (64-bit ARM userspace) | `DISTRO_ARCH="Amlogic-no.aarch64"` | `amlogic-multistream-<version>-coreelec22-no-aarch64.AppImage` |
+
+They come from the `amlogic-multistream-appimage-coreelec21-ng-armv7hf` and `amlogic-multistream-appimage-coreelec22-no-aarch64` artifacts of the **CoreELEC device AppImages** workflow, or from `scripts/build-coreelec-appimage.sh`. The x86_64 and aarch64 artifacts of the CI workflow are host smoke builds against Ubuntu's FFmpeg and do not run on either CoreELEC line.
 
 ## How Launch works
 
@@ -78,10 +85,24 @@ These steps require GS-King X / CoreELEC.
 ### With the install helper (SSH)
 
 ```sh
-./scripts/install-kodi-addon.sh --host root@coreelec --player /path/to/armv7/amlogic-multistream
+# CoreELEC 21 Amlogic-ng (the default --target)
+./scripts/install-kodi-addon.sh --host root@coreelec \
+  --player amlogic-multistream-0.1.0-coreelec21-ng-armv7hf.AppImage
+
+# CoreELEC 22 Amlogic-no
+./scripts/install-kodi-addon.sh --host root@coreelec --target coreelec22-no-aarch64 \
+  --player amlogic-multistream-0.1.0-coreelec22-no-aarch64.AppImage
 ```
 
-The helper copies the add-on tree to `/storage/.kodi/addons/plugin.program.amlogic-multistream/` with tar over SSH, then runs `kodi-send --action=UpdateLocalAddons`. With `--player` it also installs the binary as `/storage/amlogic-multistream` with mode 0755. A player that is not a 32-bit ARM ELF is refused, which includes both CI AppImages, unless you pass `--allow-non-arm32`. `--dry-run` prints the remote commands without running them. `--storage DIR` with no `--host` installs into a local directory instead.
+The helper first reads the box's `/etc/os-release` and stops if its architecture is not the one `--target` is for. It then copies the add-on tree to `/storage/.kodi/addons/plugin.program.amlogic-multistream/` with tar over SSH and runs `kodi-send --action=UpdateLocalAddons`. With `--player` it also installs the binary as `/storage/amlogic-multistream` with mode 0755.
+
+`--player` is checked before anything is copied:
+
+- `--target coreelec21-ng-armv7hf` (default) needs a 32-bit ARM ELF or AppImage. aarch64 and x86-64 are refused.
+- `--target coreelec22-no-aarch64` needs an aarch64 ELF or AppImage. 32-bit ARM and x86-64 are refused.
+- A type-2 AppImage must contain `usr/share/amlogic-multistream/coreelec-target` naming the same target. The host smoke AppImages have no such file, so the Ubuntu aarch64 one is refused for CoreELEC 22 even though it is aarch64. Reading the file needs `unsquashfs` (squashfs-tools) on the workstation; without it only the architecture is checked and a warning is printed.
+
+`--allow-target-mismatch` (older name: `--allow-non-arm32`) installs anyway with a warning. `--dry-run` prints the remote commands without running them. `--storage DIR` with no `--host` installs into a local directory instead.
 
 Kodi may list an add-on that was copied in by hand as disabled. If it does, enable it under **Add-ons → My add-ons → Program add-ons**, or restart Kodi with `systemctl restart kodi`.
 
@@ -90,7 +111,7 @@ Kodi may list an add-on that was copied in by hand as disabled. If it does, enab
 ```sh
 ./scripts/package-kodi-addon.sh --stage /tmp/stage
 scp -r /tmp/stage/plugin.program.amlogic-multistream root@coreelec:/storage/.kodi/addons/
-scp /path/to/armv7/amlogic-multistream root@coreelec:/storage/amlogic-multistream
+scp amlogic-multistream-0.1.0-coreelec21-ng-armv7hf.AppImage root@coreelec:/storage/amlogic-multistream   # or the coreelec22-no-aarch64 AppImage on CoreELEC 22
 ssh root@coreelec 'chmod 0755 /storage/amlogic-multistream && kodi-send --action=UpdateLocalAddons'
 ```
 
@@ -108,6 +129,8 @@ Open **Add-ons → Program add-ons** (or **Game add-ons**), choose **amlogic-mul
 - `settings.xml` and `strings.po`: every label resolves to a string, and every setting and string id that `default.py` uses exists.
 - The packaged zip: one top-level `plugin.program.amlogic-multistream/` directory, no bytecode, and a byte-identical executable copy of `scripts/launch-coreelec.sh`.
 - `default.py` from the extracted zip, with mode bits dropped as a zip install may do, run against stub `xbmc*` modules and stand-ins for `systemd-run` and `systemctl`. **Launch** runs the bundled launch script through `/bin/sh` with `PLAYER_BIN` and the MQTT settings. The stand-in log reads `stop kodi` and then `start kodi`, and a stub player sees that environment. A missing player and an already-active unit both leave Kodi alone.
-- `install-kodi-addon.sh`: a local `--storage` install, rejection of aarch64 and x86-64 ELF headers, and `--host --dry-run`.
+- `install-kodi-addon.sh`: a local `--storage` install; for the default CoreELEC 21 target, rejection of aarch64 and x86-64 ELF headers; for `--target coreelec22-no-aarch64`, acceptance of aarch64 and rejection of 32-bit ARM and x86-64; synthetic type-2 AppImages with and without the device target marker (the unmarked aarch64 one stands in for the Ubuntu smoke AppImage and is refused); and `--host --dry-run`, including the `/etc/os-release` check.
 
-These items still need a GS-King X running CoreELEC: Kodi loading and listing the add-on, the real transient unit surviving `systemctl stop kodi`, the display handover, the zip install from the Kodi UI, and the SSH install.
+The **CoreELEC device AppImages** workflow also installs each device AppImage with `--target` into a local `--storage` tree.
+
+These items still need a GS-King X running CoreELEC: Kodi loading and listing the add-on, the real transient unit surviving `systemctl stop kodi`, the display handover, the zip install from the Kodi UI, the SSH install with its `/etc/os-release` check, and the device AppImage itself running under the CoreELEC kernel.

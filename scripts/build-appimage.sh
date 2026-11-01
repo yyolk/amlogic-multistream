@@ -2,10 +2,12 @@
 # Build amlogic-multistream and package it as an AppImage.
 #
 # Host: normal Linux. The AppImage matches this machine: x86_64 for a host
-# smoke build, aarch64 for a native 64-bit ARM build. The aarch64 image is
-# not the GS-King X binary. CoreELEC Amlogic-ng is 32-bit ARM userspace, and
-# this script does not cross-compile it. CI runs the script once on each
-# native runner. No GS-King X or CoreELEC image is required to package.
+# smoke build, aarch64 for a native 64-bit ARM build against Ubuntu's
+# FFmpeg. Neither is a GS-King X binary. The device AppImages for CoreELEC
+# 21 Amlogic-ng (armv7hf) and CoreELEC 22 Amlogic-no (aarch64) are built by
+# scripts/build-coreelec-appimage.sh against a CoreELEC sysroot. CI runs this
+# script once on each native runner. No GS-King X or CoreELEC image is
+# required to package.
 #
 # linuxdeploy fills the AppDir (binary, desktop file, icon, shared libraries).
 # Its excludelist omits libX11 and the libraries behind Ubuntu's FFmpeg
@@ -13,8 +15,8 @@
 # This script copies those back in. A host — or a chroot — that only has
 # glibc, libstdc++, libgcc_s, zlib, and libdrm can then run --help.
 # appimagetool packs the AppDir after that copy. The smoke image is still
-# not a GS-King X / CoreELEC build; a device AppImage should link that
-# system's FFmpeg instead of shipping Ubuntu's X11 stack.
+# not a GS-King X / CoreELEC build; the device AppImages link CoreELEC's
+# FFmpeg instead of shipping Ubuntu's X11 stack.
 #
 # scripts/launch-coreelec.sh requires GS-King X / CoreELEC and is not used here.
 
