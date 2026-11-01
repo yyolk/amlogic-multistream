@@ -1,6 +1,7 @@
 #pragma once
 
 #include "decoder_backend.h"
+#include "layout_engine.h"
 #include "software_renderer.h"
 #include "stream_manager.h"
 
@@ -39,10 +40,19 @@
 // on the reaper, so another open for the same id is not started while it
 // is there (AUDIT4 A3). playing == false retires every decoder and clears
 // the viewport; the following start waits the same way.
+//
+// Adding and removing streams under new ids would still stack one stuck
+// thread per id (AUDIT5 F3). While kMaxBusyRetired workers on the reaper are
+// still running, no new open starts for any id. Tiles that are already open
+// keep presenting. A worker is started only in tick(), with fewer than
+// kMaxBusyRetired busy on the reaper and at most LayoutEngine::kMaxStreams
+// live sessions, so the decode threads still running never exceed
+// LayoutEngine::kMaxStreams + kMaxBusyRetired - 1.
 class StreamPlayer {
 public:
     static constexpr int kDefaultViewportWidth = 1280;
     static constexpr int kDefaultViewportHeight = 720;
+    static constexpr int kMaxBusyRetired = LayoutEngine::kMaxStreams;
 
     using DecoderFactory = std::function<std::unique_ptr<DecoderBackend>()>;
 
@@ -168,6 +178,8 @@ private:
     // True when this id still has a worker on the reaper whose loop has not
     // returned. tick() must not start another open for that id.
     bool reaperBusy(const std::string& id) const;
+    // Reaper workers whose loop has not returned, for any id.
+    int busyRetiredCount() const;
     void releaseDecoder(Worker& worker);
     void startWorker(const StreamInfo& info, Session& session);
     void sessionLoop(Worker* worker, const std::string& id, const std::string& url);
@@ -183,6 +195,7 @@ private:
     bool ready_ = false;
     bool wasPlaying_ = false;
     bool layoutErrorLogged_ = false;
+    bool retiredLimitLogged_ = false;
     std::string topology_;
     std::unordered_map<std::string, std::unique_ptr<Session>> sessions_;
     std::vector<std::unique_ptr<Worker>> reaper_;

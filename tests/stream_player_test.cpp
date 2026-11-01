@@ -528,6 +528,114 @@ void testRestartDoesNotStackUninterruptibleOpen() {
     CHECK(player.drain(std::chrono::milliseconds(2000)));
 }
 
+int threadCount() {
+    std::error_code ec;
+    std::filesystem::directory_iterator it("/proc/self/task", ec);
+    if (ec) {
+        return -1;
+    }
+    int n = 0;
+    for (; it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        if (ec) {
+            return -1;
+        }
+        ++n;
+    }
+    return n;
+}
+
+// AUDIT5 F3: add/remove of a stuck stream under a new id each time must not
+// stack one thread per id. At most kMaxBusyRetired stuck opens, the healthy
+// tile keeps presenting, and a new id waits until a stuck open returns.
+void testNewIdChurnDoesNotStackUninterruptibleOpen() {
+    constexpr int kChurn = 40;
+    constexpr int kCap = StreamPlayer::kMaxBusyRetired;
+    auto gate = std::make_shared<StallGate>();
+    gate->blockFor = std::chrono::seconds(30);
+    StreamManager streams;
+    SoftwareRenderer renderer;
+    StreamPlayer player(
+        streams, renderer,
+        [gate]() -> std::unique_ptr<DecoderBackend> { return std::make_unique<StallingDecoder>(gate); },
+        32, 16);
+    struct ReleaseGate {
+        std::shared_ptr<StallGate> gate;
+        ~ReleaseGate() {
+            if (gate) {
+                gate->release.store(true);
+            }
+        }
+    } release{gate};
+
+    CHECK(player.init());
+    CHECK(streams.addStream("left", "http://example/left.ts"));
+    CHECK(until([&] {
+        player.tick(true);
+        return renderer.framesPresented() >= 1;
+    }));
+    const int baseThreads = threadCount();
+    int maxThreads = baseThreads;
+    int presentsDuring = 0;
+    int maxTickMs = 0;
+    auto timedTick = [&] {
+        const auto tickStart = std::chrono::steady_clock::now();
+        presentsDuring += player.tick(true);
+        const int tickMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 std::chrono::steady_clock::now() - tickStart)
+                                                 .count());
+        maxTickMs = std::max(maxTickMs, tickMs);
+        maxThreads = std::max(maxThreads, threadCount());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    };
+
+    for (int i = 0; i < kChurn; ++i) {
+        const std::string id = "stall-" + std::to_string(i);
+        CHECK(streams.addStream(id, "http://example/" + id + ".ts"));
+        for (int t = 0; t < 3; ++t) {
+            timedTick();
+        }
+        if (i < kCap) {
+            CHECK(until([&] { return gate->entered.load() == i + 1; }));
+        }
+        CHECK(streams.removeStream(id));
+        timedTick();
+    }
+    CHECK(gate->entered.load() == kCap);
+    CHECK(gate->inFlight.load() == kCap);
+    CHECK(gate->maxInFlight.load() <= kCap);
+    CHECK(presentsDuring >= 5);
+    CHECK(maxTickMs < 250);
+    if (baseThreads > 0) {
+        CHECK(maxThreads - baseThreads <= kCap);
+        CHECK(threadCount() - baseThreads <= kCap);
+    }
+    if (gate->entered.load() != kCap || maxTickMs >= 250 || maxThreads - baseThreads > kCap) {
+        std::cerr << "new-id churn entered=" << gate->entered.load() << " presents=" << presentsDuring
+                  << " maxTickMs=" << maxTickMs << " threads " << baseThreads << "->" << maxThreads
+                  << "\n";
+    }
+
+    // At the limit a new id is listed but not opened. The open tile stays.
+    const int fastBeforeExtra = gate->fastOpens.load();
+    CHECK(streams.addStream("extra", "http://example/extra.ts"));
+    const int presentedBeforeExtra = renderer.framesPresented();
+    for (int t = 0; t < 10; ++t) {
+        timedTick();
+    }
+    CHECK(gate->fastOpens.load() == fastBeforeExtra);
+    CHECK(renderer.framesPresented() > presentedBeforeExtra);
+
+    gate->release.store(true);
+    CHECK(until([&] {
+        player.tick(true);
+        return gate->fastOpens.load() > fastBeforeExtra && gate->inFlight.load() == 0;
+    }));
+    CHECK(gate->entered.load() == kCap);
+
+    player.closeAll();
+    CHECK(player.drain(std::chrono::milliseconds(2000)));
+}
+
 }  // namespace
 
 int main() {
@@ -764,6 +872,7 @@ int main() {
 
     testUninterruptibleOpen();
     testRestartDoesNotStackUninterruptibleOpen();
+    testNewIdChurnDoesNotStackUninterruptibleOpen();
 
     if (g_failed != 0) {
         std::cerr << g_failed << " check(s) failed\n";
