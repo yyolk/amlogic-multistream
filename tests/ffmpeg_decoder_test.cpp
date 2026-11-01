@@ -527,6 +527,42 @@ void testMasterOrder(LocalHttp& server,
     CHECK(log.find(other_last) == std::string::npos);
 }
 
+void testRejectGif(const std::string& ffmpeg, const std::filesystem::path& dir) {
+    g_case = "generate gif";
+    const std::filesystem::path gif = dir / "clip.gif";
+    const std::filesystem::path log = dir / "gif-ffmpeg.log";
+    const int gif_rc = run(
+        {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "testsrc=size=16x16:rate=1:duration=0.2", gif.string()},
+        log);
+    if (gif_rc != 0) {
+        std::cerr << "failed to generate GIF fixture (exit " << gif_rc << ")\n" << readFile(log);
+        ++g_failures;
+        return;
+    }
+
+    g_case = "gif local";
+    FfmpegDecoder local;
+    local.setAllowLocalFile(true);
+    CHECK(!local.open(gif.string()));
+    local.close();
+
+    g_case = "gif http";
+    const std::filesystem::path get_log = dir / "gif-gets.log";
+    LocalHttp server = startLocalHttp(dir, get_log);
+    CHECK(server.pid > 0);
+    CHECK(server.port > 0);
+    if (server.pid <= 0 || server.port <= 0) {
+        return;
+    }
+    const std::string url = "http://127.0.0.1:" + std::to_string(server.port) + "/clip.gif";
+    FfmpegDecoder http;
+    const bool opened = http.open(url);
+    CHECK(!opened);
+    http.close();
+    server.stop();
+}
+
 void testMissingFile(const std::filesystem::path& dir) {
     g_case = "missing file";
     FfmpegDecoder decoder;
@@ -566,6 +602,7 @@ int main() {
         g_case = "mp4";
         testDecode(mp4.string());
         testMissingFile(tmp.path());
+        testRejectGif(ffmpeg, tmp.path());
 
         g_case = "generate hls";
         const std::filesystem::path hls_dir = tmp.path() / "hls";

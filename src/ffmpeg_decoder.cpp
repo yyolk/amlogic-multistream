@@ -6,6 +6,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/avstring.h>
 #include <libavutil/error.h>
 #include <libavutil/log.h>
 #include <libavutil/pixdesc.h>
@@ -17,6 +18,17 @@ namespace {
 // Socket read timeout passed to protocols that understand rw_timeout
 // (microseconds). File inputs ignore it.
 constexpr const char* kRwTimeoutUs = "15000000";
+
+// HLS and the segment demuxers it opens (mpegts, fMP4/mov). mpegts is also
+// a direct HTTP MPEG-TS URL. gif, image2, and the other image demuxers are
+// not listed. hls.c copies this whitelist onto each segment demuxer.
+constexpr const char* kFormatWhitelist = "hls,mpegts,mov,mp4,mpeg";
+
+// Video codecs this player decodes, plus audio codecs
+// avformat_find_stream_info may open while probing HLS or MPEG-TS. gif is
+// not listed. This is not a TLS or privilege boundary.
+constexpr const char* kCodecWhitelist =
+    "h264,hevc,mpeg4,mpeg2video,mpeg1video,mjpeg,aac,mp3,ac3,eac3";
 
 void logAvError(const char* prefix, const std::string& url, const char* what, int err) {
     std::cerr << prefix << " for '" << url << "': " << what;
@@ -91,6 +103,8 @@ bool FfmpegDecoder::open(const std::string& url) {
                 allow_local_file_ ? "file,http,https,tls,tcp,crypto,hls"
                                   : "http,https,tls,tcp,crypto,hls",
                 0);
+    av_dict_set(&opts, "format_whitelist", kFormatWhitelist, 0);
+    av_dict_set(&opts, "codec_whitelist", kCodecWhitelist, 0);
 
     // libavformat initializes network libraries itself. Do not call
     // avformat_network_init(); it is optional and not recommended.
@@ -103,6 +117,14 @@ bool FfmpegDecoder::open(const std::string& url) {
     }
 
     fmt_->flags |= AVFMT_FLAG_GENPTS;
+    if (fmt_->iformat == nullptr || fmt_->iformat->name == nullptr ||
+        av_match_list(fmt_->iformat->name, kFormatWhitelist, ',') <= 0) {
+        const char* name = fmt_->iformat != nullptr ? fmt_->iformat->name : nullptr;
+        std::cerr << "FfmpegDecoder::open failed for '" << url_
+                  << "': demuxer is not allowed: " << (name != nullptr ? name : "unknown") << "\n";
+        close();
+        return false;
+    }
 
     const int info_rc = avformat_find_stream_info(fmt_, nullptr);
     if (info_rc < 0) {
@@ -141,6 +163,13 @@ bool FfmpegDecoder::open(const std::string& url) {
     if (decoder == nullptr) {
         return failOpen("no software decoder for video codec", AVERROR_DECODER_NOT_FOUND);
     }
+    if (decoder->name == nullptr || av_match_list(decoder->name, kCodecWhitelist, ',') <= 0) {
+        std::cerr << "FfmpegDecoder::open failed for '" << url_
+                  << "': video codec is not allowed: "
+                  << (decoder->name != nullptr ? decoder->name : "unknown") << "\n";
+        close();
+        return false;
+    }
 
     codec_ = avcodec_alloc_context3(decoder);
     if (codec_ == nullptr) {
@@ -160,7 +189,10 @@ bool FfmpegDecoder::open(const std::string& url) {
             AVERROR(ENOSYS));
     }
 
-    const int codec_rc = avcodec_open2(codec_, decoder, nullptr);
+    AVDictionary* codec_opts = nullptr;
+    av_dict_set(&codec_opts, "codec_whitelist", kCodecWhitelist, 0);
+    const int codec_rc = avcodec_open2(codec_, decoder, &codec_opts);
+    av_dict_free(&codec_opts);
     if (codec_rc < 0) {
         return failOpen("avcodec_open2", codec_rc);
     }
