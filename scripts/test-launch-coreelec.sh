@@ -149,6 +149,27 @@ int main() {
 }
 EOF
 
+# Ignores TERM, HUP, and INT so the launch script's stop window stays open
+# long enough for a second signal. SIGKILL still ends it.
+g++ -std=c++17 -Wall -Wextra -O2 -o "$WORK/payload-ignore" -x c++ - <<'EOF'
+#include <csignal>
+#include <fstream>
+#include <cstdlib>
+#include <unistd.h>
+int main() {
+    const char* ready_path = std::getenv("READY_FILE");
+    if (ready_path == nullptr) return 2;
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+    {
+        std::ofstream ready(ready_path);
+        ready << getpid() << "\n";
+    }
+    for (;;) pause();
+}
+EOF
+
 # Type-2 stand-in. --appimage-extract writes squashfs-root/AppRun that execs
 # STUB_PAYLOAD. Any other invocation is the buggy runtime: ignore TERM, fork
 # the payload, and do not forward the signal.
@@ -166,7 +187,29 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--appimage-extract") {
         if (mkdir("squashfs-root", 0755) != 0) return 3;
         std::ofstream app("squashfs-root/AppRun");
-        app << "#!/bin/sh\nexec \"" << payload << "\" \"$@\"\n";
+        const char* tree = std::getenv("STUB_TREE");
+        if (tree != nullptr && std::string(tree) == "1") {
+            // Fork two children, one of which has a grandchild. signal_tree
+            // must signal the root and both branches.
+            app << "#!/bin/sh\n"
+                << "dir=${TREE_DIR:?}\n"
+                << "echo $$ > \"$dir/root\"\n"
+                << "(\n"
+                << "  echo $$ > \"$dir/c1\"\n"
+                << "  sleep 120 &\n"
+                << "  echo $! > \"$dir/g\"\n"
+                << "  wait\n"
+                << ") &\n"
+                << "echo $! > \"$dir/c1.pid\"\n"
+                << "(\n"
+                << "  echo $$ > \"$dir/c2\"\n"
+                << "  exec sleep 120\n"
+                << ") &\n"
+                << "echo $! > \"$dir/c2.pid\"\n"
+                << "wait\n";
+        } else {
+            app << "#!/bin/sh\nexec \"" << payload << "\" \"$@\"\n";
+        }
         app.close();
         if (chmod("squashfs-root/AppRun", 0755) != 0) return 4;
         return 0;
@@ -218,6 +261,8 @@ start_shell() {
     READY_FILE="${READY_FILE:-}" \
     SIGNAL_FILE="${SIGNAL_FILE:-}" \
     STUB_PAYLOAD="${STUB_PAYLOAD:-}" \
+    STUB_TREE="${STUB_TREE:-}" \
+    TREE_DIR="${TREE_DIR:-}" \
     PLAYER_BIN="$PLAYER_BIN" \
     PLAYER_EXTRACT_DIR="${PLAYER_EXTRACT_DIR:-}" \
     MQTT_HOST="${MQTT_HOST:-}" \
@@ -286,6 +331,8 @@ run_case() {
   READY_FILE=$ready
   SIGNAL_FILE=$sigfile
   STUB_PAYLOAD=$WORK/payload
+  STUB_TREE=
+  TREE_DIR=
   PLAYER_BIN=$player
   PLAYER_EXTRACT_DIR=$extract
   MQTT_HOST=""
@@ -435,6 +482,322 @@ run_synthetic() {
   run_case "stand-in $hup_name SIGHUP after player" "$hup_cmd" "$WORK/runtime" hup
 }
 
+# Two signals during the 10s stop window. The payload ignores TERM, so the
+# first restore is still inside stop_player when the second arrives.
+run_double_signal() {
+  local name=$1
+  local shell_cmd=$2
+  local label="stand-in $name second TERM during Kodi restore"
+  local case_dir
+  case_dir=$(mktemp -d "$WORK/case.XXXXXX")
+  local log="$case_dir/systemctl.log"
+  local ready="$case_dir/ready"
+  local out="$case_dir/out"
+  local err="$case_dir/err"
+  : >"$log"
+
+  SYSTEMCTL_LOG=$log
+  SYSTEMCTL_STATE=
+  SYSTEMCTL_BLOCK_STOP=0
+  READY_FILE=$ready
+  SIGNAL_FILE=
+  STUB_PAYLOAD=
+  STUB_TREE=
+  TREE_DIR=
+  PLAYER_BIN=$WORK/payload-ignore
+  PLAYER_EXTRACT_DIR=$case_dir/extract
+  MQTT_HOST=
+  MQTT_PORT=
+  start_shell "$shell_cmd" "$out" "$err"
+  local shell_pid=$STARTED_PID
+
+  if ! wait_file "$ready"; then
+    fail "$label: player did not become ready"
+    cat "$err" >&2 || true
+    kill -s TERM "$shell_pid" 2>/dev/null || true
+    wait "$shell_pid" 2>/dev/null || true
+    return
+  fi
+  local payload_pid
+  payload_pid=$(cat "$ready")
+  kill -s TERM "$shell_pid"
+  sleep 2
+  if ! kill -0 "$shell_pid" 2>/dev/null; then
+    fail "$label: shell exited before the second signal"
+    cat "$log" >&2 || true
+    return
+  fi
+  kill -s TERM "$shell_pid" 2>/dev/null || true
+
+  local i=0
+  while kill -0 "$shell_pid" 2>/dev/null && [[ $i -lt 200 ]]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$shell_pid" 2>/dev/null; then
+    fail "$label: shell still running"
+    kill -s KILL -- "-$shell_pid" 2>/dev/null || true
+    wait "$shell_pid" 2>/dev/null || true
+    return
+  fi
+  local status=0
+  wait "$shell_pid" || status=$?
+
+  local starts
+  starts=$(count_starts "$log")
+  if [[ "$starts" != "1" ]]; then
+    fail "$label: expected one 'start kodi', got ${starts:-0}"
+    cat "$log" >&2 || true
+    cat "$err" >&2 || true
+    return
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    fail "$label: expected exit 0, got $status"
+    return
+  fi
+  if kill -0 "$payload_pid" 2>/dev/null; then
+    fail "$label: payload $payload_pid still running"
+    kill -s KILL "$payload_pid" 2>/dev/null || true
+    return
+  fi
+  pass "$label"
+}
+
+# PLAYER_EXTRACT_DIR must not be rm -rf'd, and a dangerous value is refused
+# before anything is removed.
+run_extract_guards() {
+  local shell_cmd=$1
+  local label_shell=$2
+
+  local safe
+  safe=$(mktemp -d "$WORK/safe.XXXXXX")
+  local extract="$safe/extract"
+  mkdir -p "$extract"
+  echo keep > "$extract/keep-me"
+  local log="$safe/systemctl.log"
+  local ready="$safe/ready"
+  local out="$safe/out"
+  local err="$safe/err"
+  : >"$log"
+  SYSTEMCTL_LOG=$log
+  SYSTEMCTL_STATE=
+  SYSTEMCTL_BLOCK_STOP=0
+  READY_FILE=$ready
+  SIGNAL_FILE=
+  STUB_PAYLOAD=$WORK/payload
+  STUB_TREE=
+  TREE_DIR=
+  PLAYER_BIN=$WORK/runtime
+  PLAYER_EXTRACT_DIR=$extract
+  MQTT_HOST=
+  MQTT_PORT=
+  start_shell "$shell_cmd" "$out" "$err"
+  local shell_pid=$STARTED_PID
+  if ! wait_file "$ready"; then
+    fail "$label_shell extract sentinel: player did not become ready"
+    cat "$err" >&2 || true
+    kill -s TERM "$shell_pid" 2>/dev/null || true
+    wait "$shell_pid" 2>/dev/null || true
+    return
+  fi
+  if [[ ! -f "$extract/keep-me" ]]; then
+    fail "$label_shell extract sentinel: keep-me was removed"
+  elif [[ ! -x "$extract/squashfs-root/AppRun" ]]; then
+    fail "$label_shell extract sentinel: AppRun missing"
+  else
+    pass "$label_shell extract sentinel kept"
+  fi
+  kill -s TERM "$shell_pid" 2>/dev/null || true
+  wait "$shell_pid" 2>/dev/null || true
+
+  refuse_extract() {
+    local why=$1
+    local dir_value=$2
+    local case_dir
+    case_dir=$(mktemp -d "$WORK/refuse.XXXXXX")
+    local sentinel="$case_dir/sentinel"
+    echo keep > "$sentinel"
+    local rlog="$case_dir/systemctl.log"
+    local rout="$case_dir/out"
+    local rerr="$case_dir/err"
+    : >"$rlog"
+    SYSTEMCTL_LOG=$rlog
+    SYSTEMCTL_STATE=
+    SYSTEMCTL_BLOCK_STOP=0
+    READY_FILE=
+    SIGNAL_FILE=
+    STUB_PAYLOAD=
+    STUB_TREE=
+    TREE_DIR=
+    PLAYER_BIN=$WORK/runtime
+    PLAYER_EXTRACT_DIR=$dir_value
+    MQTT_HOST=
+    MQTT_PORT=
+    start_shell "$shell_cmd" "$rout" "$rerr"
+    local pid=$STARTED_PID
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [[ $i -lt 50 ]]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      fail "$label_shell refuse $why: shell still running"
+      kill -s KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return
+    fi
+    local status=0
+    wait "$pid" || status=$?
+    if [[ "$status" -eq 0 ]]; then
+      fail "$label_shell refuse $why: expected non-zero exit"
+      cat "$rerr" >&2 || true
+      return
+    fi
+    if ! grep -q 'refusing' "$rerr"; then
+      fail "$label_shell refuse $why: stderr did not say refusing"
+      cat "$rerr" >&2 || true
+      return
+    fi
+    if grep -q 'stop kodi' "$rlog"; then
+      fail "$label_shell refuse $why: stopped Kodi"
+      cat "$rlog" >&2 || true
+      return
+    fi
+    if [[ ! -f "$sentinel" || ! -x "$WORK/runtime" ]]; then
+      fail "$label_shell refuse $why: sentinel or runtime was removed"
+      return
+    fi
+    pass "$label_shell refuse $why"
+  }
+
+  local ancestor
+  ancestor=$(mktemp -d "$WORK/ancestor.XXXXXX")
+  mkdir -p "$ancestor/bin"
+  cp "$WORK/runtime" "$ancestor/bin/player"
+  echo keep > "$ancestor/keep-me"
+  local alog="$ancestor/systemctl.log"
+  local aout="$ancestor/out"
+  local aerr="$ancestor/err"
+  : >"$alog"
+  SYSTEMCTL_LOG=$alog
+  PLAYER_BIN=$ancestor/bin/player
+  PLAYER_EXTRACT_DIR=$ancestor
+  start_shell "$shell_cmd" "$aout" "$aerr"
+  local apid=$STARTED_PID
+  local i=0
+  while kill -0 "$apid" 2>/dev/null && [[ $i -lt 50 ]]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$apid" 2>/dev/null; then
+    fail "$label_shell refuse ancestor: shell still running"
+    kill -s KILL "$apid" 2>/dev/null || true
+    wait "$apid" 2>/dev/null || true
+  else
+    local status=0
+    wait "$apid" || status=$?
+    if [[ "$status" -eq 0 ]] || ! grep -q 'refusing' "$aerr"; then
+      fail "$label_shell refuse ancestor: expected refusal"
+      cat "$aerr" >&2 || true
+    elif [[ ! -f "$ancestor/keep-me" || ! -x "$ancestor/bin/player" ]]; then
+      fail "$label_shell refuse ancestor: player or sentinel removed"
+    elif grep -q 'stop kodi' "$alog"; then
+      fail "$label_shell refuse ancestor: stopped Kodi"
+    else
+      pass "$label_shell refuse ancestor"
+    fi
+  fi
+
+  refuse_extract "empty" ""
+  refuse_extract "root" "/"
+  refuse_extract "storage" "/storage"
+  refuse_extract "storage-parent" "/storage/.."
+}
+
+# AppRun forks a child with a grandchild and a second child. All of them
+# must die on one TERM, including under dash, bash, and busybox ash.
+run_signal_tree() {
+  local name=$1
+  local shell_cmd=$2
+  local label="stand-in $name signal_tree forks"
+  local case_dir
+  case_dir=$(mktemp -d "$WORK/tree.XXXXXX")
+  local tree="$case_dir/pids"
+  mkdir -p "$tree"
+  local log="$case_dir/systemctl.log"
+  local ready="$tree/root"
+  local out="$case_dir/out"
+  local err="$case_dir/err"
+  : >"$log"
+  SYSTEMCTL_LOG=$log
+  SYSTEMCTL_STATE=
+  SYSTEMCTL_BLOCK_STOP=0
+  READY_FILE=
+  SIGNAL_FILE=
+  STUB_PAYLOAD=$WORK/payload
+  STUB_TREE=1
+  TREE_DIR=$tree
+  PLAYER_BIN=$WORK/runtime
+  PLAYER_EXTRACT_DIR=$case_dir/extract
+  MQTT_HOST=
+  MQTT_PORT=
+  start_shell "$shell_cmd" "$out" "$err"
+  local shell_pid=$STARTED_PID
+
+  local i=0
+  while [[ $i -lt 50 ]]; do
+    if [[ -s "$tree/root" && -s "$tree/c1" && -s "$tree/c2" && -s "$tree/g" ]]; then
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [[ ! -s "$tree/root" || ! -s "$tree/c1" || ! -s "$tree/c2" || ! -s "$tree/g" ]]; then
+    fail "$label: process tree did not record pids"
+    cat "$err" >&2 || true
+    kill -s TERM "$shell_pid" 2>/dev/null || true
+    wait "$shell_pid" 2>/dev/null || true
+    return
+  fi
+  local root c1 c2 g
+  root=$(cat "$tree/root")
+  c1=$(cat "$tree/c1")
+  c2=$(cat "$tree/c2")
+  g=$(cat "$tree/g")
+  local started=$SECONDS
+  kill -s TERM "$shell_pid"
+  i=0
+  while kill -0 "$shell_pid" 2>/dev/null && [[ $i -lt 80 ]]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  local elapsed=$((SECONDS - started))
+  if kill -0 "$shell_pid" 2>/dev/null; then
+    fail "$label: shell still running after ${elapsed}s"
+    kill -s KILL -- "-$shell_pid" 2>/dev/null || true
+    wait "$shell_pid" 2>/dev/null || true
+    return
+  fi
+  local status=0
+  wait "$shell_pid" || status=$?
+  local starts
+  starts=$(count_starts "$log")
+  local alive=""
+  for pid in "$root" "$c1" "$c2" "$g"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive="$alive $pid"
+      kill -s KILL "$pid" 2>/dev/null || true
+    fi
+  done
+  if [[ "$starts" != "1" || "$status" -ne 0 || -n "$alive" || "$elapsed" -ge 8 ]]; then
+    fail "$label: starts=${starts:-0} status=$status elapsed=${elapsed}s alive=${alive:-none}"
+    cat "$log" >&2 || true
+    cat "$err" >&2 || true
+    return
+  fi
+  pass "$label"
+}
+
 run_real_player_case() {
   local label=$1
   local shell_cmd=$2
@@ -453,6 +816,8 @@ run_real_player_case() {
   READY_FILE=
   SIGNAL_FILE=
   STUB_PAYLOAD=
+  STUB_TREE=
+  TREE_DIR=
   PLAYER_BIN=$player
   PLAYER_EXTRACT_DIR=$REAL_EXTRACT
   MQTT_HOST=127.0.0.1
@@ -678,6 +1043,21 @@ EOF
 
 if [[ "$ONLY_APPIMAGE" -eq 0 ]]; then
   run_synthetic
+  for i in "${!SHELL_NAMES[@]}"; do
+    run_double_signal "${SHELL_NAMES[$i]}" "${SHELL_CMDS[$i]}"
+    run_signal_tree "${SHELL_NAMES[$i]}" "${SHELL_CMDS[$i]}"
+  done
+  # Extract guards are shell-independent aside from the trap syntax. Dash
+  # when present, otherwise bash.
+  guard_cmd=bash
+  guard_name=bash
+  for i in "${!SHELL_NAMES[@]}"; do
+    if [[ ${SHELL_NAMES[$i]} == dash ]]; then
+      guard_cmd=${SHELL_CMDS[$i]}
+      guard_name=dash
+    fi
+  done
+  run_extract_guards "$guard_cmd" "$guard_name"
 fi
 if [[ -n "$APPIMAGE" ]]; then
   run_appimage

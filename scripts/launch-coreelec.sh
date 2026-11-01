@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck shell=dash
 # requires GS-King X / CoreELEC
 # RetroArch-style launch: stop Kodi, run the player, start Kodi.
 #
@@ -13,7 +14,10 @@
 # on the runtime leaves the player running after this script starts Kodi.
 # A bare ELF is executed as itself. PLAYER_BIN overrides the on-device path
 # (default /storage/amlogic-multistream). PLAYER_EXTRACT_DIR overrides the
-# unpack directory (default $PLAYER_BIN.AppDir).
+# unpack directory (default $PLAYER_BIN.AppDir). The script refuses an empty
+# value, "/", "/storage", $HOME, and any directory that contains this script
+# or the player. It deletes only squashfs-root and the stamp inside that
+# directory, never the directory itself.
 #
 # /bin/sh on CoreELEC is busybox ash. This file is dash/busybox sh: traps
 # are installed before Kodi is stopped, so SIGINT during `systemctl stop`
@@ -33,6 +37,56 @@ abs_path() {
         /*) printf '%s\n' "$1" ;;
         *) printf '%s\n' "$(pwd)/$1" ;;
     esac
+}
+
+# Lexical absolute-path cleanup. Does not touch the filesystem, so a
+# not-yet-created extract directory still normalizes.
+normalize_abs() {
+    local old_ifs out seg
+    old_ifs=$IFS
+    IFS=/
+    # shellcheck disable=SC2086
+    set -- $1
+    IFS=$old_ifs
+    out=
+    for seg in "$@"; do
+        case "$seg" in
+            "" | ".")
+                ;;
+            ..)
+                out=${out%/*}
+                ;;
+            *)
+                out="$out/$seg"
+                ;;
+        esac
+    done
+    if [ -z "$out" ]; then
+        printf '%s\n' "/"
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+# True when this directory must not be used as an AppImage extract root.
+dangerous_extract_root() {
+    local root script_path home
+    root=$1
+    if [ -z "$root" ] || [ "$root" = "/" ] || [ "$root" = "/storage" ]; then
+        return 0
+    fi
+    home=${HOME:-}
+    if [ -n "$home" ] && [ "$root" = "$home" ]; then
+        return 0
+    fi
+    script_path=$(normalize_abs "$(abs_path "$0")")
+    case "$script_path" in
+        "$root" | "$root"/*) return 0 ;;
+    esac
+    case "$player_bin" in
+        "$root" | "$root"/*) return 0 ;;
+    esac
+    return 1
 }
 
 # e_ident padding at offset 8 is "AI" + 0x02 on a type-2 AppImage.
@@ -70,11 +124,13 @@ ppid_of() {
 }
 
 # Children first. An AppRun that has not exec'd must not be able to leave
-# the real player reparented to init.
+# the real player reparented to init. The player does not fork today; this
+# walk is for a forking AppRun. root and sig stay local so a recursive call
+# cannot drop the root or a later sibling (dash, bash, and busybox ash).
 signal_tree() {
+    local root sig dir pid pp
     root=$1
     sig=$2
-    local dir pid pp
     for dir in /proc/[0-9]*; do
         pid=${dir#/proc/}
         case "$pid" in
@@ -110,6 +166,10 @@ stop_player() {
 # Start Kodi once. If the player is still running, stop it first and do
 # not start Kodi while that pid is alive.
 restore_kodi() {
+    # A second HUP, TERM, or INT while stop_player is still polling must not
+    # run this trap again and exit before Kodi is started. Ignore them for
+    # the rest of the process; the caller exits after restore.
+    trap '' HUP TERM INT
     if [ "$restored" = 1 ]; then
         return 0
     fi
@@ -133,15 +193,30 @@ if [ ! -e "$player_bin" ]; then
     trap - EXIT HUP TERM INT
     exit 1
 fi
-player_bin=$(abs_path "$player_bin")
+player_bin=$(normalize_abs "$(abs_path "$player_bin")")
 
 run_bin=$player_bin
 if is_type2_appimage "$player_bin"; then
-    extract_root="${PLAYER_EXTRACT_DIR:-$player_bin.AppDir}"
+    if [ "${PLAYER_EXTRACT_DIR+x}" = x ]; then
+        extract_root=$PLAYER_EXTRACT_DIR
+    else
+        extract_root=$player_bin.AppDir
+    fi
+    if [ -z "$extract_root" ]; then
+        echo "launch-coreelec: refusing empty PLAYER_EXTRACT_DIR" >&2
+        trap - EXIT HUP TERM INT
+        exit 1
+    fi
     case "$extract_root" in
         /*) ;;
         *) extract_root="$(pwd)/$extract_root" ;;
     esac
+    extract_root=$(normalize_abs "$extract_root")
+    if dangerous_extract_root "$extract_root"; then
+        echo "launch-coreelec: refusing unsafe extract directory: $extract_root" >&2
+        trap - EXIT HUP TERM INT
+        exit 1
+    fi
     stamp="$extract_root/.source-stamp"
     if stat -c '%s %Y' "$player_bin" >/dev/null 2>&1; then
         current=$(stat -c '%s %Y' "$player_bin")
@@ -151,7 +226,9 @@ if is_type2_appimage "$player_bin"; then
     apprun="$extract_root/squashfs-root/AppRun"
     saved=$(cat "$stamp" 2>/dev/null || true)
     if [ ! -x "$apprun" ] || [ "$saved" != "$current" ]; then
-        rm -rf "$extract_root"
+        # Only the unpacked tree and the stamp. Never $extract_root itself.
+        rm -rf "$extract_root/squashfs-root"
+        rm -f "$stamp"
         mkdir -p "$extract_root"
         # APPIMAGE_EXTRACT_AND_RUN would fork AppRun and wait in the runtime,
         # which is the orphan this path exists to avoid. --appimage-extract
