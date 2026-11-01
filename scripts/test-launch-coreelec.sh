@@ -52,6 +52,17 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# /proc/pid/exe is absolute. A relative --bare path never compares equal,
+# which is what CI passed (build/amlogic-multistream).
+if [[ -n "$APPIMAGE" ]]; then
+  APPIMAGE=$(readlink -f "$APPIMAGE")
+  [[ -x "$APPIMAGE" ]] || die "AppImage is not executable: $APPIMAGE"
+fi
+if [[ -n "$BARE" ]]; then
+  BARE=$(readlink -f "$BARE")
+  [[ -x "$BARE" ]] || die "bare ELF is not executable: $BARE"
+fi
+
 failures=0
 pass() { echo "ok  $*"; }
 fail() {
@@ -451,7 +462,7 @@ run_real_player_case() {
   # stdout is block-buffered when it is not a tty, so the "Waiting for
   # SIGINT" line may not hit the log until the player exits. Readiness is
   # the player process itself: AppRun (or the bare ELF) parented by the shell.
-  local player_pid="" exe parent
+  local player_pid="" exe
   local i=0
   while [[ $i -lt 300 ]]; do
     if ! kill -0 "$shell_pid" 2>/dev/null; then
@@ -463,25 +474,22 @@ run_real_player_case() {
       return
     fi
     player_pid=""
-    for pid_path in /proc/[0-9]*; do
-      local pid=${pid_path#/proc/}
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    # Direct children only. Scanning every /proc entry made this loop take
+    # minutes on a GitHub runner when the exe path did not match.
+    local child
+    for child in $(cat "/proc/$shell_pid/task/$shell_pid/children" 2>/dev/null || true); do
+      exe=$(readlink -f "/proc/$child/exe" 2>/dev/null || true)
+      [[ -n "$exe" ]] || continue
       case "$exe" in
-        "$REAL_EXTRACT"/*) ;;
-        "$player")
-          # --appimage-extract is the type-2 runtime. Its exe is the
-          # AppImage, and a subshell may exec it so the parent is the
-          # launch script. That process exits when unpack finishes.
-          if [[ "$player" == "$APPIMAGE" ]]; then
-            continue
-          fi
+        "$REAL_EXTRACT"/*)
+          player_pid=$child
+          break
           ;;
-        *) continue ;;
       esac
-      parent=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$pid/status" | head -n 1)
-      if [[ "$parent" == "$shell_pid" ]]; then
-        player_pid=$pid
+      # --appimage-extract is the type-2 runtime. A subshell may exec it,
+      # so it shows up as a child, then exits when unpack finishes.
+      if [[ "$exe" == "$player" && "$player" != "$APPIMAGE" ]]; then
+        player_pid=$child
         break
       fi
     done
@@ -565,7 +573,7 @@ run_real_player_case() {
     for pid_path in /proc/[0-9]*; do
       pid=${pid_path#/proc/}
       [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+      exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
       case "$exe" in
         "$REAL_EXTRACT"/*|"$player")
           leftover=1
