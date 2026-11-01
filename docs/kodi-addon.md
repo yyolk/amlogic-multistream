@@ -33,6 +33,8 @@ They come from the `amlogic-multistream-appimage-coreelec21-ng-armv7hf` and `aml
 
 3. The launch script stops Kodi, runs the player, waits for it to exit, and starts Kodi again.
 
+Launch is one remote click. This build's MQTT mode is software-only and does not open DRM/KMS, so the player does not put a picture on screen. Stop the unit (`systemctl stop amlogic-multistream-launch`) to get Kodi back. What the HDMI port shows after Kodi stops has not been checked on a GS-King X.
+
 The add-on uses `systemd-run` rather than starting the script directly. A process started by Kodi belongs to `kodi.service`, so the script's own `systemctl stop kodi` would kill it and Kodi would never be started again. The transient unit has its own cgroup and keeps running after Kodi stops. `KillMode=mixed` makes `systemctl stop amlogic-multistream-launch` send SIGTERM to the script only. The script's trap then stops the player and starts Kodi. The script runs through `/bin/sh` because a zip install does not keep the executable bit.
 
 If the unit is already active, Launch shows an error and does nothing.
@@ -119,7 +121,7 @@ Do not copy `kodi-addon/plugin.program.amlogic-multistream/` from the repository
 
 ### Run it
 
-Open **Add-ons → Program add-ons** (or **Game add-ons**), choose **amlogic-multistream**, then **Launch amlogic-multistream (stops Kodi)**. **Settings** opens the add-on settings. A favourite or keymap that runs `RunPlugin(plugin://plugin.program.amlogic-multistream/?action=launch)` launches the player in one step.
+Open **Add-ons → Program add-ons** (or **Game add-ons**), choose **amlogic-multistream**, then **Launch amlogic-multistream (stops Kodi, no picture until DRM)**. The notification says the same thing: software mode shows nothing until DRM/KMS, and Kodi returns when the player exits. **Settings** opens the add-on settings. A favourite or keymap that runs `RunPlugin(plugin://plugin.program.amlogic-multistream/?action=launch)` launches the player in one step.
 
 ## What CI checks
 

@@ -11,7 +11,7 @@ msgstr ""
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
 msgctxt "#30001"
-msgid "Launch amlogic-multistream (stops Kodi)"
+msgid "Launch amlogic-multistream (stops Kodi, no picture until DRM)"
 msgstr ""
 
 msgctxt "#30002"
@@ -23,7 +23,7 @@ msgid "Could not start the player. Kodi was not stopped."
 msgstr ""
 
 msgctxt "#30011"
-msgid "Stopping Kodi. It starts again when the player exits."
+msgid "Stopping Kodi. Software mode shows nothing until DRM/KMS. Kodi returns when the player exits."
 msgstr ""
 
 msgctxt "#30100"

@@ -1,10 +1,10 @@
 # MQTT command control
 
-The player process connects to an MQTT broker, subscribes to command topics, and keeps an in-memory stream table. Broker I/O runs on the mosquitto thread. The main thread ticks software decode and present until SIGINT or SIGTERM, so the process is not blocked in `sigwait` with no decode loop.
+The player process connects to an MQTT broker, subscribes to command topics, and keeps an in-memory stream table. Broker I/O runs on the mosquitto thread. The main thread ticks software decode and present until SIGINT, SIGTERM, or SIGHUP, so the process is not blocked in `sigwait` with no decode loop.
 
-`start` / `play` sets the player-loop flag. While it is set, each visible stream is opened with `FfmpegDecoder` (CPU, `isHardware()` false) and one YUV420P frame per tick is presented with `SoftwareRenderer` into the `LayoutEngine` cell for that stream. `stop` clears the flag, closes those decoders, and clears the RGB viewport. The stream table is kept, and MQTT stays connected. DRM/KMS and Amlogic hardware decode are not started.
+`start` / `play` sets the player-loop flag. While it is set, each visible stream is opened with `FfmpegDecoder` (CPU, `isHardware()` false) and one YUV420P frame per tick is presented with `SoftwareRenderer` into the `LayoutEngine` cell for that stream. `stop` clears the flag, closes those decoders, and clears the RGB viewport. The stream table is kept, and MQTT stays connected. DRM/KMS and Amlogic hardware decode are not started. Software mode does not drive HDMI: the RGB buffer is not scanned out, so Launch from the Kodi add-on stops Kodi and puts no player picture on screen until a DRM/KMS backend exists. What the HDMI port itself shows (black, a console, or a frozen Kodi frame) has not been checked on a GS-King X. Stop the process (`systemctl stop amlogic-multistream-launch` on the add-on path) to return to Kodi.
 
-CoreELEC display takeover is still `scripts/launch-coreelec.sh` (stop Kodi, run this process, start Kodi). The process stays in the foreground until it receives SIGINT or SIGTERM, so Kodi stays stopped for that whole time.
+CoreELEC display takeover is still `scripts/launch-coreelec.sh` (stop Kodi, run this process, start Kodi). The process stays in the foreground until it receives SIGINT, SIGTERM, or SIGHUP, so Kodi stays stopped for that whole time.
 
 ## Broker
 
@@ -19,7 +19,7 @@ Environment variables, overridden by the matching flag:
 | `MQTT_PASSWORD` | `--mqtt-pass` | empty |
 | `MQTT_CLIENT_ID` | `--mqtt-client-id` | `amlogic-multistream` |
 
-TLS is not implemented. The client uses a clean session, QoS 1, and reconnects with backoff from 1s to 30s.
+TLS is not implemented. The client uses a clean session, QoS 1, and reconnects with backoff from 1s to 30s. That backoff includes the first connection: a refused port or a name that does not resolve keeps the process up and retries instead of exiting. Outside a lab LAN, broker authentication (a username and password, or a broker ACL) is expected. This does not add TLS verification and does not change that CoreELEC runs the player as root.
 
 ```bash
 amlogic-multistream --mqtt-host 192.168.1.10 --mqtt-prefix living-room
@@ -36,7 +36,9 @@ Software present, only on this MQTT path (`--url` still sizes its viewport from 
 
 The presenter is always `SoftwareRenderer`. It does not open `/dev/dri`. `--renderer drm` is only valid with `--url`.
 
-The main thread pulls at most one frame from each visible stream, presents it, then waits about 20ms for SIGINT or SIGTERM. A read that blocks inside FFmpeg (the socket `rw_timeout` is 15s) delays the next tick and the signal until that read returns. Streams past the last layout cell are not opened. A failed open or a read that ends retries after one second; `restart` retries immediately.
+The main thread pulls at most one frame from each visible stream, presents it, then waits about 20ms for SIGINT, SIGTERM, or SIGHUP. A read that blocks inside FFmpeg (the socket `rw_timeout` is 15s) delays the next tick and the signal until that read returns. Streams past the last layout cell are not opened. A failed open or a read that ends retries after one second; `restart` retries immediately.
+
+`FfmpegDecoder` keeps the protocol allowlist (`http`, `https`, `tls`, `tcp`, `crypto`, `hls`, and `file` only on the `--url` local-file path) and also sets a demuxer allowlist (`hls`, `mpegts`, `mov`, `mp4`, `mpeg`) and a codec allowlist (`h264`, `hevc`, `mpeg4`, `mpeg2video`, `mpeg1video`, `mjpeg`, plus `aac`, `mp3`, `ac3`, and `eac3` so a container probe can open the audio stream). HLS copies those whitelists onto its segment demuxers. An HTTP GIF is rejected. This is not a fix for TLS verification or for the player running as root.
 
 ## Topics
 
@@ -49,7 +51,7 @@ The main thread pulls at most one frame from each visible stream, presents it, t
 | `<prefix>/status` | publish | true | Current player and stream table |
 | `<prefix>/response` | publish | false | Result of the last command |
 
-The broker will is a retained offline status (`"online": false` and an empty stream list). That payload is fixed at connect time. On a clean shutdown the process publishes a final retained status built from the real table with `"online": false` before it disconnects.
+The broker will is a retained offline status. It starts as `"online": false` with an empty stream list. After each status publish the client stores a new will built from the current table (`"online": false` and the real streams). libmosquitto sends that will on the next CONNECT, including a reconnect after the broker drops. A SIGKILL before that next CONNECT still publishes the will from the previous CONNECT. SIGINT, SIGTERM, and SIGHUP are a clean shutdown: the process publishes a final retained status from the live table with `"online": false`, then disconnects, so the broker discards the will. Each retained status payload is also written to stdout as `MQTT status …`. Stdout is line-buffered, so a SIGKILL leaves that last line in the log (the add-on journal) even though the process cannot publish again.
 
 Retained messages on command topics are ignored. A command is applied only when it is delivered live.
 
@@ -72,7 +74,7 @@ Publish either to `<prefix>/cmd/<command>` or to `<prefix>/cmd` with `"action"` 
 | `mute` | `id`, `muted` | Set mute for one stream. `muted` is a JSON bool, or the string `"true"` / `"false"`. There is no audio decoder, so mute does not change the picture. |
 | `restart` | `id` optional | With a non-empty string `id`, bump that stream's generation so the player closes and reopens its decoder. The url and mute flag stay. An unknown id fails with `stream not found` and does not restart any other stream. An empty id, or an id that is not a string (for example `true`), fails with `id is required` and also restarts nothing. Omitting `id` restarts every stream. A JSON `null` is not stored, so `"id": null` is the same as omitting `id`. |
 
-`stop` does not exit the process. Kill it with SIGINT or SIGTERM when Kodi should come back. Send `start` (or `play`) after `add` before frames are presented. The examples below do that.
+`stop` does not exit the process. Kill it with SIGINT, SIGTERM, or SIGHUP when Kodi should come back. Send `start` (or `play`) after `add` before frames are presented. The examples below do that. Software mode still does not put those frames on a display.
 
 ### Response
 
