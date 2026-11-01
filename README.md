@@ -96,7 +96,7 @@ Pass `-DCMAKE_CXX_COMPILER=g++` when `c++` on the PATH is not g++.
 
 ## Tests
 
-`layout_engine_tests` is the layout unit-test binary. CTest registers it as `layout_engine`. The same `ctest` run also executes `stream_manager_test`, `mqtt_smoke_test`, `software_renderer_tests`, `stream_player_test`, `scripts/test-ctest-require.sh` (the CI guard that rejects a run where `ffmpeg_decoder`, `present_smoke`, or `stream_player_http` was omitted or skipped), and `scripts/test-launch-coreelec.sh` (a stand-in for the CoreELEC launch script: bash, dash, and busybox ash when busybox is installed). When the FFmpeg libraries are present it also runs `ffmpeg_decoder_tests` and `stream_player_http`, and when the player dependencies are present it runs `present_smoke_test`.
+`layout_engine_tests` is the layout unit-test binary. CTest registers it as `layout_engine`. The same `ctest` run also executes `stream_manager_test`, `mqtt_smoke_test`, `software_renderer_tests`, `stream_player_test`, `scripts/test-ctest-require.sh` (the CI guard that rejects a run where `ffmpeg_decoder`, `present_smoke`, or `stream_player_http` was omitted or skipped), `scripts/test-launch-coreelec.sh` (a stand-in for the CoreELEC launch script: bash, dash, and busybox ash when busybox is installed), and `tests/kodi_addon_test.py` (the Kodi add-on against stub Kodi modules, when `python3` is found). When the FFmpeg libraries are present it also runs `ffmpeg_decoder_tests` and `stream_player_http`, and when the player dependencies are present it runs `present_smoke_test`.
 
 ```bash
 cmake -S . -B build -DCMAKE_CXX_COMPILER=g++
@@ -160,3 +160,14 @@ CoreELEC has no `fusermount`. A type-2 AppImage is extracted once to `/storage/a
 CI runs `scripts/test-launch-coreelec.sh` with a stand-in runtime, and again against the packaged AppImage. It does not boot a GS-King X.
 
 Put a 32-bit ARM build at `/storage/amlogic-multistream` before running it. The aarch64 CI artifact is the wrong binary for that path.
+
+## Kodi plugin install
+
+`kodi-addon/plugin.program.amlogic-multistream/` is a Kodi launcher add-on. It **requires GS-King X / CoreELEC** to run. Its **Launch** entry starts the bundled copy of `scripts/launch-coreelec.sh` as a transient systemd unit (`systemd-run --unit=amlogic-multistream-launch`). The unit lets the script survive its own `systemctl stop kodi`, run the player, and start Kodi again. To return to Kodi early, run `systemctl stop amlogic-multistream-launch`.
+
+```bash
+./scripts/package-kodi-addon.sh                       # dist/plugin.program.amlogic-multistream-<version>.zip
+./scripts/install-kodi-addon.sh --host root@coreelec  # or Kodi: Add-ons → Install from zip file
+```
+
+The add-on does not contain the player. Put a 32-bit ARM build at `/storage/amlogic-multistream`, or change **Player binary** (`PLAYER_BIN`) in the add-on settings. The x86_64 and aarch64 CI AppImages do not run on the GS-King X. `install-kodi-addon.sh --player FILE` refuses a binary that is not 32-bit ARM. CI uploads the zip as the `plugin.program.amlogic-multistream` artifact. Install steps, settings, and the list of host-only checks are in [docs/kodi-addon.md](docs/kodi-addon.md). Loading the add-on in Kodi and the display handover have not been verified on a device.

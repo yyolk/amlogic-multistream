@@ -7,7 +7,9 @@
 #   binary. CoreELEC Amlogic-ng is a 32-bit ARM userspace, and this
 #   workflow does not cross-compile armv7 or use a CoreELEC sysroot.
 #
-# Both runners execute the player and the unit tests natively.
+# Both runners execute the player and the unit tests natively. The x86_64
+# runner also uploads the Kodi add-on zip (kodi-addon/), which launches
+# scripts/launch-coreelec.sh on the device and does not contain a player.
 
 name: CI
 
@@ -132,5 +134,21 @@ jobs:
         with:
           name: amlogic-multistream-appimage-${{ matrix.arch }}
           path: dist/*.AppImage
+          if-no-files-found: error
+          compression-level: 0
+
+      # The add-on zip is architecture independent and does not contain the
+      # player, so one runner is enough. ctest (kodi_addon) already checked
+      # its contents above.
+      - name: Package Kodi add-on
+        if: matrix.arch == 'x86_64'
+        run: ./scripts/package-kodi-addon.sh --out dist/kodi-addon
+
+      - name: Upload Kodi add-on
+        if: matrix.arch == 'x86_64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin.program.amlogic-multistream
+          path: dist/kodi-addon/*.zip
           if-no-files-found: error
           compression-level: 0

@@ -1,0 +1,75 @@
+# Kodi Media Center language file
+# Addon Name: amlogic-multistream
+# Addon id: plugin.program.amlogic-multistream
+msgid ""
+msgstr ""
+"Project-Id-Version: plugin.program.amlogic-multistream\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: en_GB\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+msgctxt "#30001"
+msgid "Launch amlogic-multistream (stops Kodi)"
+msgstr ""
+
+msgctxt "#30002"
+msgid "Settings"
+msgstr ""
+
+msgctxt "#30010"
+msgid "Could not start the player. Kodi was not stopped."
+msgstr ""
+
+msgctxt "#30011"
+msgid "Stopping Kodi. It starts again when the player exits."
+msgstr ""
+
+msgctxt "#30100"
+msgid "Player"
+msgstr ""
+
+msgctxt "#30101"
+msgid "Player binary or AppImage"
+msgstr ""
+
+msgctxt "#30102"
+msgid "PLAYER_BIN for the launch script. Must be a 32-bit ARM build on CoreELEC Amlogic-ng (GS-King X). The aarch64 CI AppImage does not run there."
+msgstr ""
+
+msgctxt "#30103"
+msgid "Launch script override"
+msgstr ""
+
+msgctxt "#30104"
+msgid "Leave empty to use the launch-coreelec.sh bundled with this add-on."
+msgstr ""
+
+msgctxt "#30200"
+msgid "MQTT"
+msgstr ""
+
+msgctxt "#30201"
+msgid "Broker host"
+msgstr ""
+
+msgctxt "#30202"
+msgid "MQTT_HOST. Empty leaves the player default (localhost)."
+msgstr ""
+
+msgctxt "#30203"
+msgid "Broker port"
+msgstr ""
+
+msgctxt "#30204"
+msgid "MQTT_PORT. 0 leaves the player default (1883)."
+msgstr ""
+
+msgctxt "#30205"
+msgid "Topic prefix"
+msgstr ""
+
+msgctxt "#30206"
+msgid "MQTT_TOPIC_PREFIX. Empty leaves the player default (amlogic-multistream)."
+msgstr ""

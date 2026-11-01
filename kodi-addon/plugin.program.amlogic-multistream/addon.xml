@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.program.amlogic-multistream"
+       name="amlogic-multistream"
+       version="0.1.0"
+       provider-name="yyolk">
+  <requires>
+    <import addon="xbmc.python" version="3.0.0"/>
+  </requires>
+  <extension point="xbmc.python.pluginsource" library="default.py">
+    <provides>executable game</provides>
+  </extension>
+  <extension point="xbmc.addon.metadata">
+    <summary lang="en_GB">Stop Kodi, run amlogic-multistream, start Kodi again</summary>
+    <description lang="en_GB">RetroArch-style launcher for the amlogic-multistream player on CoreELEC. Launch stops Kodi, runs the player binary (default /storage/amlogic-multistream), and starts Kodi when the player exits. The player binary is not part of this add-on. The GS-King X runs a 32-bit ARM CoreELEC Amlogic-ng userspace, so the x86_64 and aarch64 CI AppImages do not run there.</description>
+    <disclaimer lang="en_GB">Kodi is stopped while the player runs. Return to Kodi by stopping the player, for example: systemctl stop amlogic-multistream-launch</disclaimer>
+    <platform>linux</platform>
+    <assets>
+      <icon>resources/icon.png</icon>
+    </assets>
+  </extension>
+</addon>
