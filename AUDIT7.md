@@ -310,3 +310,62 @@ logged `MQTT connected`, applied `add`, and on SIGTERM published
 - **libmosquitto source:** v2.0.18 tag (`lib/connect.c`, `lib/net_mosq.c`,
   `lib/packet_mosq.c`, `lib/thread_mosq.c`) for B1 and for the claim that the
   client library resolves on the calling thread.
+
+---
+
+## CROSSCHECK-A
+
+Peer: [AUDIT7-B](https://github.com/yyolk/amlogic-multistream/pull/49)
+(`AUDIT7-B.md`, commit `0a05714` on `cursor/audit7-b-second-look-034b`).
+They audited `c597b16` and did not read this file. This file audited
+`25bfa8d`. `git diff c597b16 25bfa8d -- src tests scripts CMakeLists.txt` is
+empty, so both passes read the same host code. Nothing was fixed here.
+
+The survivors table at the top is this pass's rating before the cross-check.
+The calls below replace it for anything both auditors would still ship.
+
+### Their findings
+
+| ID | Call | After this pass | Reason |
+| --- | --- | --- | --- |
+| **N5** | **agree** (same bug as B1) | **nit** | The empty startup will is the same retained object `finishProcess` stores for a session that has not applied a command: `online:false`, empty `streams`. Exit is 1 ms (theirs) or a few ms (this pass). It does not leave `online:true` and it does not blow the launch poll. What remains is the "has not published yet" sentence, a missing `MQTT status` line, and no DISCONNECT. |
+| **N2** | **agree** | **nit** | A blackhole broker from launch still pays `kDisconnectWait`. They measured 515 ms; this pass measured 516 ms. `publishRaw`'s "live connection" comment is still wrong. |
+| **N3** | **agree**, refine the evidence | **nit** | The cap gates every new open, including `restart`. They read the code. This pass timed a healthy `add` at **6.95 s** while the cap was full. The `restart` path is the same `continue` and was not re-timed. |
+| **N4** | **agree** | **nit** | `src/stream_player.h:31-34` still says exit `_exit`s only when a worker is inside the blocking call. Unchanged since `6d9d146`. `exitIfBusy` is still test-only. |
+| **F4** | **agree**, refine the evidence | **nit** | Re-adding an id whose lookup is in flight still waits that lookup out. They read the code. This pass measured the replacement open **5.61 s** later. |
+| **F5** | **agree** | **nit** | `song.m4a` and HLS wraps of `song.mp3` / `song.m4a` still present `codec=mjpeg`. Their extra probes (`plain.ac3`, a `file://` AES key, `pipe:`, ffconcat, a plain `file://` playlist, HTTP 302 to `ok.ts` and to `file://`) match section 3: those inputs do not open a local file when `setAllowLocalFile` is false. This pass also saw the cover on the live MQTT player. |
+| **F6** | **agree** | **nit** | Packed-audio fixtures are still ADTS. `ac3` / `eac3` / `mp3` renditions can leave `kFormatWhitelist` without the test going red. |
+| **F7** | **agree** | **nit** | `mqtt_exit_test` (now the N1 guard) and `mqtt_reconnect` still skip with 77 and are still absent from `scripts/ctest-require.sh`. |
+| **F8** | **agree** | **drop** (already closed) | The destructor comment at `src/stream_player.cpp:62-67` matches `finishProcess`. AUDIT6 already closed it. |
+| **N1** | **agree** | **drop** (closed) | Their wchan probe is independent: main in `do_sigtimedwait`, helper in `do_poll` inside `getaddrinfo`, SIGTERM **3 ms** rc 0 while a control lookup was still blocked. Unit `startup-dns` is **20 ms** on both passes. Refused-port SIGTERM / SIGHUP / SIGINT at 350 ms: 3 / 1 / 3 ms. |
+| **F1** | **agree** | **drop** (closed) | drain-cmd 2007 ms (theirs) / 2008 ms (this pass), retained `online:false` with `cam`. `closing_` still latches before the offline publish. |
+| **X1** | **agree** | **drop** (closed) | `finishProcess` still never calls `mosquitto_loop_stop`. gone-dns 20 ms, gone-blackhole 502 ms, drop-drain 2011 ms (theirs) / 2010 ms (this pass). |
+| **F3** | **agree** | **drop** (closed) | They cite the unit test (`entered == kMaxBusyRetired`). This pass also ran a real silent resolver: threads stop at 12, VmSize 1021 MB, one cap log line. Same verdict. |
+| **A1** | **agree** | **drop** (closed) | sigterm ~2011 ms, retained offline status still lists `cam`. They attribute the fix to #30; this file says #25 / #34. The behavior matches either citation. |
+| **A2** | **agree** | **drop** (closed) | Mid-session give-up rc 1, `waitExitMs=2010`. They attribute it to #30; this file says #24 / #34. Same bound. |
+| **A3** | **agree** | **drop** (closed) | `maxInFlight <= 1` still holds. This pass also re-added `cam` during a live lookup and saw one later open (5.61 s), which is F4's wait. |
+| **A4** | **agree** | **drop** (closed) | Top-level `mp3` / `aac` rejected on both passes. They also rejected `plain.ac3`. |
+| **A5** | **agree** | **drop** (closed) | `mp3float` is still on `kCodecWhitelist`. Cover-art opens did not log a codec-whitelist miss. |
+
+**N5 fix shape, refined.** Their repair (if the signal arrives and
+`connectReady` is already true, join, `loop_start`, `finishProcess`) makes
+the log line and the DISCONNECT match a normal empty-session shutdown. It
+stores the same empty object, so the previous retained list is still
+replaced. Delaying `mosquitto_connect_async` until the main thread commits to
+`loop_start` is what keeps the previous payload, and that is a larger change
+than this nit needs. Either repair is optional.
+
+### This pass's findings
+
+| ID | Peer | After this pass | Reason |
+| --- | --- | --- | --- |
+| **B1** | Filed as **N5**. They rate it a nit, which reclassifies the should-fix in the table above. | **revise to nit** | Same bug, two repros. Theirs: retained `playing:true` plus stream `old`, SIGTERM at 20 ms, exit 1 ms, broker log `Will message specified (84 bytes)`, no DISCONNECT, retained becomes the empty offline object. This pass: 3 of 4 localhost launches at 30 ms, sentinel `KEEPME` replaced by that same object, no `MQTT running`. The DNS-stall window (N1) still keeps the previous payload on both passes. |
+| **B2** | **Missed.** Their allowlist runs call `setAllowLocalFile(false)`, the MQTT path. They did not run `--url`. | **keep should-fix** | `decodeUrl` still calls `setAllowLocalFile(true)` for every `--url`, including `http://` (`src/app.cpp:181-183` at both `c597b16` and `25bfa8d`). An HTTP playlist with one `file:///…/secret.mp4` segment decodes that file (rc 0, `codec=mpeg4`) on `--url` and is rejected on MQTT `add`. `docs/mqtt.md` says `file` is only on the `--url` local-file path. This stays a should-fix for this auditor. It is absent from the agreed table: they treated the `file` protocol as closed and did not assess this entry point. |
+
+### Agreed survivors
+
+**None.** After this pass there is no must-fix and no should-fix that both
+auditors would keep.
+
+B1/N5 stays a nit on both sides. B2 stays a should-fix on this side only.
+N2, N3, N4, F4, F5, F6, and F7 stay nits on both sides.
