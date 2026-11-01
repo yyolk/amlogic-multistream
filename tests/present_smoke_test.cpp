@@ -3,6 +3,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -68,7 +69,8 @@ std::string readFile(const std::filesystem::path& path) {
 
 int run(const std::vector<std::string>& args,
         const std::filesystem::path& outFile,
-        const std::filesystem::path& errFile) {
+        const std::filesystem::path& errFile,
+        long* maxRssKb = nullptr) {
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
     for (const std::string& arg : args) {
@@ -100,8 +102,12 @@ int run(const std::vector<std::string>& args,
     }
 
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
+    rusage usage{};
+    if (wait4(pid, &status, 0, &usage) < 0) {
         return -1;
+    }
+    if (maxRssKb != nullptr) {
+        *maxRssKb = usage.ru_maxrss;
     }
     if (!WIFEXITED(status)) {
         return -1;
@@ -351,14 +357,68 @@ int main() {
             const int wideRc = run({player, "--url", wideMp4.string(), "--frames", "2"}, out, err);
             const std::string wideOut = readFile(out);
             const std::string wideErr = readFile(err);
+            // AUDIT9 D1: reject before sws_scale, so the convert line is absent.
             if (wideRc == 0 || wideOut.find("presented ") != std::string::npos ||
                 wideOut.find("Decoded ") != std::string::npos ||
                 wideOut.find("layout ") != std::string::npos ||
+                wideOut.find("-> yuv420p") != std::string::npos ||
                 wideErr.find("cannot be presented") == std::string::npos ||
                 wideErr.find("viewport must be") != std::string::npos) {
                 std::cerr << "wide --url must reject the frame before present (exit " << wideRc
                           << ")\n"
                           << wideOut << wideErr;
+                return 1;
+            }
+        }
+
+        // Inclusive cap: 8192x32 must still present.
+        {
+            const std::filesystem::path edgeMp4 = tmp.path() / "edge.mp4";
+            const int genEdge = run({ffmpegBinary(), "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                                     "testsrc=size=8192x32:rate=10:duration=0.4", "-c:v", "libx264",
+                                     "-pix_fmt", "yuv420p", edgeMp4.string()},
+                                    empty, log);
+            if (genEdge != 0) {
+                std::cerr << "failed to generate edge fixture (exit " << genEdge << ")\n"
+                          << readFile(log);
+                return 1;
+            }
+            const int edgeRc = run({player, "--url", edgeMp4.string(), "--frames", "1"}, out, err);
+            const std::string edgeOut = readFile(out);
+            const std::string edgeErr = readFile(err);
+            if (edgeRc != 0 || edgeOut.find("presented ") == std::string::npos ||
+                edgeOut.find("8192x32") == std::string::npos) {
+                std::cerr << "8192x32 --url must present (exit " << edgeRc << ")\n"
+                          << edgeOut << edgeErr;
+                return 1;
+            }
+        }
+
+        // AUDIT9 D1: a 12000x12000 MJPEG still must fail without the ~425 MB convert.
+        {
+            const std::filesystem::path hugeMp4 = tmp.path() / "huge.mp4";
+            const int genHuge = run({ffmpegBinary(), "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                                     "color=c=red:s=12000x12000:d=0.04", "-frames:v", "1", "-c:v",
+                                     "mjpeg", "-q:v", "31", hugeMp4.string()},
+                                    empty, log);
+            if (genHuge != 0) {
+                std::cerr << "failed to generate 12000x12000 fixture (exit " << genHuge << ")\n"
+                          << readFile(log);
+                return 1;
+            }
+            long maxRssKb = 0;
+            const int hugeRc =
+                run({player, "--url", hugeMp4.string(), "--frames", "1"}, out, err, &maxRssKb);
+            const std::string hugeOut = readFile(out);
+            const std::string hugeErr = readFile(err);
+            constexpr long kConvertRssKb = 300000;
+            if (hugeRc == 0 || hugeOut.find("presented ") != std::string::npos ||
+                hugeOut.find("Decoded ") != std::string::npos ||
+                hugeOut.find("layout ") != std::string::npos ||
+                hugeOut.find("-> yuv420p") != std::string::npos || maxRssKb >= kConvertRssKb) {
+                std::cerr << "oversize still --url must fail before convert (exit " << hugeRc
+                          << " rss_kb=" << maxRssKb << ")\n"
+                          << hugeOut << hugeErr;
                 return 1;
             }
         }

@@ -50,6 +50,10 @@ public:
     // mp3, mp3float, ac3, and eac3. On FFmpeg 6.1 the MP3 decoder is named
     // mp3float; mp3 stays for a build that registers that name (AUDIT4 A5).
     // gif and image demuxers are rejected on every path, including `--url`.
+    // open() sets decoder max_pixels to SoftwareRenderer::kMaxExtent squared
+    // so FFmpeg can refuse an oversize still before it materializes.
+    // readFrame() also refuses to convert a frame that fails those extent
+    // and stride caps (AUDIT9 D1).
     void setAllowLocalFile(bool allow);
 
     bool open(const std::string& url) override;

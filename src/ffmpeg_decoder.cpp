@@ -1,5 +1,7 @@
 #include "ffmpeg_decoder.h"
 
+#include "software_renderer.h"
+
 #include <cerrno>
 #include <iostream>
 
@@ -7,8 +9,10 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avstring.h>
+#include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/log.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
@@ -64,6 +68,40 @@ void prepareAmlogicHwaccel(AVCodecContext* codec) {
         return;
     }
     codec->hw_device_ctx = nullptr;
+}
+
+// Same pixel-count bound as an 8192x8192 presentable frame. A 8224x32
+// still is under this cap and is rejected later by extent, before convert.
+int64_t presentableMaxPixels() {
+    return static_cast<int64_t>(SoftwareRenderer::kMaxExtent) *
+           static_cast<int64_t>(SoftwareRenderer::kMaxExtent);
+}
+
+bool decodedFramePresentable(const AVFrame* src) {
+    if (src == nullptr || !SoftwareRenderer::sizeAcceptable(src->width, src->height)) {
+        return false;
+    }
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; ++i) {
+        const int stride = src->linesize[i];
+        if (stride > SoftwareRenderer::kMaxStride || stride < -SoftwareRenderer::kMaxStride) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void setPresentableMaxPixels(AVDictionary** opts) {
+    av_dict_set_int(opts, "max_pixels", presentableMaxPixels(), 0);
+}
+
+void freeStreamOptions(AVDictionary** stream_opts, unsigned count) {
+    if (stream_opts == nullptr) {
+        return;
+    }
+    for (unsigned i = 0; i < count; ++i) {
+        av_dict_free(&stream_opts[i]);
+    }
+    av_freep(&stream_opts);
 }
 
 }  // namespace
@@ -175,7 +213,20 @@ bool FfmpegDecoder::open(const std::string& url) {
         return false;
     }
 
-    const int info_rc = avformat_find_stream_info(fmt_, nullptr);
+    // Probe decoders use their own AVCodecContext. Pass the same pixel cap
+    // so find_stream_info does not materialize an oversize still (AUDIT9 D1).
+    AVDictionary** stream_opts = nullptr;
+    const unsigned stream_count = fmt_->nb_streams;
+    if (stream_count > 0) {
+        stream_opts = static_cast<AVDictionary**>(av_calloc(stream_count, sizeof(*stream_opts)));
+        if (stream_opts != nullptr) {
+            for (unsigned i = 0; i < stream_count; ++i) {
+                setPresentableMaxPixels(&stream_opts[i]);
+            }
+        }
+    }
+    const int info_rc = avformat_find_stream_info(fmt_, stream_opts);
+    freeStreamOptions(stream_opts, stream_count);
     if (info_rc < 0) {
         if (abort_.load()) {
             close();
@@ -244,6 +295,8 @@ bool FfmpegDecoder::open(const std::string& url) {
 
     AVDictionary* codec_opts = nullptr;
     av_dict_set(&codec_opts, "codec_whitelist", kCodecWhitelist, 0);
+    setPresentableMaxPixels(&codec_opts);
+    codec_->max_pixels = presentableMaxPixels();
     const int codec_rc = avcodec_open2(codec_, decoder, &codec_opts);
     av_dict_free(&codec_opts);
     if (codec_rc < 0) {
@@ -293,6 +346,13 @@ bool FfmpegDecoder::publishYuv420(const AVFrame* src, DecodedFrame& out) {
     const auto src_fmt = static_cast<AVPixelFormat>(src->format);
     if (src_fmt == AV_PIX_FMT_NONE) {
         std::cerr << "FfmpegDecoder::readFrame failed: decoded frame has no pixel format\n";
+        return false;
+    }
+    // Same caps as SoftwareRenderer::frameAcceptable, before the YUV420
+    // buffer or sws_scale. A 12000x12000 still used to convert first.
+    if (!decodedFramePresentable(src)) {
+        std::cerr << "FfmpegDecoder::readFrame failed: decoded frame " << src->width << "x"
+                  << src->height << " cannot be presented\n";
         return false;
     }
 

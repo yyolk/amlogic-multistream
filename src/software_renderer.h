@@ -33,11 +33,16 @@ Rgb8 yuv601ToRgb(uint8_t y, uint8_t u, uint8_t v);
 // FNV-1a over those bytes (the FNV offset basis when the viewport is empty).
 class SoftwareRenderer : public Renderer {
 public:
-    // Largest width, height, and plane stride present() accepts. Copy and
-    // --url use the same caps so an unpresentable frame is not treated as a
-    // successful decode.
+    // Largest width, height, and plane stride present() accepts. Copy,
+    // --url, and the decoder convert path use the same caps so an
+    // unpresentable frame is not materialized or treated as a successful
+    // decode.
     static constexpr int kMaxExtent = 8192;
     static constexpr int kMaxStride = 65536;
+
+    static constexpr bool sizeAcceptable(int width, int height) {
+        return width > 0 && height > 0 && width <= kMaxExtent && height <= kMaxExtent;
+    }
 
     explicit SoftwareRenderer(std::string ppmDirectory = {});
     ~SoftwareRenderer() override;
