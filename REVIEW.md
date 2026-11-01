@@ -1,8 +1,8 @@
 # Code review: `main` @ 7a0f243 (after #1, #2, #3, #4)
 
-Review only. No production code was changed. Findings are numbered so an
-adversarial filter pass can accept or reject each one on its own. Do not file
-issues from this file directly.
+Unfiltered Opus pass. Do not act on this file. The filtered list is
+[SURVIVING.md](SURVIVING.md). Findings below are numbered so each one can be
+accepted or rejected on its own. Do not file issues from this file directly.
 
 Severity: **blocker** = stops hardware bring-up or is unsafe to ship;
 **major** = wrong behavior or an interface that has to change before the next
