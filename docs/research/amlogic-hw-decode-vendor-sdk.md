@@ -41,11 +41,13 @@ code rather than prose, the file path inside the repo is given.
   `/sys/class/vfm/map`. Kodi's `AMLCodec.cpp`/`AMLUtils.cpp` show every path.
   This directly affects `DrmRenderer` plans: `/dev/dri/card0` exists on
   CoreELEC but there is no KMS video-plane pipeline for decoded frames.
-- The vendor media_modules tree also contains an optional V4L2 M2M decoder
-  (`CONFIG_AMLOGIC_MEDIA_V4L_DEC`, device `aml-vcodec-dec`,
-  `drivers/amvdec_ports/`, `drivers/frame_provider/decoder_v4l/`), but
-  CoreELEC 22's kernel config does not enable it — stock CoreELEC has no
-  vendor V4L2 node.
+- Vendor V4L2 M2M (`amvdec_ports`, `/dev/video26`, name `aml-vcodec-dec`) is
+  **not a stock CoreELEC decode path we can rely on**. CE21 ships and
+  autoloads the `.ko` (DT node present on G12B / GS-King X) but the 32-bit
+  userspace compat ioctl wrapper skips `v4l2_compat_ioctl32`. CE22's load
+  script still `modprobe -q amvdec_ports`, but the module is **not built**
+  (`CONFIG_AMLOGIC_MEDIA_V4L_DEC` unset). Verdict in [§7](#7-path-3-vendor-v4l2--amvdec_ports--stock-coreelec-gono-go):
+  **no-go for direct vendor V4L2; must use libamcodec on stock CoreELEC.**
 - Mainline (LibreELEC `AMLGX`) covers the GS-King X with
   `meson-g12b-gsking-x.dts`, DRM/KMS (`CONFIG_DRM_MESON`), and the staging
   `meson-vdec` stateful V4L2 M2M driver — but only MPEG-1/2, H.264, and VP9
@@ -485,10 +487,13 @@ Decode API options for a hardware `DecoderBackend`, in order of fit:
    `MAX_INSTANCE_MUN`), 9 on CE22; needs frame-block (`multi_vdec`) mode per
    stream and a per-instance VFM map (`vdec.<fmt>.NN → ppmgr → amvideo`).
    H.264/H.265/VP9 all supported — matches HLS content best.
-2. **FFmpeg `*_v4l2m2m` against the vendor `aml-vcodec-dec` node.** Cleanest
-   userspace shape (same as mainline), but `CONFIG_AMLOGIC_MEDIA_V4L_DEC` is
-   off in CoreELEC 22's kernel config — requires a custom kernel, so not a
-   first target.
+2. **FFmpeg `*_v4l2m2m` against vendor `aml-vcodec-dec` (`/dev/video26`).**
+   **No-go on stock CoreELEC** — see [§7](#7-path-3-vendor-v4l2--amvdec_ports--stock-coreelec-gono-go).
+   CE22 does not package the module. CE21 packages it but 32-bit compat is
+   broken-by-construction for standard V4L2 structs. Only becomes interesting
+   with a rebuilt `media_modules-aml` (`CONFIG_AMLOGIC_MEDIA_V4L_DEC=m`) and
+   64-bit userspace; even then frames come back as NV12/NV21, not amvideo
+   HDMI scanout.
 3. **Mainline meson-vdec + FFmpeg `*_v4l2m2m` (LibreELEC-style).** Real
    DRM/KMS display (fits `DrmRenderer`'s `/dev/dri/card0` plan) and fully
    open stack, but: HEVC unavailable on G12B (10-bit crash), staging driver
@@ -527,7 +532,329 @@ Open questions to verify on a GS-King X (device checklist):
   abort/reset semantics (`codec_reset`, `codec_close`) needed by this repo's
   "stop/restart unblocks within 2s" guarantees.
 
+## 7. Path 3 — vendor V4L2 / `amvdec_ports` (stock CoreELEC go/no-go)
+
+Pinned trees this section was read from (2026-11-01):
+
+| Line | Tree | Pin |
+| --- | --- | --- |
+| CE21 media_modules-aml | `CoreELEC/media_modules-aml` | `60561618f2bf154c1438d3c790b625ff01f215c3` (`package.mk` on `coreelec-21`) |
+| CE21 kernel | `CoreELEC/linux-amlogic` | `50c8e8154c5aba3c7cd8438d04dd5fdd51733e41` (`amlogic-4.9-20`) |
+| CE21 instance-cap patch | `CoreELEC/CoreELEC` `coreelec-21` | `projects/Amlogic-ce/packages/linux-drivers/amlogic/media_modules-aml/patches/003-multi-decoders-limit-maximum-number-of-decoder.patch` |
+| CE22 media_modules-aml | `CoreELEC/media_modules-aml` | `c15aebb1ac93028d0aceadf8f35dda2204d33424` (`package.mk` on `coreelec-22`) |
+| CE22 kernel | `CoreELEC/linux-amlogic` | `44cbccdee100b6a388814b9121b3b7629ab94382` (`5.15.196_20260306`) |
+| CE22 in-kernel media (amlvideo) | `CoreELEC/common_drivers` | `8ca9b6c3b7152fa2959147a403fc5e7e697d78d2` |
+
+File:line citations below are against those pins, not `HEAD`. Facts that still need a GS-King X are tagged ***verify***.
+
+### 7.1 Verdict
+
+**No-go: do not implement a hardware `DecoderBackend` that talks vendor V4L2 M2M (`/dev/video26`, `aml-vcodec-dec`) on stock CoreELEC 21 or 22.**
+
+**Go: libamcodec / `/dev/amstream_*` remains the only stock-CoreELEC userspace decode API** that (a) is packaged on both CE21 armv7 and CE22 aarch64, (b) is what Kodi actually drives, and (c) can feed the amvideo HDMI layer without a custom kernel.
+
+`amvdec_ports` is a real Amlogic Android/Buildroot M2M port sitting on the same `vdec_create` / `MAX_INSTANCE_MUN` core as libamcodec. It is **not** equivalently productized on CoreELEC.
+
+### 7.2 Registration — which `/dev/videoN`, formats, memory
+
+One M2M video node, hard-coded minor **26**:
+
+- CE21 probe: `video_register_device(vfd_dec, VFL_TYPE_GRABBER, 26)` → log
+  `"decoder registered as /dev/video%d"`
+  (`aml_vcodec_dec_drv.c:490`, `:503–504`). Name `AML_VCODEC_DEC_NAME`
+  `"aml-vcodec-dec"` (`aml_vcodec_drv.h:33`). Caps
+  `V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING`, `vfl_dir = VFL_DIR_M2M`
+  (`aml_vcodec_dec_drv.c:460–462`). DT compatible `"amlogic, vcodec-dec"`
+  (`aml_vcodec_dec_drv.c:515–516`).
+- CE22 (source only; see §7.4): same minor 26
+  (`aml_vcodec_dec_drv.c:672–675`, `VFL_TYPE_GRABBER` if `< 5.15` else
+  `VFL_TYPE_VIDEO`). Same compatible (`:751–752`).
+
+QUERYCAP driver string is `aml-vcodec-dec` (`aml_vcodec_dec.c:1446` CE21).
+
+**OUTPUT (bitstream) fourccs** (CE21 `aml_video_formats[]`,
+`aml_vcodec_dec.c:63–129`): `H264`, `HEVC`, `VP9`, `MPEG1`, `MPEG2`,
+`MPEG4`, `MJPEG`, `AV1`. CE22 adds `AVS`, `AVS2`, `AVS3`, `VC1_ANNEX_{L,G}`,
+`H266` (`aml_vcodec_dec.c:139–217`).
+
+**CAPTURE (decoded) fourccs** (CE21): `NV21`, `NV21M`, `NV12`, `NV12M`,
+`YUV420`. CE22 also `YUV420M`. Default capture is single-plane unless module
+param `multiplanar=1` (`aml_vcodec_dec_drv.c:615–617` CE21; default `false`
+→ `dst_vq->type` is `VIDEO_CAPTURE` not `_MPLANE`,
+`aml_vcodec_dec.c:2697–2698`).
+
+Frame-size enum default is 64×64 .. 2048×1088 (`AML_VDEC_MAX_W/H` in
+`aml_vcodec_dec.h:32–33`); `enum_framesizes` lifts that to 4096×2304 when
+`VCODEC_CAPABILITY_4K_DISABLED` is clear (`aml_vcodec_dec.c:1810–1816`).
+`dec_capability` is initialized to `0` (`:1318`), so 4K is advertised.
+***verify*** whether a 4K stream actually configures the G12B HEVC block
+through this port.
+
+**Memory / PRIME:**
+
+| Queue | CE21 (`aml_vcodec_dec.c:2682–2703`) | CE22 (`:5816–5837`) |
+| --- | --- | --- |
+| OUTPUT | `VB2_DMABUF \| VB2_MMAP`; `vb2_dma_contig_memops` | `VB2_DMABUF \| VB2_MMAP \| VB2_USERPTR`; `vb2_dma_sg_memops` |
+| CAPTURE | `VB2_DMABUF \| VB2_MMAP \| VB2_USERPTR`; contig | same io_modes; contig |
+
+`VIDIOC_EXPBUF` is wired (`vidioc_vdec_expbuf` → `v4l2_m2m_ioctl_expbuf`,
+CE21 `:1281–1289`, ioctl table `:2634`). That is the PRIME export path:
+`REQBUFS(MMAP)` + `EXPBUF` → dmabuf fd. OUTPUT can also be queued as
+`MEMORY_DMABUF` (prepare short-circuits for DMABUF output,
+`:2038–2041`). Vendor "drm mode" is a custom write-only ctrl
+`AML_V4L2_SET_DRMMODE = V4L2_CID_USER_BASE+0x1100`
+(`aml_vcodec_dec.c:50–51`, `:2474–2479`) — Android TVP, not GBM/DRM KMS.
+
+### 7.3 Instance accounting — 9 vs 2, global, `-EBUSY`
+
+The V4L2 `open()` path does **not** take a hardware instance. It allocates a
+`aml_vcodec_ctx`, bumps `dev->id_counter`, and creates an m2m context
+(`aml_vcodec_dec_drv.c:54–129` CE21). No `MAX_INSTANCE_MUN` check, no
+`-EBUSY` on the Nth `open()`.
+
+The hardware slot is taken at **`VIDIOC_S_FMT` on OUTPUT** while
+`ctx->state == AML_STATE_IDLE`:
+
+1. `vidioc_vdec_s_fmt` → `vdec_if_init(ctx, fourcc)` (`aml_vcodec_dec.c:1766–1775`).
+   Failure is returned to userspace as **`-EINVAL`**, not the inner errno.
+2. `vdec_if_init` picks the per-codec `dec_if` and calls `dec_if->init`
+   (`vdec_drv_if.c:36–70`).
+3. e.g. `vdec_h264_init` → `video_decoder_init` (`decoder/vdec_h264_if.c:296–328`)
+   → `vdec_ports_init` (`aml_vcodec_adapt.c:482–497`).
+4. `vdec_ports_init` calls `vdec_create(&ada_ctx->port, NULL)`
+   (`aml_vcodec_adapt.c:444–446`). `NULL` → return `-1`.
+5. `vdec_create` allocates a **global** ida id in `[0, MAX_INSTANCE_MUN)`
+   (`vdec.c:1141–1146` CE21; `:1808–1809` CE22). Exhaustion is
+   `ida_simple_get` → **`-ENOSPC`** (kernel ida), logged
+   `"vdec_create request id failed!"`, function returns `NULL`. **Not
+   per-codec.** HEVC and H.264 share the same 2 / 9 slots.
+6. After create, `video_decoder_init` / `vdec_init` can still return
+   **`-EBUSY`**:
+   - `is_res_locked(...)` at `vdec_init` entry (`vdec.c:2401–2404` CE21).
+   - `"vdec_init vfm path busy."` when the single stream-parser VFM slot is
+     taken (`vdec.c:2427–2432` CE21; `:3478–3479` CE22).
+   - 2s wait timeout in `vdec_resource_checking` (`vdec.c:2376–2377`).
+
+Those `-EBUSY` values propagate out of `video_decoder_init` but are then
+collapsed to **`-EINVAL` at `S_FMT`**. Userspace should treat `S_FMT`
+failure as "no slot / init failed", not look for `EBUSY`.
+
+`MAX_INSTANCE_MUN` itself:
+
+- Upstream trees (both pins): `#define MAX_INSTANCE_MUN  9`
+  (CE21 `vdec.h:51`, CE22 `vdec.h:70`).
+- **CE21 stock image applies the CoreELEC patch**
+  `003-multi-decoders-limit-maximum-number-of-decoder.patch`:
+  `#define MAX_INSTANCE_MUN  2` with message "Kodi can only handle one
+  decoder … limit the multi decoder instances". **Shipped CE21 cap = 2.**
+- **CE22 `package.mk` has no such patch.** Shipped CE22 cap = 9.
+
+`amvdec_ports` forces frame-block mode (`vdec->type = VDEC_TYPE_FRAME_BLOCK`,
+`PORT_TYPE_FRAME`, `aml_vcodec_adapt.c:408–409`) — the same multi-instance
+mode `multi_vdec` selects on the libamcodec path. Default VFM path is
+`FRAME_BASE_PATH_V4L_OSD` (`:410`): the created map is
+`provider → vf_receiver_name` only (`vdec.c:2623–2628`), **not**
+`… ppmgr deinterlace amvideo`. Decoded frames stay in the V4L2 CAPTURE
+queue for userspace. HDMI scanout is not automatic.
+
+Module params `aml_set_vfm_enable` / `aml_set_vfm_path`
+(`aml_vcodec_dec_drv.c:591–597`) can override the path to the amvideo
+chain. Default is off. ***verify*** a non-default path actually lights HDMI
+from `/dev/video26` without Kodi.
+
+### 7.4 Is `amvdec_ports` packaged into CE21 / CE22 GS-King X kernels?
+
+**CE21 Amlogic-ng (GS-King X): packaged and autoloaded.**
+
+- Kbuild: `ifdef CONFIG_V4L2_MEM2MEM_DEV` / `obj-y += amvdec_ports/`
+  (`drivers/Makefile:5–7`). CE21 `linux.aarch64.conf` has
+  `CONFIG_V4L2_MEM2MEM_DEV=m`.
+- `amvdec_ports/Makefile`: `obj-m += amvdec_ports.o` — always a `.ko` when
+  the directory is built. `package.mk` `makeinstall_target` copies every
+  `*.ko`.
+- Autoload: `modules-load.d/media_modules.conf` lists `amvdec_ports`
+  (between `amvdec_mpeg4` and `amvdec_real`).
+- DT on this box: `g12b_s922x_beelink_gs_king_x.dts` →
+  `g12b_s922x_beelink_gt_king.dts` → `coreelec_g12b.dtsi` →
+  `g12b_a311d_w400.dts` `#include "mesong12b.dtsi"`. That dtsi has
+
+  ```
+  vcodec_dec {
+      compatible = "amlogic, vcodec-dec";
+      dev_name = "aml-vcodec-dec";
+      status = "okay";
+  };
+  ```
+
+  (`mesong12b.dtsi:1459–1463`). Probe should bind. ***verify***
+  `ls /dev/video26` and `dmesg | grep aml-vcodec` on a CE21 GS-King X
+  (node number is requested 26; if taken, V4L2 assigns the next free).
+
+**CE22 Amlogic-no (GS-King X): source present, module not built.**
+
+- Kbuild: `obj-$(CONFIG_AMLOGIC_MEDIA_V4L_DEC) += amvdec_ports/`
+  (`drivers/Makefile:7`) and `decoder_v4l/` the same flag.
+- `package.mk` `make_target` sets `CONFIG_AMLOGIC_MEDIA_VDEC_*=m` for the
+  classic decoders only. **It does not pass `CONFIG_AMLOGIC_MEDIA_V4L_DEC=m`.**
+- `devices/Amlogic-no/linux/linux.aarch64.conf` has
+  `CONFIG_AMLOGIC_MEDIA_MODULE=y` and `CONFIG_V4L2_MEM2MEM_DEV=y` but **no
+  `CONFIG_AMLOGIC_MEDIA_V4L_DEC`**.
+- The boot script still runs `modprobe -q amvdec_ports` first
+  (`scripts/media_modules-aml.sh`). `-q` swallows "module not found".
+  ***verify*** `modprobe amvdec_ports; echo $?` and `ls /dev/video26` on
+  CE22 — expected: module absent, no node.
+
+So: the port exists in the Android TV / Buildroot / vendor 5.15 *source*
+tree CoreELEC redistributes, and CE21 happens to ship the 4.9 `.ko`. CE22
+stock images do **not** ship it. This is not "Android-only", but it is
+"not a CE22 product surface."
+
+### 7.5 Ioctl timeline — one session and N parallel
+
+One session (stateful M2M, Android-shaped):
+
+1. `open("/dev/video26")` → `fops_vcodec_open`. New ctx, no HW yet.
+2. `VIDIOC_QUERYCAP` / `ENUM_FMT` / `ENUM_FRAMESIZES` / `SUBSCRIBE_EVENT`
+   (`V4L2_EVENT_SOURCE_CHANGE`, `V4L2_EVENT_EOS`).
+3. Optional `VIDIOC_S_CTRL` `AML_V4L2_SET_DRMMODE` (skip unless TVP).
+4. `VIDIOC_S_FMT` OUTPUT (`H264`/`HEVC`/`VP9`/…) → **`vdec_if_init` /
+   `vdec_create` / `vdec_init`**. This is the slot-taking ioctl. Failure:
+   `-EINVAL` (cap / init), possibly after an inner `-EBUSY` / `-ENOSPC`.
+5. `VIDIOC_REQBUFS` OUTPUT (`MMAP` or `DMABUF`), `QUERYBUF`+`mmap` or
+   import fds, `QBUF` a few Annex-B access units (64-byte DMA align
+   required, `vdec_drv_if.c:88–93`).
+6. `VIDIOC_STREAMON` OUTPUT then CAPTURE — `vidioc_decoder_streamon`
+   (`aml_vcodec_dec.c:1179–1213`) only clears stream-off flags / maybe
+   `aml_vdec_reset` on capture re-on, then `v4l2_m2m_ioctl_streamon`.
+   **No second instance check at STREAMON.**
+7. `DQBUF` OUTPUT (recycle), wait `SOURCE_CHANGE`, `G_CTRL`
+   `MIN_BUFFERS_FOR_CAPTURE`, `S_FMT` CAPTURE, `REQBUFS` CAPTURE,
+   `QBUF` CAPTURE, more `QBUF` OUTPUT, `DQBUF` CAPTURE → NV12/NV21.
+8. Drain: `VIDIOC_DECODER_CMD` `V4L2_DEC_CMD_STOP` (`:1097–1131`).
+9. `STREAMOFF` / `close` → `fops_vcodec_release` → `vdec_release` frees
+   the ida slot.
+
+N parallel sessions:
+
+- N `open()`s of the **same** `/dev/video26` (standard V4L2 m2m). Each fh
+  is one ctx. `open` always succeeds (until `kzalloc` fails).
+- The Nth **`S_FMT` OUTPUT** is what hits the global cap (2 on CE21, 9 on
+  CE22). Earlier sessions already `STREAMON`'d are unaffected.
+- Second-session `STREAMON` does not serialize against the first; if both
+  `S_FMT`s succeeded, both stream. ***verify*** real 1080p×N on G12B —
+  datasheet "4K60+1080p60" is a throughput claim, not a V4L2 slot claim.
+- Capture default is single-planar `NV21`/`NV12` unless `multiplanar=1`.
+  FFmpeg `*_v4l2m2m` prefers `_MPLANE`; ***verify*** it enumerates the
+  non-mplane CAPTURE queue.
+
+### 7.6 Relation to `amlvideo` `/dev/video10` (Kodi + libamcodec)
+
+`/dev/video10` is **not** `amvdec_ports`. It is the capture-only VFM tap
+`amlvideo`:
+
+- CE21 kernel `amlvideo.c:90–96,961–970`: `video_nr_base = 10`;
+  `n_devs = 2` when `CONFIG_AMLOGIC_MEDIA_MULTI_DEC` (set on CE21).
+  Instance 0 registers at **10**, instance 1 at `video_nr_base_second = 23`.
+  Caps: `V4L2_CAP_VIDEO_CAPTURE` (+ `STREAMING`/`READWRITE` in
+  `capabilities`, `:466–470`). No M2M, no OUTPUT queue, no bitstream.
+- CE22 `common_drivers` `amlvideo.c:78–86,968–977`: same numbering.
+  `device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING` (`:454`,
+  `:966`).
+- `amlvideo2` is a *different* grabber at `video_nr = 11`
+  (CE21 `amlvideo2.c:124,6543`).
+
+Kodi `CAMLCodec::OpenAmlVideo` opens `/dev/video10` `O_RDONLY|O_NONBLOCK`
+after libamcodec is already feeding `/dev/amstream_*`
+(`CoreELEC/xbmc` `AMLCodec.cpp` ~2205–2212). Purpose: pull already-decoded
+vframes out of the VFM chain (`amlvideo` is a VFM receiver/provider named
+`"amlvideo"`) for stills / GUI, while HDMI continues through `amvideo`.
+Opening `/dev/video10` does **not** start a decoder. It is useless as a
+`DecoderBackend`.
+
+`/dev/video26` (M2M in) and `/dev/video10` (VFM capture out) can coexist;
+they are opposite ends of the pipeline. libamcodec never opens 26.
+
+### 7.7 What a userspace `DecoderBackend` would open — and what breaks if absent
+
+If we skipped libamcodec and spoke V4L2:
+
+```
+open("/dev/video26")                         # aml-vcodec-dec M2M
+# not /dev/video10 (amlvideo capture)
+# not /dev/amstream_vbuf (libamcodec)
+VIDIOC_S_FMT(OUTPUT, H264/HEVC/VP9, mplane)
+VIDIOC_REQBUFS + QBUF bitstream (MMAP or DMABUF)
+VIDIOC_STREAMON both directions
+DQBUF CAPTURE → NV12/NV21 (EXPBUF/PRIME optional)
+# then we still have to blit/scanout ourselves
+```
+
+FFmpeg would look for `h264_v4l2m2m` / `hevc_v4l2m2m` / `vp9_v4l2m2m` on
+that node. The vendor test stub `amvdec_ports/test/vcodec_m2m_test.c` is
+libavcodec-based and does **not** show the ioctl sequence (not a usable
+cookbook).
+
+**If the module is absent (stock CE22, or CE21 if probe failed):**
+
+| Call | Result |
+| --- | --- |
+| `open("/dev/video26")` | `-ENOENT` |
+| FFmpeg `*_v4l2m2m` | no device / "Unable to open a context" |
+| `modprobe amvdec_ports` | CE22: module not found (script already `-q`s this). CE21: module exists |
+| libamcodec `codec_init` / `/dev/amstream_vbuf` | **unaffected** — different driver (`stream_input/amports`) |
+| `/dev/video10` amlvideo | **unaffected** — lives in the kernel `video_processor` tree |
+| HDMI via `/sys/class/video/*` | **unaffected** |
+
+### 7.8 32-bit compat (CE21 armv7 userspace on aarch64 kernel)
+
+This repo's CE21 AppImage is `coreelec21-ng-armv7hf`. The kernel is aarch64
+with `CONFIG_COMPAT=y` (CE21 `linux.aarch64.conf`).
+
+`amvdec_ports` installs its own `.compat_ioctl32`:
+
+```
+v4l2_compat_ioctl(...)
+    → v4l2_vcodec_ioctl(file, cmd, (ulong)compat_ptr(arg));
+```
+
+(`aml_vcodec_dec_drv.c:395–414` CE21; same pattern CE22 `:488–505`).
+
+That is **not** `v4l2_compat_ioctl32()`. `compat_ptr` only widens the
+userspace pointer. `video_ioctl2` then interprets the pointed-to struct as
+the **native 64-bit** `v4l2_format` / `v4l2_buffer` / `v4l2_exportbuffer`
+layout. 32-bit those structs differ (pointer-sized fields, `timeval`,
+`planes` pointers). Android 64-bit userspace never hits this. CE21 32-bit
+FFmpeg / `v4l2-ctl` will.
+
+Vendor private ioctls on the same `unlocked_ioctl`
+(`V4LVIDEO_IOCTL_{ALLOC,CHECK}_FD`, `{SET,GET}_CONFIG_PARAMS`, `'I'` magic,
+CE22 `aml_vcodec_dec_drv.c:54–58`) also go through `compat_ptr` +
+`copy_from_user` of a native `v4l2_config_parm` — another 32/64 trap, but
+FFmpeg `*_v4l2m2m` does not need those.
+
+CE22 userspace is aarch64, so compat is irrelevant *if* the module existed.
+It does not, on stock.
+
+***verify*** on CE21: `v4l2-ctl -d /dev/video26 --all` from the 32-bit
+rootfs. If QUERYCAP works but `S_FMT`/`REQBUFS` fault or return garbage,
+the compat wrapper is the reason — another independent no-go.
+
+### 7.9 Go / no-go summary
+
+| Question | Stock CE21 (armv7 / kernel 4.9) | Stock CE22 (aarch64 / kernel 5.15) |
+| --- | --- | --- |
+| Is `amvdec_ports.ko` in the image? | Yes (autoload + DT okay) | **No** (not built; `modprobe -q` is a no-op) |
+| `/dev/video26` present? | ***verify*** (should be) | **No** (ENOENT) |
+| Direct V4L2 `DecoderBackend`? | **No-go** (32-bit compat + NV12-not-HDMI + cap 2) | **No-go** (no device) |
+| libamcodec `DecoderBackend`? | **Go** | **Go** |
+| Rebuild `media_modules-aml` with `CONFIG_AMLOGIC_MEDIA_V4L_DEC=m`? | Possible but still 32-bit compat + not stock | Possible, 64-bit, still not stock; frames are V4L2 CAPTURE not amvideo |
+
+**Success criterion:** on stock CoreELEC, skip vendor V4L2. Implement hardware
+decode via libamcodec (Kodi's path). Treat `/dev/video26` as an Android /
+custom-kernel experiment only.
+
 *Method note: facts marked with file paths were read directly in the linked
-repos on 2026-11-01 (branch names recorded above). The datasheet is the
+repos on 2026-11-01 (branch names / pins recorded above). The datasheet is the
 public V0.2 revision; anything marked "Confidential for Hardkernel" beyond it
-remains NDA material and was not used.*
+remains NDA material and was not used. `*verify*` marks on-device checks
+this environment cannot run.*
