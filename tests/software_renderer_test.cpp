@@ -310,12 +310,33 @@ void testLayoutCellLeavesNeighbors() {
     }
 }
 
+void testRejectsOversizeFrame() {
+    g_case = "oversize frame";
+    YuvImage wide(8224, 32, 8224, 4112);
+    wide.fill(235, 128, 128);
+    CHECK(!SoftwareRenderer::frameAcceptable(wide.frame()));
+
+    YuvImage tall(32, 8224, 32, 16);
+    tall.fill(235, 128, 128);
+    CHECK(!SoftwareRenderer::frameAcceptable(tall.frame()));
+
+    YuvImage ok(SoftwareRenderer::kMaxExtent, 32, SoftwareRenderer::kMaxExtent,
+                SoftwareRenderer::kMaxExtent / 2);
+    ok.fill(235, 128, 128);
+    CHECK(SoftwareRenderer::frameAcceptable(ok.frame()));
+
+    SoftwareRenderer renderer;
+    CHECK(renderer.init(4, 4));
+    CHECK(!renderer.present(wide.frame(), LayoutEngine::Rect{0, 0, 4, 4}));
+    CHECK(renderer.framesPresented() == 0);
+}
+
 void testReplaceAndReject() {
     g_case = "replace and reject";
     SoftwareRenderer renderer;
     CHECK(!renderer.present(DecodedFrame{}, LayoutEngine::Rect{0, 0, 1, 1}));
     CHECK(!renderer.init(0, 10));
-    CHECK(!renderer.init(8193, 8));
+    CHECK(!renderer.init(SoftwareRenderer::kMaxExtent + 1, 8));
     CHECK(renderer.init(4, 4));
 
     YuvImage image(4, 4, 4, 2);
@@ -397,6 +418,7 @@ int main() {
         testScaleBlocks();
         testLetterbox();
         testLayoutCellLeavesNeighbors();
+        testRejectsOversizeFrame();
         testReplaceAndReject();
         testPpmDump();
     } catch (const std::exception& ex) {

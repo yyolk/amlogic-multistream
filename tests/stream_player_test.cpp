@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <sys/wait.h>
 #include <thread>
@@ -41,10 +42,13 @@ struct Stats {
 
 class FakeDecoder : public DecoderBackend {
 public:
-    explicit FakeDecoder(std::shared_ptr<Stats> stats) : stats_(std::move(stats)) {
-        y_.assign(16 * 16, 235);
-        u_.assign(8 * 8, 128);
-        v_.assign(8 * 8, 128);
+    explicit FakeDecoder(std::shared_ptr<Stats> stats, int width = 16, int height = 16)
+        : stats_(std::move(stats)), width_(width), height_(height) {
+        const int chromaW = (width + 1) / 2;
+        const int chromaH = (height + 1) / 2;
+        y_.assign(static_cast<size_t>(width) * static_cast<size_t>(height), 235);
+        u_.assign(static_cast<size_t>(chromaW) * static_cast<size_t>(chromaH), 128);
+        v_.assign(static_cast<size_t>(chromaW) * static_cast<size_t>(chromaH), 128);
     }
 
     ~FakeDecoder() override { close(); }
@@ -85,20 +89,22 @@ public:
         }
         frame = DecodedFrame{};
         frame.format = FramePixelFormat::Yuv420p;
-        frame.width = 16;
-        frame.height = 16;
+        frame.width = width_;
+        frame.height = height_;
         frame.data[0] = y_.data();
         frame.data[1] = u_.data();
         frame.data[2] = v_.data();
-        frame.linesize[0] = 16;
-        frame.linesize[1] = 8;
-        frame.linesize[2] = 8;
+        frame.linesize[0] = width_;
+        frame.linesize[1] = (width_ + 1) / 2;
+        frame.linesize[2] = (width_ + 1) / 2;
         stats_->reads.fetch_add(1);
         return true;
     }
 
 private:
     std::shared_ptr<Stats> stats_;
+    int width_ = 16;
+    int height_ = 16;
     bool opened_ = false;
     std::vector<uint8_t> y_;
     std::vector<uint8_t> u_;
@@ -636,6 +642,65 @@ void testNewIdChurnDoesNotStackUninterruptibleOpen() {
     CHECK(player.drain(std::chrono::milliseconds(2000)));
 }
 
+int countNeedle(const std::string& hay, const std::string& needle) {
+    int n = 0;
+    for (size_t pos = 0; (pos = hay.find(needle, pos)) != std::string::npos; pos += needle.size()) {
+        ++n;
+    }
+    return n;
+}
+
+// AUDIT8 P1: width in (8192, 65536] with height <= 8192 used to copy and then
+// fail every present(). That must take the same 1s retry path as a tall frame.
+void testWideFrameUsesRetryPath() {
+    auto stats = std::make_shared<Stats>();
+    StreamManager streams;
+    SoftwareRenderer renderer;
+    StreamPlayer player(
+        streams, renderer,
+        [stats]() -> std::unique_ptr<DecoderBackend> {
+            return std::make_unique<FakeDecoder>(stats, 8224, 32);
+        },
+        640, 360);
+    CHECK(player.init());
+    CHECK(streams.addStream("wide", "http://example/wide.ts"));
+
+    std::string err;
+    {
+        std::ostringstream captured;
+        struct RestoreCerr {
+            std::streambuf* old;
+            ~RestoreCerr() { std::cerr.rdbuf(old); }
+        } restore{std::cerr.rdbuf(captured.rdbuf())};
+        CHECK(until([&] {
+            player.tick(true);
+            return stats->opened.load() >= 1 && stats->reads.load() >= 1;
+        }));
+        for (int i = 0; i < 20; ++i) {
+            CHECK(player.tick(true) == 0);
+        }
+        CHECK(stats->opened.load() == 1);
+        CHECK(renderer.framesPresented() == 0);
+        CHECK(until(
+            [&] {
+                player.tick(true);
+                return stats->opened.load() >= 2;
+            },
+            2000));
+        err = captured.str();
+    }
+    CHECK(renderer.framesPresented() == 0);
+    CHECK(stats->opened.load() >= 2);
+    CHECK(countNeedle(err, "present failed") == 0);
+    CHECK(countNeedle(err, "will retry") >= 1);
+    if (countNeedle(err, "present failed") != 0 || countNeedle(err, "will retry") < 1) {
+        std::cerr << "wide frame should retry without present spam:\n" << err;
+    }
+
+    player.closeAll();
+    CHECK(player.drain(std::chrono::milliseconds(2000)));
+}
+
 }  // namespace
 
 int main() {
@@ -873,6 +938,7 @@ int main() {
     testUninterruptibleOpen();
     testRestartDoesNotStackUninterruptibleOpen();
     testNewIdChurnDoesNotStackUninterruptibleOpen();
+    testWideFrameUsesRetryPath();
 
     if (g_failed != 0) {
         std::cerr << g_failed << " check(s) failed\n";

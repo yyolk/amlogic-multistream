@@ -14,13 +14,13 @@
 namespace {
 
 constexpr std::chrono::milliseconds kRetryDelay{1000};
-constexpr int kMaxPlaneStride = 65536;
-constexpr int kMaxPlaneRows = 8192;
 
 }  // namespace
 
 bool StreamPlayer::copyOwned(const DecodedFrame& src, OwnedFrame& dst) {
-    if (src.format != FramePixelFormat::Yuv420p || src.width <= 0 || src.height <= 0) {
+    // Same caps as SoftwareRenderer::present. A wider-than-extent frame used
+    // to copy (stride and height were in range) and then fail every tick.
+    if (!SoftwareRenderer::frameAcceptable(src)) {
         return false;
     }
     const int chromaRows = (src.height + 1) / 2;
@@ -33,10 +33,6 @@ bool StreamPlayer::copyOwned(const DecodedFrame& src, OwnedFrame& dst) {
     copy.time_base_den = src.time_base_den;
     try {
         for (int i = 0; i < 3; ++i) {
-            if (src.data[i] == nullptr || src.linesize[i] <= 0 || src.linesize[i] > kMaxPlaneStride ||
-                rows[i] <= 0 || rows[i] > kMaxPlaneRows) {
-                return false;
-            }
             const auto bytes = static_cast<size_t>(src.linesize[i]) * static_cast<size_t>(rows[i]);
             copy.plane[i].assign(src.data[i], src.data[i] + bytes);
             copy.linesize[i] = src.linesize[i];
