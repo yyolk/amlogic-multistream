@@ -369,6 +369,74 @@ int main() {
             }
         }
 
+        // AUDIT8 P1: a real 8224x32 decode into a 640x360 viewport must take
+        // the retry path. The old copy caps accepted that size and present()
+        // then failed every tick until EOF.
+        {
+            const auto wideClip = tmp.path() / "wide.ts";
+            const int genWide = run({ffmpegBinary(), "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                                     "testsrc=size=8224x32:rate=10:duration=1", "-c:v", "libx264",
+                                     "-pix_fmt", "yuv420p", "-f", "mpegts", wideClip.string()},
+                                    log);
+            if (genWide != 0) {
+                std::cerr << "failed to generate wide fixture (exit " << genWide << ")\n"
+                          << readFile(log);
+                return 1;
+            }
+            std::ifstream wideIn(wideClip, std::ios::binary);
+            std::ostringstream wideBodyStream;
+            wideBodyStream << wideIn.rdbuf();
+            const std::string wideBody = wideBodyStream.str();
+            if (wideBody.size() < 64) {
+                std::cerr << "wide fixture is empty\n";
+                return 1;
+            }
+            LocalHttp wideServer = startServer(wideBody);
+            if (wideServer.pid <= 0 || wideServer.port <= 0) {
+                std::cerr << "wide http server failed to start\n";
+                return 1;
+            }
+            const std::string wideUrl =
+                "http://127.0.0.1:" + std::to_string(wideServer.port) + "/clip.ts";
+            StreamManager wideStreams;
+            SoftwareRenderer wideRenderer;
+            StreamPlayer widePlayer(
+                wideStreams, wideRenderer,
+                []() -> std::unique_ptr<DecoderBackend> { return std::make_unique<FfmpegDecoder>(); },
+                640, 360);
+            if (!widePlayer.init()) {
+                std::cerr << "wide renderer init failed\n";
+                return 1;
+            }
+            if (!wideStreams.addStream("wide", wideUrl)) {
+                std::cerr << "wide addStream failed\n";
+                return 1;
+            }
+            std::string err;
+            {
+                std::ostringstream captured;
+                struct RestoreCerr {
+                    std::streambuf* old;
+                    ~RestoreCerr() { std::cerr.rdbuf(old); }
+                } restore{std::cerr.rdbuf(captured.rdbuf())};
+                const auto wideDeadline =
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+                while (std::chrono::steady_clock::now() < wideDeadline) {
+                    widePlayer.tick(true);
+                }
+                err = captured.str();
+            }
+            widePlayer.closeAll();
+            widePlayer.drain(std::chrono::milliseconds(2000));
+            if (wideRenderer.framesPresented() != 0 || err.find("present failed") != std::string::npos ||
+                err.find("will retry") == std::string::npos) {
+                std::cerr << "wide HTTP stream must retry without present spam\n"
+                          << "presented=" << wideRenderer.framesPresented() << "\n"
+                          << err;
+                return 1;
+            }
+        }
+
         std::cout << "stream player http test passed\n";
         return 0;
     } catch (const std::exception& ex) {

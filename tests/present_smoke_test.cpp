@@ -334,6 +334,35 @@ int main() {
             return 1;
         }
 
+        // AUDIT8 P1: 8224x32 is inside the old copy caps (stride/height) but
+        // present() rejects width > 8192. --url must fail that frame once,
+        // not print it and then die at viewport init.
+        {
+            const std::filesystem::path wideMp4 = tmp.path() / "wide.mp4";
+            const int genWide = run({ffmpegBinary(), "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                                     "testsrc=size=8224x32:rate=10:duration=0.4", "-c:v", "libx264",
+                                     "-pix_fmt", "yuv420p", wideMp4.string()},
+                                    empty, log);
+            if (genWide != 0) {
+                std::cerr << "failed to generate wide fixture (exit " << genWide << ")\n"
+                          << readFile(log);
+                return 1;
+            }
+            const int wideRc = run({player, "--url", wideMp4.string(), "--frames", "2"}, out, err);
+            const std::string wideOut = readFile(out);
+            const std::string wideErr = readFile(err);
+            if (wideRc == 0 || wideOut.find("presented ") != std::string::npos ||
+                wideOut.find("Decoded ") != std::string::npos ||
+                wideOut.find("layout ") != std::string::npos ||
+                wideErr.find("cannot be presented") == std::string::npos ||
+                wideErr.find("viewport must be") != std::string::npos) {
+                std::cerr << "wide --url must reject the frame before present (exit " << wideRc
+                          << ")\n"
+                          << wideOut << wideErr;
+                return 1;
+            }
+        }
+
         // AUDIT7 B2: --url of an HTTP playlist whose only segment is file:///…
         // must reject the local file, same as MQTT add (flag stays off).
         // hls+http:// is on the protocol whitelist and must not inherit file.

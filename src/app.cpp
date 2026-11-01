@@ -159,16 +159,7 @@ uint32_t sampleChecksum(const DecodedFrame& frame) {
 }
 
 bool frameLooksComplete(const DecodedFrame& frame) {
-    if (frame.format != FramePixelFormat::Yuv420p || frame.width <= 0 || frame.height <= 0) {
-        return false;
-    }
-    if (frame.data[0] == nullptr || frame.data[1] == nullptr || frame.data[2] == nullptr) {
-        return false;
-    }
-    const int chroma_w = (frame.width + 1) / 2;
-    return frame.linesize[0] >= frame.width &&
-           frame.linesize[1] >= chroma_w &&
-           frame.linesize[2] >= chroma_w;
+    return SoftwareRenderer::frameAcceptable(frame);
 }
 
 // FFmpeg opens a scheme-less path and file: / file:// as the file protocol.
@@ -231,7 +222,8 @@ int decodeUrl(const std::string& url, int frames, PresenterKind presenter, const
             break;
         }
         if (!frameLooksComplete(frame)) {
-            std::cerr << "Decoded frame " << i << " is incomplete\n";
+            std::cerr << "Decoded frame " << i << " " << frame.width << "x" << frame.height
+                      << " cannot be presented\n";
             renderer->shutdown();
             decoder.close();
             return 1;

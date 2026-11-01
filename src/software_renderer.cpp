@@ -9,8 +9,6 @@
 
 namespace {
 
-constexpr int kMaxExtent = 8192;
-constexpr int kMaxStride = 65536;
 constexpr uint32_t kFnvOffset = 2166136261u;
 constexpr uint32_t kFnvPrime = 16777619u;
 
@@ -86,7 +84,7 @@ bool planeOk(const uint8_t* data, int linesize, int width, int height) {
     if (data == nullptr || width <= 0 || height <= 0) {
         return false;
     }
-    if (linesize < width || linesize > kMaxStride) {
+    if (linesize < width || linesize > SoftwareRenderer::kMaxStride) {
         return false;
     }
     return true;
@@ -161,6 +159,21 @@ SoftwareRenderer::~SoftwareRenderer() {
     shutdown();
 }
 
+bool SoftwareRenderer::frameAcceptable(const DecodedFrame& frame) {
+    if (frame.format != FramePixelFormat::Yuv420p) {
+        return false;
+    }
+    if (frame.width <= 0 || frame.height <= 0 || frame.width > kMaxExtent ||
+        frame.height > kMaxExtent) {
+        return false;
+    }
+    const int chromaW = (frame.width + 1) / 2;
+    const int chromaH = (frame.height + 1) / 2;
+    return planeOk(frame.data[0], frame.linesize[0], frame.width, frame.height) &&
+           planeOk(frame.data[1], frame.linesize[1], chromaW, chromaH) &&
+           planeOk(frame.data[2], frame.linesize[2], chromaW, chromaH);
+}
+
 bool SoftwareRenderer::init(int viewportWidth, int viewportHeight) {
     shutdown();
     if (viewportWidth <= 0 || viewportHeight <= 0 || viewportWidth > kMaxExtent ||
@@ -191,24 +204,19 @@ bool SoftwareRenderer::present(const DecodedFrame& frame, const LayoutEngine::Re
         std::cerr << "SoftwareRenderer::present called before a successful init\n";
         return false;
     }
-    if (frame.format != FramePixelFormat::Yuv420p) {
-        std::cerr << "SoftwareRenderer::present: only yuv420p is supported\n";
-        return false;
-    }
-    if (frame.width <= 0 || frame.height <= 0 || frame.width > kMaxExtent || frame.height > kMaxExtent) {
-        std::cerr << "SoftwareRenderer::present: frame size must be 1.." << kMaxExtent << "\n";
+    if (!frameAcceptable(frame)) {
+        if (frame.format != FramePixelFormat::Yuv420p) {
+            std::cerr << "SoftwareRenderer::present: only yuv420p is supported\n";
+        } else if (frame.width <= 0 || frame.height <= 0 || frame.width > kMaxExtent ||
+                   frame.height > kMaxExtent) {
+            std::cerr << "SoftwareRenderer::present: frame size must be 1.." << kMaxExtent << "\n";
+        } else {
+            std::cerr << "SoftwareRenderer::present: yuv420p planes are missing or have a bad stride\n";
+        }
         return false;
     }
     if (!rectInside(width_, height_, dest)) {
         std::cerr << "SoftwareRenderer::present: dest is outside the viewport\n";
-        return false;
-    }
-    const int chromaW = (frame.width + 1) / 2;
-    const int chromaH = (frame.height + 1) / 2;
-    if (!planeOk(frame.data[0], frame.linesize[0], frame.width, frame.height) ||
-        !planeOk(frame.data[1], frame.linesize[1], chromaW, chromaH) ||
-        !planeOk(frame.data[2], frame.linesize[2], chromaW, chromaH)) {
-        std::cerr << "SoftwareRenderer::present: yuv420p planes are missing or have a bad stride\n";
         return false;
     }
 

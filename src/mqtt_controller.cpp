@@ -86,10 +86,6 @@ void stripTrailingSlashes(std::string& prefix) {
     }
 }
 
-// SoftwareRenderer rejects sides above 8192. Match that here so a bad flag
-// fails before the broker connect.
-constexpr int kMaxViewportSide = 8192;
-
 // Pause between present ticks while waiting for SIGINT, SIGTERM, or SIGHUP.
 // Decode runs on each stream's thread, so this wait is not stuck behind a
 // socket read.
@@ -125,7 +121,8 @@ bool parseViewport(const std::string& text, int& width, int& height) {
         if (used != heightText.size()) {
             return false;
         }
-        if (w < 1 || h < 1 || w > kMaxViewportSide || h > kMaxViewportSide) {
+        // Same cap as SoftwareRenderer::init, so a bad --viewport fails here.
+        if (w < 1 || h < 1 || w > SoftwareRenderer::kMaxExtent || h > SoftwareRenderer::kMaxExtent) {
             return false;
         }
         width = w;

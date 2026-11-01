@@ -33,6 +33,12 @@ Rgb8 yuv601ToRgb(uint8_t y, uint8_t u, uint8_t v);
 // FNV-1a over those bytes (the FNV offset basis when the viewport is empty).
 class SoftwareRenderer : public Renderer {
 public:
+    // Largest width, height, and plane stride present() accepts. Copy and
+    // --url use the same caps so an unpresentable frame is not treated as a
+    // successful decode.
+    static constexpr int kMaxExtent = 8192;
+    static constexpr int kMaxStride = 65536;
+
     explicit SoftwareRenderer(std::string ppmDirectory = {});
     ~SoftwareRenderer() override;
 
@@ -40,6 +46,10 @@ public:
     SoftwareRenderer& operator=(const SoftwareRenderer&) = delete;
     SoftwareRenderer(SoftwareRenderer&&) = delete;
     SoftwareRenderer& operator=(SoftwareRenderer&&) = delete;
+
+    // Format, size, and plane layout present() will accept. Does not check
+    // init readiness or dest placement.
+    static bool frameAcceptable(const DecodedFrame& frame);
 
     bool init(int viewportWidth, int viewportHeight) override;
     bool present(const DecodedFrame& frame, const LayoutEngine::Rect& dest) override;
