@@ -1,9 +1,15 @@
 #include "ffmpeg_decoder.h"
 
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <csignal>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -12,10 +18,14 @@
 #include <vector>
 
 // Local software-decode smoke test. Generates a tiny fixture with the
-// ffmpeg CLI (no network) and pulls one YUV420P frame through FfmpegDecoder.
+// ffmpeg CLI and pulls one YUV420P frame through FfmpegDecoder.
 // Exit 77 when the CLI is missing so ctest can mark the test skipped.
 // FFmpeg dev libraries are required to link this binary; CMake omits the
 // target when they are absent.
+//
+// The dual-variant case serves a master playlist on 127.0.0.1 from this
+// process. It does not use an outside network. It fails if a later segment
+// of the variant that was not selected is still requested.
 
 #ifndef FFMPEG_CLI
 #define FFMPEG_CLI ""
@@ -176,6 +186,341 @@ void testDecode(const std::string& url) {
     decoder.close();
 }
 
+// One-connection-at-a-time HTTP/1.1 server. Enough for libavformat's HLS
+// client against files in root. Every request path is appended to log_path.
+struct LocalHttp {
+    pid_t pid = -1;
+    int port = 0;
+
+    LocalHttp() = default;
+    LocalHttp(const LocalHttp&) = delete;
+    LocalHttp& operator=(const LocalHttp&) = delete;
+    LocalHttp(LocalHttp&& other) noexcept : pid(other.pid), port(other.port) {
+        other.pid = -1;
+        other.port = 0;
+    }
+    LocalHttp& operator=(LocalHttp&& other) noexcept {
+        if (this != &other) {
+            stop();
+            pid = other.pid;
+            port = other.port;
+            other.pid = -1;
+            other.port = 0;
+        }
+        return *this;
+    }
+
+    ~LocalHttp() { stop(); }
+
+    void stop() {
+        if (pid <= 0) {
+            return;
+        }
+        kill(pid, SIGTERM);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        pid = -1;
+    }
+};
+
+bool startsWith(const std::string& value, const char* prefix) {
+    const std::string p(prefix);
+    return value.size() >= p.size() && value.compare(0, p.size(), p) == 0;
+}
+
+void appendLog(const std::filesystem::path& log_path, const std::string& path) {
+    const int fd = ::open(log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) {
+        return;
+    }
+    const std::string line = path + "\n";
+    const ssize_t n = ::write(fd, line.data(), line.size());
+    ::close(fd);
+    (void)n;
+}
+
+std::string readRequest(int fd) {
+    std::string data;
+    char buf[2048];
+    while (data.find("\r\n\r\n") == std::string::npos && data.size() < 65536) {
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        const int pr = ::poll(&pfd, 1, 2000);
+        if (pr <= 0) {
+            break;
+        }
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+        data.append(buf, static_cast<size_t>(n));
+    }
+    return data;
+}
+
+std::string requestPath(const std::string& headers) {
+    const auto line_end = headers.find("\r\n");
+    const std::string line = headers.substr(0, line_end == std::string::npos ? headers.size() : line_end);
+    if (!startsWith(line, "GET ")) {
+        return {};
+    }
+    const auto sp = line.find(' ', 4);
+    if (sp == std::string::npos) {
+        return {};
+    }
+    std::string url = line.substr(4, sp - 4);
+    const auto query = url.find('?');
+    if (query != std::string::npos) {
+        url = url.substr(0, query);
+    }
+    const auto scheme = url.find("://");
+    if (scheme != std::string::npos) {
+        const auto slash = url.find('/', scheme + 3);
+        url = slash == std::string::npos ? "/" : url.substr(slash);
+    }
+    return url;
+}
+
+bool safeRelative(const std::string& url, std::filesystem::path& rel) {
+    if (url.empty() || url[0] != '/') {
+        return false;
+    }
+    rel = std::filesystem::path(url.substr(1));
+    for (const std::filesystem::path& part : rel) {
+        if (part == "..") {
+            return false;
+        }
+    }
+    return true;
+}
+
+void sendAll(int fd, const char* data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        const ssize_t n = ::write(fd, data + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
+        }
+        if (n == 0) {
+            return;
+        }
+        off += static_cast<size_t>(n);
+    }
+}
+
+void sendResponse(int fd, int status, const std::string& body, const char* content_type) {
+    const char* text = status == 200 ? "OK" : "Not Found";
+    std::ostringstream hdr;
+    hdr << "HTTP/1.1 " << status << " " << text
+        << "\r\nContent-Length: " << body.size()
+        << "\r\nContent-Type: " << content_type
+        << "\r\nConnection: close\r\n\r\n";
+    const std::string header = hdr.str();
+    sendAll(fd, header.data(), header.size());
+    if (!body.empty()) {
+        sendAll(fd, body.data(), body.size());
+    }
+}
+
+[[noreturn]] void serveLoop(int listen_fd,
+                            const std::filesystem::path& root,
+                            const std::filesystem::path& log_path) {
+    ::signal(SIGPIPE, SIG_IGN);
+    while (true) {
+        const int client = ::accept(listen_fd, nullptr, nullptr);
+        if (client < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            _exit(0);
+        }
+        const std::string headers = readRequest(client);
+        const std::string url = requestPath(headers);
+        if (!url.empty()) {
+            appendLog(log_path, url);
+        }
+        std::filesystem::path rel;
+        std::string body;
+        bool ok = !url.empty() && safeRelative(url, rel);
+        if (ok) {
+            const std::filesystem::path full = root / rel;
+            std::ifstream in(full, std::ios::binary);
+            if (!in) {
+                ok = false;
+            } else {
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                body = ss.str();
+            }
+        }
+        if (!ok) {
+            sendResponse(client, 404, "missing\n", "text/plain");
+        } else {
+            const char* type = "application/octet-stream";
+            if (rel.extension() == ".m3u8") {
+                type = "application/vnd.apple.mpegurl";
+            }
+            sendResponse(client, 200, body, type);
+        }
+        ::close(client);
+    }
+}
+
+LocalHttp startLocalHttp(const std::filesystem::path& root, const std::filesystem::path& log_path) {
+    LocalHttp server;
+    const int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        return server;
+    }
+    const int yes = 1;
+    ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0);
+    if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(listen_fd, 16) != 0) {
+        ::close(listen_fd);
+        return server;
+    }
+    sockaddr_in bound{};
+    socklen_t bound_len = sizeof(bound);
+    if (::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&bound), &bound_len) != 0) {
+        ::close(listen_fd);
+        return server;
+    }
+    const pid_t pid = fork();
+    if (pid < 0) {
+        ::close(listen_fd);
+        return server;
+    }
+    if (pid == 0) {
+        serveLoop(listen_fd, root, log_path);
+    }
+    ::close(listen_fd);
+    server.pid = pid;
+    server.port = ntohs(bound.sin_port);
+    return server;
+}
+
+bool parseSegmentIndex(const std::string& name, int& index) {
+    const std::string prefix = "index";
+    const std::string suffix = ".ts";
+    if (name.size() <= prefix.size() + suffix.size()) {
+        return false;
+    }
+    if (name.compare(0, prefix.size(), prefix) != 0) {
+        return false;
+    }
+    if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return false;
+    }
+    const std::string num = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+    if (num.empty()) {
+        return false;
+    }
+    for (char c : num) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    index = std::stoi(num);
+    return true;
+}
+
+int maxSegmentIndex(const std::filesystem::path& dir) {
+    int max_index = -1;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        int index = -1;
+        if (!parseSegmentIndex(entry.path().filename().string(), index)) {
+            continue;
+        }
+        if (index > max_index) {
+            max_index = index;
+        }
+    }
+    return max_index;
+}
+
+void writeMaster(const std::filesystem::path& path, bool low_first) {
+    std::ofstream out(path);
+    out << "#EXTM3U\n";
+    const char* low = "#EXT-X-STREAM-INF:BANDWIDTH=400000,RESOLUTION=320x240\nlo/index.m3u8\n";
+    const char* high = "#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=640x480\nhi/index.m3u8\n";
+    if (low_first) {
+        out << low << high;
+    } else {
+        out << high << low;
+    }
+}
+
+// First listed variant is the one open() keeps. The other variant's last
+// segment must not be requested. Probe traffic during avformat_find_stream_info
+// still fetches the early segments of both; the fixture is long enough that
+// the last segment is past that probe.
+void testMasterOrder(LocalHttp& server,
+                     const std::filesystem::path& root,
+                     const std::filesystem::path& log_path,
+                     bool low_first,
+                     int last_index) {
+    const char* master_name = low_first ? "master-low-first.m3u8" : "master-high-first.m3u8";
+    writeMaster(root / master_name, low_first);
+    std::ofstream trunc(log_path, std::ios::trunc);
+    trunc.close();
+
+    const int expect_w = low_first ? 320 : 640;
+    const int expect_h = low_first ? 240 : 480;
+    const std::string chosen = low_first ? "lo" : "hi";
+    const std::string other = low_first ? "hi" : "lo";
+    const std::string chosen_last = "/" + chosen + "/index" + std::to_string(last_index) + ".ts";
+    const std::string other_last = "/" + other + "/index" + std::to_string(last_index) + ".ts";
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(server.port) + "/" + master_name;
+
+    g_case = low_first ? "hls master low first" : "hls master high first";
+    FfmpegDecoder decoder;
+    const bool opened = decoder.open(url);
+    CHECK(opened);
+    if (!opened) {
+        std::cerr << readFile(log_path);
+        return;
+    }
+
+    int got = 0;
+    int width = 0;
+    int height = 0;
+    for (; got < 400; ++got) {
+        DecodedFrame frame;
+        if (!decoder.readFrame(frame)) {
+            break;
+        }
+        if (got == 0) {
+            width = frame.width;
+            height = frame.height;
+        }
+        CHECK(frame.format == FramePixelFormat::Yuv420p);
+    }
+    decoder.close();
+
+    const std::string log = readFile(log_path);
+    if (got < 1 || width != expect_w || height != expect_h || log.find(chosen_last) == std::string::npos ||
+        log.find(other_last) != std::string::npos || log.find("/lo/index0.ts") == std::string::npos ||
+        log.find("/hi/index0.ts") == std::string::npos) {
+        std::cerr << "GET log for " << url << ":\n" << log;
+    }
+    CHECK(got >= 1);
+    CHECK(width == expect_w);
+    CHECK(height == expect_h);
+    CHECK(log.find("/lo/index0.ts") != std::string::npos);
+    CHECK(log.find("/hi/index0.ts") != std::string::npos);
+    CHECK(log.find(chosen_last) != std::string::npos);
+    CHECK(log.find(other_last) == std::string::npos);
+}
+
 void testMissingFile(const std::filesystem::path& dir) {
     g_case = "missing file";
     FfmpegDecoder decoder;
@@ -231,6 +576,56 @@ int main() {
             g_case = "hls";
             testDecode(playlist.string());
             hls_decoded = true;
+
+            g_case = "generate hls master";
+            const std::filesystem::path master_root = tmp.path() / "master";
+            const std::filesystem::path lo_dir = master_root / "lo";
+            const std::filesystem::path hi_dir = master_root / "hi";
+            std::filesystem::create_directories(lo_dir);
+            std::filesystem::create_directories(hi_dir);
+            // Eight seconds, one-second segments. find_stream_info probes the
+            // start of both variants; the last segment is past that probe, so
+            // a discard miss still fetches it and this test fails.
+            const int lo_enc = run(
+                {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "testsrc=size=320x240:rate=10:duration=8",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                 "-g", "10", "-hls_time", "1", "-hls_list_size", "0",
+                 "-hls_playlist_type", "vod",
+                 "-hls_segment_filename", (lo_dir / "index%d.ts").string(),
+                 (lo_dir / "index.m3u8").string()},
+                log);
+            const int hi_enc = run(
+                {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "testsrc=size=640x480:rate=10:duration=8",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                 "-g", "10", "-hls_time", "1", "-hls_list_size", "0",
+                 "-hls_playlist_type", "vod",
+                 "-hls_segment_filename", (hi_dir / "index%d.ts").string(),
+                 (hi_dir / "index.m3u8").string()},
+                log);
+            if (lo_enc != 0 || hi_enc != 0) {
+                std::cerr << "failed to generate dual-variant HLS fixture (lo " << lo_enc
+                          << " hi " << hi_enc << ")\n"
+                          << readFile(log);
+                return 1;
+            }
+            const int last_index = maxSegmentIndex(lo_dir);
+            const int hi_last = maxSegmentIndex(hi_dir);
+            if (last_index < 4 || hi_last != last_index) {
+                std::cerr << "dual-variant fixture segments lo=" << last_index
+                          << " hi=" << hi_last << "\n";
+                return 1;
+            }
+            const std::filesystem::path get_log = master_root / "gets.log";
+            LocalHttp server = startLocalHttp(master_root, get_log);
+            if (server.pid <= 0 || server.port <= 0) {
+                std::cerr << "failed to bind local HLS server\n";
+                return 1;
+            }
+            testMasterOrder(server, master_root, get_log, true, last_index);
+            testMasterOrder(server, master_root, get_log, false, last_index);
+            server.stop();
         } else if (hls_rc == 127) {
             std::cout << "SKIP ffmpeg CLI not found\n";
             return kSkip;

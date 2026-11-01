@@ -8,9 +8,13 @@
 # native runner. No GS-King X or CoreELEC image is required to package.
 #
 # linuxdeploy fills the AppDir (binary, desktop file, icon, shared libraries).
-# linuxdeploy-plugin-appimage then runs appimagetool. A copy of appimagetool
-# is also placed on PATH because the plugin looks there if its bundled copy
-# is not found.
+# Its excludelist omits libX11 and the libraries behind Ubuntu's FFmpeg
+# (libxcb, fontconfig, freetype, harfbuzz, and the rest of that closure).
+# This script copies those back in. A host — or a chroot — that only has
+# glibc, libstdc++, libgcc_s, zlib, and libdrm can then run --help.
+# appimagetool packs the AppDir after that copy. The smoke image is still
+# not a GS-King X / CoreELEC build; a device AppImage should link that
+# system's FFmpeg instead of shipping Ubuntu's X11 stack.
 #
 # scripts/launch-coreelec.sh requires GS-King X / CoreELEC and is not used here.
 
@@ -35,9 +39,16 @@ need() {
   command -v "$1" >/dev/null 2>&1 || die "required command '$1' is not installed"
 }
 
-for cmd in cmake g++ pkg-config curl patchelf file strip timeout; do
+for cmd in cmake g++ pkg-config curl patchelf file strip timeout readelf sudo; do
   need "$cmd"
 done
+sudo -n true || die "passwordless sudo is required for the minimal-chroot --help smoke test"
+
+LDCONFIG=$(command -v ldconfig || true)
+if [[ -z "$LDCONFIG" && -x /sbin/ldconfig ]]; then
+  LDCONFIG=/sbin/ldconfig
+fi
+[[ -n "$LDCONFIG" ]] || die "ldconfig is required to locate shared libraries"
 
 case "$(uname -m)" in
   x86_64) ARCH=x86_64 ;;
@@ -96,6 +107,178 @@ download() {
   mv "$dest.partial" "$dest"
 }
 
+# Sonames a minimal host is expected to provide. Everything else that the
+# player needs is copied into the AppDir, including libraries linuxdeploy's
+# excludelist would leave on the build machine (libX11 and its closure).
+is_host_soname() {
+  case "$1" in
+    libc.so.6 | libm.so.6 | libdl.so.2 | librt.so.1 | libpthread.so.0 | \
+      libresolv.so.2 | libutil.so.1 | libstdc++.so.6 | libgcc_s.so.1 | \
+      libz.so.1 | libdrm.so.2 | ld-linux.so.* | ld-linux-*.so.*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+needed_sonames() {
+  readelf -d "$1" 2>/dev/null | awk -F'[][]' '/\(NEEDED\)/ { print $2 }'
+}
+
+find_system_soname() {
+  local name=$1
+  local path
+  path=$("$LDCONFIG" -p | awk -v n="$name" '$1 == n { print $NF; exit }')
+  [[ -n "$path" ]] || return 1
+  readlink -f "$path"
+}
+
+# Copy NEEDED libraries that are not already in the AppDir and are not on
+# the host allowlist. New files land next to libavutil so the existing
+# $ORIGIN rpath finds them.
+bundle_excluded_libraries() {
+  local appdir=$1
+  local avutil libdir
+  avutil=$(find "$appdir" -name 'libavutil.so.*' -print -quit)
+  [[ -n "$avutil" ]] || die "linuxdeploy did not bundle libavutil"
+  libdir=$(dirname "$avutil")
+  echo "Bundling libraries the minimal host does not provide into $libdir"
+
+  local -A seen=()
+  local -a queue=()
+  enqueue() {
+    local resolved
+    resolved=$(readlink -f "$1")
+    [[ -n "$resolved" && -f "$resolved" ]] || return 0
+    if [[ -n "${seen[$resolved]:-}" ]]; then
+      return 0
+    fi
+    seen[$resolved]=1
+    queue+=("$resolved")
+  }
+
+  local file
+  while IFS= read -r -d '' file; do
+    if readelf -h "$file" >/dev/null 2>&1; then
+      enqueue "$file"
+    fi
+  done < <(find "$appdir" -type f -print0)
+
+  local index=0
+  while [[ $index -lt ${#queue[@]} ]]; do
+    file=${queue[$index]}
+    index=$((index + 1))
+    local soname
+    while IFS= read -r soname; do
+      [[ -n "$soname" ]] || continue
+      if is_host_soname "$soname"; then
+        continue
+      fi
+      local existing
+      existing=$(find "$appdir" -name "$soname" -print -quit || true)
+      if [[ -n "$existing" ]]; then
+        enqueue "$existing"
+        continue
+      fi
+      local src dest
+      src=$(find_system_soname "$soname") || die "no system library for $soname (needed by $file)"
+      dest="$libdir/$soname"
+      echo "  bundle $soname"
+      cp -a "$src" "$dest"
+      # $ORIGIN is a dynamic-linker token, not a shell variable.
+      # shellcheck disable=SC2016
+      patchelf --set-rpath '$ORIGIN' "$dest"
+      enqueue "$dest"
+    done < <(needed_sonames "$file")
+  done
+
+  local missing=0
+  while IFS= read -r -d '' file; do
+    readelf -h "$file" >/dev/null 2>&1 || continue
+    local soname
+    while IFS= read -r soname; do
+      [[ -n "$soname" ]] || continue
+      if is_host_soname "$soname"; then
+        continue
+      fi
+      if [[ ! -e "$libdir/$soname" ]]; then
+        echo "missing $soname needed by $file" >&2
+        missing=1
+      fi
+    done < <(needed_sonames "$file")
+  done < <(find "$appdir" -type f -print0)
+  [[ "$missing" -eq 0 ]] || die "AppDir is still missing shared libraries"
+  LIBDIR=$libdir
+}
+
+CHROOT_DIR=""
+cleanup_chroot() {
+  if [[ -n "${CHROOT_DIR}" && -d "$CHROOT_DIR" ]]; then
+    sudo umount "$CHROOT_DIR/proc" 2>/dev/null || true
+    sudo umount "$CHROOT_DIR/app" 2>/dev/null || true
+    rm -rf "$CHROOT_DIR"
+    CHROOT_DIR=""
+  fi
+}
+trap cleanup_chroot EXIT
+
+# --help must start when the only libraries outside the AppDir are glibc,
+# libstdc++, libgcc_s, zlib, and libdrm. That is the failure mode of an
+# excludelist that drops libX11 while Ubuntu's libavutil still needs it.
+smoke_minimal_chroot() {
+  local appdir=$1
+  local bin="$appdir/usr/bin/amlogic-multistream"
+  [[ -e "$appdir/AppRun" ]] || die "AppDir has no AppRun"
+  [[ -e "$bin" ]] || die "AppDir has no player binary"
+  local interp interp_src
+  interp=$(readelf -l "$bin" | sed -n 's/.*interpreter: \([^]]*\)\]/\1/p' | head -n 1)
+  [[ -n "$interp" ]] || die "could not read the ELF interpreter from $bin"
+  interp_src=$(readlink -f "$interp")
+  [[ -f "$interp_src" ]] || die "interpreter not found: $interp"
+
+  CHROOT_DIR=$(mktemp -d /tmp/amlogic-min-chroot.XXXXXX)
+  mkdir -p "$CHROOT_DIR/opt/base" "$CHROOT_DIR/proc" "$CHROOT_DIR/app" \
+    "$CHROOT_DIR/tmp" "$CHROOT_DIR/dev" "$CHROOT_DIR$(dirname "$interp")"
+  cp -a "$interp_src" "$CHROOT_DIR$interp"
+  sudo mknod -m 666 "$CHROOT_DIR/dev/null" c 1 3
+  sudo mount --bind /proc "$CHROOT_DIR/proc"
+  sudo mount --bind "$appdir" "$CHROOT_DIR/app"
+
+  local -A wanted=()
+  local file soname
+  while IFS= read -r -d '' file; do
+    readelf -h "$file" >/dev/null 2>&1 || continue
+    while IFS= read -r soname; do
+      [[ -n "$soname" ]] || continue
+      if is_host_soname "$soname"; then
+        wanted["$soname"]=1
+      fi
+    done < <(needed_sonames "$file")
+  done < <(find "$appdir" -type f -print0)
+  # glibc dlopens these. They are part of glibc, not X11.
+  for soname in libnss_files.so.2 libnss_dns.so.2; do
+    if "$LDCONFIG" -p | awk -v n="$soname" '$1 == n { found = 1 } END { exit !found }'; then
+      wanted["$soname"]=1
+    fi
+  done
+
+  local name src
+  for name in "${!wanted[@]}"; do
+    case "$name" in
+      ld-linux*) continue ;;
+    esac
+    src=$(find_system_soname "$name") || die "host has no $name for the minimal chroot"
+    cp -a "$src" "$CHROOT_DIR/opt/base/$name"
+  done
+
+  local lib_rel=${LIBDIR#"$appdir"}
+  echo "Smoke-testing --help with only glibc, libstdc++, libgcc_s, zlib, and libdrm outside the AppDir"
+  sudo env LANG=C LC_ALL=C chroot "$CHROOT_DIR" "$interp" \
+    --library-path "/opt/base:/app${lib_rel}" \
+    /app/AppRun --help
+  cleanup_chroot
+}
+
 # AppImages are extracted instead of FUSE-mounted so CI and containers work.
 export APPIMAGE_EXTRACT_AND_RUN=1
 
@@ -113,10 +296,15 @@ unset LDAI_SIGN || true
   --appdir "$APPDIR" \
   --executable "$BIN" \
   --desktop-file "$ROOT/packaging/amlogic-multistream.desktop" \
-  --icon-file "$ROOT/packaging/amlogic-multistream.png" \
-  --output appimage
+  --icon-file "$ROOT/packaging/amlogic-multistream.png"
 
-[[ -f "$OUTPUT" ]] || die "linuxdeploy did not write $OUTPUT"
+bundle_excluded_libraries "$APPDIR"
+smoke_minimal_chroot "$APPDIR"
+
+echo "Packing $OUTPUT"
+"$TOOLS_DIR/appimagetool-${ARCH}.AppImage" "$APPDIR" "$OUTPUT"
+
+[[ -f "$OUTPUT" ]] || die "appimagetool did not write $OUTPUT"
 chmod +x "$OUTPUT"
 
 echo "Smoke-testing $OUTPUT --help"

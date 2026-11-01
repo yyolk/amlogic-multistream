@@ -1,5 +1,6 @@
-# Two native builds. Neither job calls scripts/launch-coreelec.sh
-# (that script requires GS-King X / CoreELEC).
+# Two native builds. scripts/launch-coreelec.sh requires GS-King X /
+# CoreELEC. CI runs it only through scripts/test-launch-coreelec.sh
+# (a stand-in runtime, then the packaged AppImage against mosquitto).
 #
 # - ubuntu-24.04: x86_64 host/Codespaces smoke AppImage
 # - ubuntu-24.04-arm: native aarch64 AppImage. This is NOT the GS-King X
@@ -56,8 +57,9 @@ jobs:
           path: .cache/appimage-tools
           key: appimage-tools-${{ runner.os }}-${{ matrix.arch }}-v1
 
-      # Library list matches .devcontainer/Dockerfile, plus ccache and the
-      # ffmpeg CLI (ffmpeg_decoder_tests synthesizes a local fixture).
+      # Library list matches .devcontainer/Dockerfile, plus ccache, the
+      # ffmpeg CLI (ffmpeg_decoder_tests synthesizes a local fixture), and
+      # mosquitto (the packaged AppImage launch-script check).
       # layout_engine_tests itself only needs a C++ compiler.
       - name: Install build dependencies
         run: |
@@ -78,6 +80,8 @@ jobs:
             libfuse2t64 \
             libmosquitto-dev \
             libswscale-dev \
+            busybox-static \
+            mosquitto \
             patchelf \
             pkg-config
 
@@ -110,6 +114,13 @@ jobs:
           else
             file "${images[0]}" | grep -E -i -q 'x86-64|x86_64'
           fi
+
+      - name: Launch script against the AppImage
+        run: |
+          set -euo pipefail
+          image=$(find dist -maxdepth 1 -type f -name '*.AppImage' | head -n 1)
+          test -n "$image"
+          ./scripts/test-launch-coreelec.sh --only-appimage --appimage "$image" --bare build/amlogic-multistream
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v7

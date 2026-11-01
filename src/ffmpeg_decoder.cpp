@@ -114,6 +114,20 @@ bool FfmpegDecoder::open(const std::string& url) {
         return failOpen("no video stream", video_index_);
     }
 
+    // Keep the first video stream av_find_best_stream selected (HLS master:
+    // the first variant in playlist order). AVDISCARD_ALL on every other
+    // stream makes hls.c playlist_needed() drop the rest, so later segments
+    // of those variants are not fetched. Probe reads that already happened
+    // inside avformat_find_stream_info stay fetched.
+    for (unsigned i = 0; i < fmt_->nb_streams; ++i) {
+        AVStream* candidate = fmt_->streams[i];
+        if (candidate == nullptr) {
+            continue;
+        }
+        candidate->discard =
+            static_cast<int>(i) == video_index_ ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+    }
+
     AVStream* stream = fmt_->streams[video_index_];
     if (stream == nullptr || stream->codecpar == nullptr) {
         return failOpen("video stream has no codec parameters", AVERROR(EINVAL));

@@ -14,6 +14,14 @@ struct SwsContext;
 // calls a no-op hook marked "requires GS-King X / CoreELEC" so a future
 // hardware backend has an obvious insertion point that is not this class.
 //
+// An HLS master lists every variant as its own program. open() keeps the
+// video stream av_find_best_stream() returns and sets AVDISCARD_ALL on the
+// others. For a master playlist that stream is the first variant in
+// playlist order, not the highest bitrate. Later segments of the discarded
+// variants are not requested. Segments already read inside
+// avformat_find_stream_info() are not rewound. A tile-size bitrate picker
+// is a later change.
+//
 // open() drops any previous stream first. On failure it returns false and
 // leaves the object closed (safe to destroy or open() again).
 // readFrame() yields FramePixelFormat::Yuv420p planes owned by this object.
