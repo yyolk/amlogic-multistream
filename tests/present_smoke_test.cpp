@@ -448,6 +448,71 @@ int main() {
                           << hugeTsOut << hugeTsErr;
                 return 1;
             }
+
+            // HLS of a PMT 160x120 plus an undeclared 12000x12000 PID. The
+            // extra stream is born after open_input; probe max_pixels must
+            // still apply (AUDIT10 D2).
+            const std::filesystem::path smallTs = tmp.path() / "small.ts";
+            const int genSmallTs = run({ffmpegBinary(), "-y", "-loglevel", "error", "-f", "lavfi",
+                                        "-i", "testsrc=size=160x120:rate=10:duration=0.4", "-c:v",
+                                        "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                                        "-f", "mpegts", smallTs.string()},
+                                       empty, log);
+            if (genSmallTs != 0) {
+                std::cerr << "failed to generate small mpegts fixture (exit " << genSmallTs << ")\n"
+                          << readFile(log);
+                return 1;
+            }
+            const std::filesystem::path extraPid = tmp.path() / "extra-pid.ts";
+            {
+                std::ifstream base(smallTs, std::ios::binary);
+                std::ifstream more(hugeTs, std::ios::binary);
+                std::ofstream extra(extraPid, std::ios::binary);
+                extra << base.rdbuf();
+                char pkt[188];
+                bool kept = false;
+                while (more.read(pkt, 188) && more.gcount() == 188) {
+                    if (static_cast<unsigned char>(pkt[0]) != 0x47) {
+                        std::cerr << "huge mpegts fixture is not 188-byte packets\n";
+                        return 1;
+                    }
+                    const int pid = ((static_cast<unsigned char>(pkt[1]) & 0x1f) << 8) |
+                                    static_cast<unsigned char>(pkt[2]);
+                    if (pid == 0x100) {
+                        pkt[1] = static_cast<char>((pkt[1] & 0xE0) | 0x01);
+                        pkt[2] = 0x01;
+                        extra.write(pkt, 188);
+                        kept = true;
+                    }
+                }
+                if (!kept) {
+                    std::cerr << "failed to build extra-PID mpegts fixture\n";
+                    return 1;
+                }
+            }
+            const std::filesystem::path extraHls = tmp.path() / "extra-pid.m3u8";
+            {
+                std::ofstream playlist(extraHls);
+                playlist << "#EXTM3U\n"
+                         << "#EXT-X-VERSION:3\n"
+                         << "#EXT-X-TARGETDURATION:1\n"
+                         << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                         << "#EXTINF:0.400,\n"
+                         << extraPid.filename().string() << "\n"
+                         << "#EXT-X-ENDLIST\n";
+            }
+            long extraRssKb = 0;
+            const int extraRc =
+                run({player, "--url", extraHls.string(), "--frames", "1"}, out, err, &extraRssKb);
+            const std::string extraOut = readFile(out);
+            const std::string extraErr = readFile(err);
+            if (extraRc != 0 || extraOut.find("presented ") == std::string::npos ||
+                extraOut.find("160x120") == std::string::npos || extraRssKb >= kConvertRssKb) {
+                std::cerr << "extra-PID HLS --url must present the small stream (exit " << extraRc
+                          << " rss_kb=" << extraRssKb << ")\n"
+                          << extraOut << extraErr;
+                return 1;
+            }
         }
 
         // AUDIT9 D1: a 12000x12000 MJPEG still must fail without the ~425 MB convert.

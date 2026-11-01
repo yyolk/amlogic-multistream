@@ -10,9 +10,11 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avstring.h>
+#include <libavutil/avutil.h>
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/log.h>
+#include <libavutil/mathematics.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
@@ -108,35 +110,59 @@ void freeStreamOptions(AVDictionary** stream_opts, unsigned count) {
 // FFmpeg 6.1.1's avformat_find_stream_info snapshots orig_nb_streams and
 // applies options[i] only while i < that count (libavformat/demux.c). There
 // is no format-wide codec-option default for streams created later.
-bool formatIsMpegTs(const AVFormatContext* fmt) {
-    const char* name = fmt != nullptr && fmt->iformat != nullptr ? fmt->iformat->name : nullptr;
-    return name != nullptr && av_match_list(name, "mpegts", ',') > 0;
-}
-
-bool formatHasVideoStream(const AVFormatContext* fmt) {
-    if (fmt == nullptr) {
-        return false;
-    }
-    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
-        const AVStream* st = fmt->streams[i];
-        if (st != nullptr && st->codecpar != nullptr &&
-            st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            return true;
-        }
-    }
-    return false;
+bool formatNameIs(const AVFormatContext* fmt, const char* name) {
+    const char* got = fmt != nullptr && fmt->iformat != nullptr ? fmt->iformat->name : nullptr;
+    return got != nullptr && name != nullptr && av_match_list(got, name, ',') > 0;
 }
 
 bool formatMayAddStreams(const AVFormatContext* fmt) {
     if (fmt == nullptr) {
         return false;
     }
-    // mpegts auto_guess can add an extra PID after open_input. HLS of a
-    // PMT segment already has streams; only a headerless segment leaves
-    // nb_streams at 0. Do not key off AVFMTCTX_NOHEADER: a normal HLS
-    // master keeps that flag and a probesize-long pre-pass would fetch
-    // every variant (AUDIT10 D2).
-    return formatIsMpegTs(fmt) || fmt->nb_streams == 0;
+    // mpegts auto_guess and HLS of a PMT segment can add a PID after some
+    // streams already exist. A headerless input starts at nb_streams == 0.
+    return formatNameIs(fmt, "mpegts") || formatNameIs(fmt, "hls") || fmt->nb_streams == 0;
+}
+
+int64_t probeAnalyzeDuration(const AVFormatContext* fmt) {
+    if (fmt != nullptr && fmt->max_analyze_duration > 0) {
+        return fmt->max_analyze_duration;
+    }
+    // Same defaults as FFmpeg 6.1.1 avformat_find_stream_info.
+    if (formatNameIs(fmt, "mpegts") || formatNameIs(fmt, "mpeg")) {
+        return 7 * static_cast<int64_t>(AV_TIME_BASE);
+    }
+    return 5 * static_cast<int64_t>(AV_TIME_BASE);
+}
+
+int64_t packetTimeUs(const AVFormatContext* fmt, const AVPacket* pkt) {
+    if (fmt == nullptr || pkt == nullptr || pkt->stream_index < 0 ||
+        static_cast<unsigned>(pkt->stream_index) >= fmt->nb_streams) {
+        return AV_NOPTS_VALUE;
+    }
+    const AVStream* st = fmt->streams[pkt->stream_index];
+    if (st == nullptr || st->time_base.num <= 0 || st->time_base.den <= 0) {
+        return AV_NOPTS_VALUE;
+    }
+    const int64_t ts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+    if (ts == AV_NOPTS_VALUE) {
+        return AV_NOPTS_VALUE;
+    }
+    return av_rescale_q(ts, st->time_base, AV_TIME_BASE_Q);
+}
+
+int firstVideoStreamIndex(const AVFormatContext* fmt) {
+    if (fmt == nullptr) {
+        return AVERROR_STREAM_NOT_FOUND;
+    }
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const AVStream* st = fmt->streams[i];
+        if (st != nullptr && st->codecpar != nullptr &&
+            st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            return static_cast<int>(i);
+        }
+    }
+    return AVERROR_STREAM_NOT_FOUND;
 }
 
 void freePacketQueue(AVPacket*** pkts, unsigned* count, unsigned* pos) {
@@ -198,21 +224,17 @@ int rewindAfterDiscovery(AVFormatContext* fmt, int64_t start) {
 
 // Demux-only: av_read_frame creates AVStreams for PIDs that appear after
 // avformat_open_input (PSI-less MPEG-TS, extra PIDs, HLS of those files)
-// without opening a decoder. If the container can rewind, seek back so
-// find_stream_info can apply max_pixels to every index that now exists
-// (AUDIT10 D2). HLS of a local playlist cannot rewind; those packets are
-// queued for readFrame() instead. A PID that first appears after this
-// probesize window can still be uncapped; the playback context still sets
-// max_pixels.
+// without opening a decoder. The window matches find_stream_info
+// (probesize and max_analyze_duration) so a normal HLS master is not
+// drained past the usual probe. If the container can rewind, seek back
+// so find_stream_info can apply max_pixels to every index that now
+// exists (AUDIT10 D2). Local HLS cannot rewind; those packets are queued
+// for readFrame() and find_stream_info is not allowed to read further.
 void discoverStreamsForProbeOptions(AVFormatContext* fmt,
                                     AVPacket*** queued,
-                                    unsigned* queued_count) {
-    if (queued != nullptr) {
-        *queued = nullptr;
-    }
-    if (queued_count != nullptr) {
-        *queued_count = 0;
-    }
+                                    unsigned* queued_count,
+                                    unsigned* queued_pos) {
+    freePacketQueue(queued, queued_count, queued_pos);
     if (!formatMayAddStreams(fmt) || queued == nullptr || queued_count == nullptr) {
         return;
     }
@@ -222,8 +244,9 @@ void discoverStreamsForProbeOptions(AVFormatContext* fmt,
     }
     const int64_t start = fmt->pb != nullptr ? avio_tell(fmt->pb) : 0;
     const int64_t probesize = fmt->probesize > 0 ? fmt->probesize : 5000000;
-    const bool mpegts = formatIsMpegTs(fmt);
+    const int64_t max_analyze = probeAnalyzeDuration(fmt);
     int64_t read_size = 0;
+    int64_t first_ts = AV_NOPTS_VALUE;
     bool stash_ok = true;
     while (read_size < probesize) {
         if (fmt->interrupt_callback.callback != nullptr &&
@@ -234,24 +257,40 @@ void discoverStreamsForProbeOptions(AVFormatContext* fmt,
         if (rc < 0) {
             break;
         }
-        if (pkt->size > 0) {
-            read_size += pkt->size;
+        read_size += pkt->size > 0 ? pkt->size : 1;
+        const int64_t ts = packetTimeUs(fmt, pkt);
+        if (ts != AV_NOPTS_VALUE) {
+            if (first_ts == AV_NOPTS_VALUE) {
+                first_ts = ts;
+            }
+            if (ts - first_ts >= max_analyze) {
+                if (stash_ok && pushPacketQueue(queued, queued_count, pkt) < 0) {
+                    stash_ok = false;
+                    freePacketQueue(queued, queued_count, queued_pos);
+                }
+                av_packet_unref(pkt);
+                break;
+            }
         }
         if (stash_ok && pushPacketQueue(queued, queued_count, pkt) < 0) {
             stash_ok = false;
-            freePacketQueue(queued, queued_count, nullptr);
+            freePacketQueue(queued, queued_count, queued_pos);
         }
         av_packet_unref(pkt);
-        // HLS cannot rewind. Stop once the missing video stream exists so a
-        // master playlist is not drained past find_stream_info's window.
-        if (!mpegts && formatHasVideoStream(fmt)) {
-            break;
-        }
     }
     av_packet_free(&pkt);
 
-    if (rewindAfterDiscovery(fmt, start) >= 0) {
-        freePacketQueue(queued, queued_count, nullptr);
+    // HLS seek is not trustworthy here: av_seek_frame is often EPERM, and
+    // a successful avio_seek only rewinds the playlist file. Always keep
+    // the queue for hls. MPEG-TS can rewind, so drop the copies.
+    if (!formatNameIs(fmt, "hls") && rewindAfterDiscovery(fmt, start) >= 0) {
+        freePacketQueue(queued, queued_count, queued_pos);
+    } else {
+        // Already consumed the probe window. find_stream_info must not
+        // keep reading or it would fetch past a master playlist's usual
+        // probe and decode a late PID without options.
+        fmt->probesize = 1;
+        fmt->max_analyze_duration = 1;
     }
 }
 
@@ -369,8 +408,7 @@ bool FfmpegDecoder::open(const std::string& url) {
     // so find_stream_info does not materialize an oversize still
     // (AUDIT9 D1, AUDIT10 D2). FFmpeg 6.1.1 will not apply these options to
     // a stream that does not exist yet.
-    discoverStreamsForProbeOptions(fmt_, &probe_pkts_, &probe_pkt_count_);
-    probe_pkt_pos_ = 0;
+    discoverStreamsForProbeOptions(fmt_, &probe_pkts_, &probe_pkt_count_, &probe_pkt_pos_);
     AVDictionary** stream_opts = nullptr;
     const unsigned stream_count = fmt_->nb_streams;
     if (stream_count > 0) {
@@ -391,16 +429,18 @@ bool FfmpegDecoder::open(const std::string& url) {
         return failOpen("avformat_find_stream_info", info_rc);
     }
 
-    video_index_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    // First video in playlist / PMT order, not av_find_best_stream. The D2
+    // pre-pass gives every HLS variant codec parameters, and
+    // av_find_best_stream then prefers the higher-resolution one. Extra
+    // PIDs born after the program stream also lose if "best" wins.
+    video_index_ = firstVideoStreamIndex(fmt_);
     if (video_index_ < 0) {
         return failOpen("no video stream", video_index_);
     }
 
-    // Keep the first video stream av_find_best_stream selected (HLS master:
-    // the first variant in playlist order). AVDISCARD_ALL on every other
-    // stream makes hls.c playlist_needed() drop the rest, so later segments
-    // of those variants are not fetched. Probe reads that already happened
-    // inside avformat_find_stream_info stay fetched.
+    // AVDISCARD_ALL on every other stream makes hls.c playlist_needed()
+    // drop the rest, so later segments of those variants are not fetched.
+    // Probe reads that already happened stay fetched.
     for (unsigned i = 0; i < fmt_->nb_streams; ++i) {
         AVStream* candidate = fmt_->streams[i];
         if (candidate == nullptr) {
@@ -482,7 +522,11 @@ int FfmpegDecoder::readDemuxPacket() {
     if (probe_pkt_pos_ < probe_pkt_count_) {
         av_packet_unref(pkt_);
         const int ref_rc = av_packet_ref(pkt_, probe_pkts_[probe_pkt_pos_]);
+        av_packet_free(&probe_pkts_[probe_pkt_pos_]);
         ++probe_pkt_pos_;
+        if (probe_pkt_pos_ >= probe_pkt_count_) {
+            freePacketQueue(&probe_pkts_, &probe_pkt_count_, &probe_pkt_pos_);
+        }
         return ref_rc;
     }
     return av_read_frame(fmt_, pkt_);
