@@ -243,12 +243,13 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
     add_test(NAME present_smoke COMMAND present_smoke_test)
     set_tests_properties(present_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
-    # Broker-down retry, SIGHUP retained status, and a SIGKILL that keeps
-    # the last stdout status line. Skips when mosquitto is not installed.
+    # Broker-down retry, SIGHUP retained status, a SIGKILL that keeps the
+    # last stdout status line, and a non-zero exit after MQTT authentication
+    # refusals. Skips when mosquitto is not installed.
     add_test(NAME mqtt_reconnect
         COMMAND "${CMAKE_SOURCE_DIR}/scripts/test-mqtt-reconnect.sh"
                 "$<TARGET_FILE:amlogic-multistream>")
-    set_tests_properties(mqtt_reconnect PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(mqtt_reconnect PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 else()
     message(STATUS
         "Skipping amlogic-multistream player: need libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm")

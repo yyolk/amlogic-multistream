@@ -19,7 +19,7 @@ Environment variables, overridden by the matching flag:
 | `MQTT_PASSWORD` | `--mqtt-pass` | empty |
 | `MQTT_CLIENT_ID` | `--mqtt-client-id` | `amlogic-multistream` |
 
-TLS is not implemented. The client uses a clean session, QoS 1, and reconnects with backoff from 1s to 30s. That backoff includes the first connection: a refused port or a name that does not resolve keeps the process up and retries instead of exiting. Outside a lab LAN, broker authentication (a username and password, or a broker ACL) is expected. This does not add TLS verification and does not change that CoreELEC runs the player as root.
+TLS is not implemented. The client uses a clean session, QoS 1, and reconnects with backoff from 1s to 30s. That backoff includes the first connection: a refused port or a name that does not resolve keeps the process up and retries instead of exiting. A CONNACK of "not authorised" or "bad user name or password" does not. After three of those refusals the process exits non-zero, and `scripts/launch-coreelec.sh` starts Kodi. Outside a lab LAN, broker authentication (a username and password, or a broker ACL) is expected. The Kodi add-on passes `MQTT_USERNAME` and, when a password is set, `MQTT_PASSWORD` through a mode 0600 `EnvironmentFile` (see [kodi-addon.md](kodi-addon.md)). This does not add TLS verification and does not change that CoreELEC runs the player as root.
 
 ```bash
 amlogic-multistream --mqtt-host 192.168.1.10 --mqtt-prefix living-room

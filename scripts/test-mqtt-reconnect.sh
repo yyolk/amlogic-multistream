@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Broker-down retry, SIGHUP clean status, and a SIGKILL that still leaves
-# the last retained status line. Requires the player binary and mosquitto.
+# Broker-down retry, SIGHUP clean status, a SIGKILL that still leaves the
+# last retained status line, and a non-zero exit after repeated CONNACK
+# authentication refusals. Requires the player binary and mosquitto.
 # Exit 77 when either is missing so CTest can skip.
 
 set -euo pipefail
@@ -283,6 +284,151 @@ PLAYER_PID=
 wait "$kill_pid" 2>/dev/null || true
 if ! grep -q "MQTT status .*cam9" "$WORK/kill.out"; then
   die "SIGKILL lost the last status line"
+fi
+
+# A CONNACK of not authorised must exit non-zero. A down broker keeps
+# retrying; this one answers and refuses, which used to loop with Kodi
+# stopped. Three attempts, then the process exits.
+if [[ -n "${BROKER_PID:-}" ]]; then
+  kill "$BROKER_PID" 2>/dev/null || true
+  wait "$BROKER_PID" 2>/dev/null || true
+  BROKER_PID=
+fi
+cat > "$WORK/mosquitto-auth.conf" <<EOF
+listener ${PORT} 127.0.0.1
+allow_anonymous false
+persistence false
+log_dest stderr
+EOF
+mosquitto -c "$WORK/mosquitto-auth.conf" >"$WORK/mosquitto-auth.log" 2>&1 &
+BROKER_PID=$!
+sleep 0.3
+if ! kill -0 "$BROKER_PID" 2>/dev/null; then
+  die "auth broker did not start"
+fi
+
+wait_player_exit() {
+  local pid=$1
+  local i=0
+  while kill -0 "$pid" 2>/dev/null && [[ $i -lt 150 ]]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+"$PLAYER" \
+  --mqtt-host 127.0.0.1 \
+  --mqtt-port "$PORT" \
+  --mqtt-prefix "$PREFIX" \
+  --mqtt-client-id "anon-$$" \
+  >"$WORK/anon.out" 2>"$WORK/anon.err" &
+PLAYER_PID=$!
+if ! wait_player_exit "$PLAYER_PID"; then
+  die "anonymous client kept running after not authorised"
+fi
+anon_pid=$PLAYER_PID
+PLAYER_PID=
+anon_status=0
+wait "$anon_pid" || anon_status=$?
+if [[ "$anon_status" -eq 0 ]]; then
+  die "anonymous client exited 0 after not authorised"
+fi
+if ! grep -q "not authorised" "$WORK/anon.err"; then
+  die "anonymous client did not log not authorised"
+fi
+if ! grep -q "MQTT authentication failed after 3 attempts; exiting" "$WORK/anon.err"; then
+  die "anonymous client did not exit after 3 authentication attempts"
+fi
+if grep -q "MQTT connected" "$WORK/anon.out"; then
+  die "anonymous client connected to a broker that refuses anonymous clients"
+fi
+
+# Wrong password is the other CONNACK the add-on has to stop on. Mosquitto
+# may phrase it as "bad user name or password" or "not authorised".
+if ! command -v mosquitto_passwd >/dev/null 2>&1; then
+  if [[ "${CI:-}" == "true" ]]; then
+    die "CI requires mosquitto_passwd"
+  fi
+  echo "skip bad-password check (mosquitto_passwd not installed)"
+else
+  if [[ -n "${BROKER_PID:-}" ]]; then
+    kill "$BROKER_PID" 2>/dev/null || true
+    wait "$BROKER_PID" 2>/dev/null || true
+    BROKER_PID=
+  fi
+  mosquitto_passwd -b -c "$WORK/pwfile" player 'right-secret' >/dev/null
+  chmod 0600 "$WORK/pwfile"
+  cat > "$WORK/mosquitto-pw.conf" <<EOF
+listener ${PORT} 127.0.0.1
+allow_anonymous false
+password_file ${WORK}/pwfile
+persistence false
+log_dest stderr
+EOF
+  mosquitto -c "$WORK/mosquitto-pw.conf" >"$WORK/mosquitto-pw.log" 2>&1 &
+  BROKER_PID=$!
+  sleep 0.3
+  if ! kill -0 "$BROKER_PID" 2>/dev/null; then
+    die "password broker did not start"
+  fi
+  "$PLAYER" \
+    --mqtt-host 127.0.0.1 \
+    --mqtt-port "$PORT" \
+    --mqtt-prefix "$PREFIX" \
+    --mqtt-client-id "badpw-$$" \
+    --mqtt-user player \
+    --mqtt-pass 'wrong-secret' \
+    >"$WORK/badpw.out" 2>"$WORK/badpw.err" &
+  PLAYER_PID=$!
+  if ! wait_player_exit "$PLAYER_PID"; then
+    die "wrong password kept the player running"
+  fi
+  bad_pid=$PLAYER_PID
+  PLAYER_PID=
+  bad_status=0
+  wait "$bad_pid" || bad_status=$?
+  if [[ "$bad_status" -eq 0 ]]; then
+    die "wrong password exited 0"
+  fi
+  if ! grep -Eq "not authorised|bad user name or password|bad username or password" "$WORK/badpw.err"; then
+    die "wrong password did not log an authentication refusal"
+  fi
+  if ! grep -q "MQTT authentication failed after 3 attempts; exiting" "$WORK/badpw.err"; then
+    die "wrong password did not exit after 3 authentication attempts"
+  fi
+
+  "$PLAYER" \
+    --mqtt-host 127.0.0.1 \
+    --mqtt-port "$PORT" \
+    --mqtt-prefix "$PREFIX" \
+    --mqtt-client-id "goodpw-$$" \
+    --mqtt-user player \
+    --mqtt-pass 'right-secret' \
+    >"$WORK/goodpw.out" 2>"$WORK/goodpw.err" &
+  PLAYER_PID=$!
+  if ! wait_for "$WORK/goodpw.out" "MQTT connected" 50; then
+    die "correct password did not connect"
+  fi
+  kill -s TERM "$PLAYER_PID"
+  good_pid=$PLAYER_PID
+  PLAYER_PID=
+  i=0
+  while kill -0 "$good_pid" 2>/dev/null && [[ $i -lt 30 ]]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$good_pid" 2>/dev/null; then
+    die "SIGTERM after a correct login did not stop the player"
+  fi
+  good_status=0
+  wait "$good_pid" || good_status=$?
+  if [[ "$good_status" -ne 0 ]]; then
+    die "correct password then SIGTERM exited $good_status"
+  fi
 fi
 
 echo "mqtt reconnect checks ok"
