@@ -37,6 +37,24 @@ experiment only — no nine-tile hardware promise. Keep two AppImages;
 `dlopen` the matching ELF. Freeze Appendix A after *verify* **V1, V2, V3,
 V5** on a GS-King X.
 
+**Product floor:** the shipping minimum on GS-King X / CE22 is **2×2
+(4 concurrent hardware-accelerated streams)**, not 3×3. Prefer tile-sized
+HLS **480/720**; allow **1080p** when Mpx/s and `codec_mm` admit. The UI
+may still target up to 9 on CE22 (EGL compose); 9 is aspirational. Stage
+planning is: **1-stream spike → 2 instances → 2×2 floor → 3×3 goal**.
+CE21 stays limited (instance cap 2) — do not promise a nine-tile CE21
+wall; 2×2 is the CE22-oriented floor.
+
+Filed trackers ([milestones](https://github.com/yyolk/amlogic-multistream/milestones)):
+
+| Order | Milestone | Issue |
+| --- | --- | --- |
+| 1 | [#3 CE22 stage-1: 1-stream amcodec spike](https://github.com/yyolk/amlogic-multistream/milestone/3) | [#65](https://github.com/yyolk/amlogic-multistream/issues/65) |
+| 2 | [#4 CE22 stage-2: dual instance](https://github.com/yyolk/amlogic-multistream/milestone/4) | [#66](https://github.com/yyolk/amlogic-multistream/issues/66) |
+| 3 | [#1 2×2 hardware wall (4 streams) product floor](https://github.com/yyolk/amlogic-multistream/milestone/1) | [#67](https://github.com/yyolk/amlogic-multistream/issues/67) |
+| 4 | [#2 3×3 hardware wall (9 streams) aspirational goal](https://github.com/yyolk/amlogic-multistream/milestone/2) | [#68](https://github.com/yyolk/amlogic-multistream/issues/68) |
+| (CE21) | [#5 CE21: software wall + optional 1–2 amvideo](https://github.com/yyolk/amlogic-multistream/milestone/5) | [#69](https://github.com/yyolk/amlogic-multistream/issues/69) |
+
 ---
 
 ## 2. Path scorecard
@@ -134,17 +152,28 @@ growth. Not `amlogic_v4l2_decoder.*`.
 
 ### 3.6 Stage-2 (after stage-1, not this spike)
 
-CE22 3×3: keep `AmlogicAmcodecDecoder`; add a compositor renderer that
-`accepts(DrmPrime)` **or** a later export from `v4lvideo` / UVM / GE2D
-into linear NV12 dma-bufs, then GBM/EGL blit into one OSD FB, one
-non-blocking atomic commit per tick (#40). Shape B-PRIME is a **new
+**Product floor first.** After the 1-stream spike ([#65](https://github.com/yyolk/amlogic-multistream/issues/65) / [milestone #3](https://github.com/yyolk/amlogic-multistream/milestone/3)) and a second instance ([#66](https://github.com/yyolk/amlogic-multistream/issues/66) / [milestone #4](https://github.com/yyolk/amlogic-multistream/milestone/4)),
+prove **2×2 (4 concurrent hardware-accelerated streams)** on CE22
+([#67](https://github.com/yyolk/amlogic-multistream/issues/67) / [milestone #1](https://github.com/yyolk/amlogic-multistream/milestone/1))
+before chasing 3×3 ([#68](https://github.com/yyolk/amlogic-multistream/issues/68) / [milestone #2](https://github.com/yyolk/amlogic-multistream/milestone/2)).
+Prefer tile-sized HLS **480/720**; allow **1080p** when
+Mpx/s and `codec_mm` admit. Nine tiles remain the UI / EGL-compose
+target, not the shipping minimum.
+
+CE22 3×3 (aspirational): keep `AmlogicAmcodecDecoder`; add a compositor
+renderer that `accepts(DrmPrime)` **or** a later export from `v4lvideo` /
+UVM / GE2D into linear NV12 dma-bufs, then GBM/EGL blit into one OSD FB,
+one non-blocking atomic commit per tick (#40). Shape B-PRIME is a **new
 class**, not a `StreamPlayer` rewrite, and only if V1 is unexpectedly
 yes. Per-tile HLS variant pick belongs in the shared open path (today’s
 “first playlist variant” can pick 1080p for a 360p tile).
 
-CE21 stage-2 is software + at most two amvideo layers. A nine-tile
-hardware wall on CE21 needs a custom kernel (revert patch 003) **and**
-a compose engine onto fbdev. Out of scope.
+CE21 stage-2 is software + at most two amvideo layers
+([#69](https://github.com/yyolk/amlogic-multistream/issues/69) /
+[milestone #5](https://github.com/yyolk/amlogic-multistream/milestone/5)).
+A nine-tile hardware wall on CE21 needs a custom kernel (revert patch
+003) **and** a compose engine onto fbdev. Out of scope. Do not treat
+2×2 as a CE21 promise (instance cap 2).
 
 ---
 
