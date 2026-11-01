@@ -66,7 +66,7 @@ on the timings above. The silent-resolver, launch-script glob, and B1
 post-CONNECT window were not rebuilt. Those lines did not move in a way
 that adds evidence.
 
-No new must-fix and no new should-fix.
+No new must-fix and no new should-fix on that first pass. [CROSSCHECK-A](#crosscheck-a) against [#55](https://github.com/yyolk/amlogic-multistream/pull/55) revises one drop: **D1** is an agreed should-fix. This file still has no must/should that #55 missed.
 
 ---
 
@@ -171,9 +171,11 @@ Not promoted. Checked only that the code is still the same shape.
 - **Reject the size before `av_frame_get_buffer`.** AUDIT8 named that as
   the preferred shape. #54 rejects at copy, after `publishYuv420` has
   scaled. The 8224 `--url` transcript shows the `video 8224x32` line and
-  then `cannot be presented`. That matches the tall-frame path this cap
-  was aligned to: one converted frame, then the 1 s retry, not a present
-  loop. Not a separate should-fix.
+  then `cannot be presented`. That thin frame matches the tall-frame path
+  this cap was aligned to: one converted frame, then the 1 s retry, not a
+  present loop. The first pass stopped there. A 12000×12000 MJPEG does
+  not stay cheap. That case is **D1** in [CROSSCHECK-A](#crosscheck-a),
+  agreed as a should-fix.
 - **`present` failure still does not back off.** `tick` logs
   `present failed` and continues when `present` returns false
   (`src/stream_player.cpp`). After #54 a frame that fails
@@ -219,3 +221,60 @@ Not promoted. Checked only that the code is still the same shape.
   `git diff 0518a7e..e53336a -- src tests scripts CMakeLists.txt`.
 - **Not rebuilt:** silent nameserver, B1's post-CONNECT sample, L1's glob
   sample, the AUDIT7 reaper-cap RSS harness.
+
+---
+
+## CROSSCHECK-A
+
+Independent rating of [#55](https://github.com/yyolk/amlogic-multistream/pull/55)
+(`AUDIT9-B.md`, `origin/cursor/audit9-b-second-look-1eb2` @ `7b1f8c3`)
+against this tree's `main` base `e53336a`. No production code changed.
+B claims no must-fix. The only should-fix items B claims are **D1** and
+**J1**. E1, H1, and U1 are B's nits and stay there.
+
+### D1 — AGREE (should-fix)
+
+`publishYuv420` calls `av_frame_get_buffer` and `sws_scale` at the decoded
+size before `frameAcceptable` runs (`src/ffmpeg_decoder.cpp`). `open()`
+never sets `max_pixels`. On this FFmpeg 6.1.1, `avcodec_alloc_context3`
+for `mjpeg` and `h264` leaves `max_pixels` at `INT_MAX` (2147483647).
+`mjpeg` is on `kCodecWhitelist`, and `mov`/`mp4` are top-level formats, so
+an MQTT `http://` add of that file is in scope. A one-frame 12000×12000
+MJPEG MP4 through `build/amlogic-multistream --url … --frames 1` on
+`e53336a` printed `video 12000x12000 yuvj420p -> yuv420p`, then
+`Decoded frame 0 12000x12000 cannot be presented`, and exited 1. Peak RSS
+was **456700 KB**. Copy failure is `WorkerFail::Read`; `tick` retires the
+worker and waits `kRetryDelay` (1 s) (`src/stream_player.cpp`). The table
+holds `LayoutEngine::kMaxStreams` (9) workers, so nine such URLs overlap.
+The 8224×32 path this audit dropped is still the cheap one. This square
+is not, and it is worth bounding before a hardware backend copies the
+same order. It is not a must-fix: the player exits the frame, frees the
+decoder on retire, and does not stay retained-online.
+
+### J1 — DEMOTE-TO-NIT
+
+A throwaway driver of `parseFlatJsonObject` + `executeCommand` on
+`{"id":"cam","url":"http://127.0.0.1/a\nMQTT status {\"online\":true}"}`
+printed a following line that is exactly `MQTT status {"online":true}`
+(`src/mqtt_json.cpp` decodes `\n`; `mqttUrlAllowed` rejects only NUL;
+`StreamManager::addStream` logs the URL raw). The same run's
+`buildStatusJson` kept the newline escaped (`\n` inside the URL string),
+and a `\u0000` URL was rejected. The retained status document is the
+escaped payload `publishRaw` logs. A reader that treats any
+`MQTT status` line as that document can be fooled. That is a log footgun,
+the same class as the existing SIGKILL-before-publish window, not a
+wrong retained status.
+
+### Must/should in AUDIT9.md that B missed
+
+None. The first pass recorded no must-fix and no should-fix. Re-reading
+`e53336a` does not promote B1, L1, N2–N4, or F4–F7. The pre-buffer drop
+in §4 is the item D1 replaces; it was not a survivor B failed to list.
+
+### AGREED SURVIVORS
+
+Must-fix and should-fix only. J1 is not in this table.
+
+| ID | Severity | Finding |
+| --- | --- | --- |
+| **D1** | should-fix | Extent cap runs after decode and `sws_scale`. A 12000×12000 MJPEG still converts, peaks at 456700 KB RSS, fails present, and the MQTT path retries that decode every 1 s, up to 9 streams. |
