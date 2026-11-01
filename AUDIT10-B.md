@@ -29,12 +29,14 @@ passed. `stream_player_stall` 9.36 s, `mqtt_reconnect` 17.70 s,
 
 ## Verdict
 
-**No new must-fix and no new should-fix.** #57 closes **D1**. A frame whose
-pixel count is over `8192²` is refused by FFmpeg `max_pixels` before a
-converted buffer exists, and a frame that fails the extent or stride cap is
-refused in `publishYuv420` before `av_frame_get_buffer` / `sws_scale`.
-Retries of that open do not accumulate RSS. Copy, `--url`, and present still
-share `SoftwareRenderer::frameAcceptable`.
+**No new must-fix.** The first pass also found no should-fix. **CROSSCHECK-B
+revises that:** **D2** is a should-fix. #57 closes **D1** for a stream that
+already exists when the probe starts. A frame whose pixel count is over
+`8192²` is refused by FFmpeg `max_pixels` before a converted buffer exists,
+and a frame that fails the extent or stride cap is refused in
+`publishYuv420` before `av_frame_get_buffer` / `sws_scale`. Retries of that
+open do not accumulate RSS. Copy, `--url`, and present still share
+`SoftwareRenderer::frameAcceptable`.
 
 AUDIT8 P1, AUDIT7 B2, AUDIT6 N1, AUDIT5 F1/X1/F3, and AUDIT4 A1–A5 still hold
 on this tree. J1, E1, H1, U1, B1, and L1 stay nits. No new evidence moved
@@ -43,7 +45,7 @@ them.
 | ID | Severity | Finding |
 | --- | --- | --- |
 | — | must-fix | None. |
-| — | should-fix | None. |
+| **D2** | should-fix | Revised in CROSSCHECK-B. Streams created during the probe miss `max_pixels`. |
 | **D1** | closed | #57. Over-pixel stills fail closed. See below. |
 | J1 | nit | Control characters in `id` / `url` still reach the add log. Retained JSON is still escaped. Not re-run. |
 | E1 | nit | A decode-thread exception still sets `done` and leaves `failed` clear (`src/stream_player.cpp`). |
@@ -211,7 +213,7 @@ Not re-promoted. #57 does not change their code.
 | ID | Severity | Status on `5c2c9d9` |
 | --- | --- | --- |
 | — | must-fix | None found. |
-| — | should-fix | None found. |
+| D2 | should-fix | Revised in CROSSCHECK-B. Probe of a stream born inside `find_stream_info` peaks near 379 MB, then releases it. |
 | D1 | closed by #57 | Over-pixel MJPEG (MP4 and HLS APIC) fails with `max_pixels` 67108864. Peak RSS about 32–36 MB, flat across retries. No convert line. |
 | P1 | closed by #54 | Copy and present still share `frameAcceptable`. |
 | B2 | closed by #51 | Local-file flag still limited to scheme-less and `file:` URLs. Suite file-segment cases passed. |
@@ -223,3 +225,51 @@ Not re-promoted. #57 does not change their code.
 | A4, A5 | closed by #28 | Top-level MP3 rejected. `mp3float` still listed. |
 | J1, E1, H1, U1, B1, L1 | nit | Carried. Not elevated. |
 | N2, N3, N4, F4, F5, F6, F7 | nit | Carried. Not elevated. |
+
+---
+
+## CROSSCHECK-B
+
+Peer draft AUDIT10-A ([#59](https://github.com/yyolk/amlogic-multistream/pull/59))
+files **D2** as should-fix. Checked here on the same tip (`5c2c9d9`), against
+this tree's `amlogic-multistream --url … --frames 1` and a throwaway
+`FfmpegDecoder` driver. **Agree: D2 is a should-fix.** It is not a must-fix.
+The first pass did not open a stream that `avformat_find_stream_info` creates,
+so it did not see this spike. No production change and no fix.
+
+`open()` builds the per-stream `max_pixels` dictionary only when
+`fmt_->nb_streams > 0` (`src/ffmpeg_decoder.cpp:216-229`). FFmpeg 6.1.1
+snapshots `orig_nb_streams` at the start of `avformat_find_stream_info` and
+applies those options only to indexes below that count ("new streams might
+appear, no options for those" in `libavformat/demux.c`). A stream added
+during the probe is decoded at the default `max_pixels` of `INT_MAX`.
+`12000×12000` is under that default, so the probe allocates the picture.
+The playback context still sets `codec_->max_pixels`
+(`src/ffmpeg_decoder.cpp:296-303`), and `avcodec_open2` then fails. #57
+still holds for a stream that exists before the probe: the same picture in
+a normal single-program TS logs `get_buffer() failed` and peaks at
+**89492 KB**.
+
+| Input | After `open_input` | After the probe | Player | `ru_maxrss` |
+| --- | --- | --- | --- | --- |
+| PSI-less H.264. PES payloads of 16000 bytes, no PAT/PMT/SDT, 437100 bytes, PID 0x100, 12000×12000 | `nb_streams=0` | 1× h264 12000×12000 | rc 1, `avcodec_open2` invalid. No `get_buffer() failed` | **378944 KB** |
+| HLS media playlist of that file | `nb_streams=0`, `iformat=hls` | 1× h264 12000×12000 | rc 1, same | **379296 KB** |
+| PMT PID 0x100 is 320×240. PID 0x101 is that 12000×12000 picture and is not in the program. 438604 bytes | 1× h264 | stream 0 becomes 320×240, stream 1 is h264 12000×12000 | **rc 0**, presents 320×240 | **380448 KB** |
+
+After the PSI-less probe, VmRSS was **33684 KB** and VmHWM **378556 KB**.
+Three serial opens in one process stayed at VmRSS ~34 MB and VmHWM
+**378908 KB**. Two overlapping opens reached VmHWM **728496 KB**, then
+VmRSS **37020 KB**. The picture is not retained. A failed MQTT open is
+`WorkerFail::Open`, and `tick` waits `kRetryDelay` (1 s) before the next
+`open()` (`src/stream_player.cpp:16`, `:518-525`), so each retry repeats
+the spike. That does not leave a retained `online:true`, and it is not a
+hang. The extra-PID file stays open and presents the PMT stream, so it
+spikes once per open or restart.
+
+One PSI-less shape did not allocate. ffmpeg's mpegts muxer omits the video
+PES length, and this demuxer's default `max_packet_size` is 204800. On
+this solid-red frame the first packet is ~200 KB. Probing that whole
+buffer ties `h264` with `gsm` (both score 51 once the buffer passes 60 KB),
+so the codec stays unset and the player fails with "no video stream" at
+**32872 KB**. A PES short enough to commit `h264` before that tie takes
+the uncapped path. That is the table above, and it is D2.
