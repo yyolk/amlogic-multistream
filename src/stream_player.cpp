@@ -154,6 +154,19 @@ void StreamPlayer::reapFinished() {
     reaper_ = std::move(pending);
 }
 
+bool StreamPlayer::reaperBusy(const std::string& id) const {
+    for (const auto& worker : reaper_) {
+        if (!worker || worker->id != id) {
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(worker->mu);
+        if (!worker->done) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void StreamPlayer::sessionLoop(Worker* worker, const std::string& id, const std::string& url) {
     DecoderBackend* decoder = worker->decoder.get();
     const bool opened = decoder != nullptr && decoder->open(url);
@@ -405,6 +418,16 @@ int StreamPlayer::tick(bool playing) {
         }
 
         if (!session.worker) {
+            // AUDIT4 A3: generationChanged used to skip backoff and start a
+            // replacement in this same tick. A retired worker stuck in
+            // getaddrinfo ignores abort and stays on the reaper until libc
+            // returns, so each restart stacked another thread. Wait until
+            // that worker is done. appliedGeneration is left unchanged, so
+            // the restart is still pending and runs on the tick after the
+            // lookup finishes. A restart cannot beat the resolver anyway.
+            if (reaperBusy(info.id)) {
+                continue;
+            }
             if (!generationChanged && !urlChanged && session.backoff && now < session.retryAfter) {
                 continue;
             }
