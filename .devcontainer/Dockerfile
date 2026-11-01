@@ -8,6 +8,7 @@ USER root
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends \
         binutils \
+        busybox-static \
         ca-certificates \
         cmake \
         curl \

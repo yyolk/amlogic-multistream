@@ -10,7 +10,7 @@ Multi-stream HLS viewer for Amlogic S922X (GS-King X / CoreELEC).
 - RetroArch-style launch: stop Kodi → run app → restart Kodi
 
 ## Status
-Grid layout selection is implemented and unit-tested. MQTT command control is implemented against an in-memory stream table. Single-stream software decode is in place: `FfmpegDecoder` opens one HLS, HTTP, or file URL with libavformat/libavcodec, decodes on the CPU, and pulls 8-bit YUV420P frames through `DecoderBackend::readFrame`. `isHardware()` is false for this backend.
+Grid layout selection is implemented and unit-tested. MQTT command control is implemented against an in-memory stream table. Single-stream software decode is in place: `FfmpegDecoder` opens one HLS, HTTP, or file URL with libavformat/libavcodec, decodes on the CPU, and pulls 8-bit YUV420P frames through `DecoderBackend::readFrame`. `isHardware()` is false for this backend. An HLS master keeps the video stream `av_find_best_stream` returns — the first variant in playlist order, not the highest bitrate — and sets `AVDISCARD_ALL` on the others so later segments of the remaining variants are not downloaded.
 
 `--url` presents each decoded frame through the `Renderer` interface. The default implementation is `SoftwareRenderer`: it letterboxes one YUV420P frame into the `1x1` cell from `LayoutEngine`, keeps an RGB buffer, and can write PPM files with `--render-dir`. It does not open `/dev/dri`. Plane pointers stay owned by the decoder until the next `readFrame()` or `close()`; the renderer copies them during `present()`.
 
@@ -55,14 +55,14 @@ ctest --test-dir build --output-on-failure
 
 `software_renderer_tests` does not need FFmpeg, libmosquitto, libdrm, or a GPU. It checks BT.601 conversion, a fake `Renderer` fed by a one-stream `LayoutEngine` rect, RGB checksums, letterboxing into one cell, and a PPM dump.
 
-`ffmpeg_decoder_tests` is added when libavformat, libavcodec, libavutil, and libswscale are present. It does not need libmosquitto, libdrm, or a network. The test runs the `ffmpeg` CLI to write a tiny local MPEG-4 MP4 and, when libx264 is available, an HLS playlist, then opens each with `FfmpegDecoder` and checks `isHardware() == false` plus at least one YUV420P frame. If the CLI is missing, the test exits 77 and ctest marks it skipped. If the dev libraries are missing, CMake skips that target and still builds the other tests.
+`ffmpeg_decoder_tests` is added when libavformat, libavcodec, libavutil, and libswscale are present. It does not need libmosquitto, libdrm, or a network. The test runs the `ffmpeg` CLI to write a tiny local MPEG-4 MP4 and, when libx264 is available, an HLS playlist, then opens each with `FfmpegDecoder` and checks `isHardware() == false` plus at least one YUV420P frame. With libx264 it also serves a two-variant master on `127.0.0.1` and fails if the last segment of the variant that was not selected is still requested. If the CLI is missing, the test exits 77 and ctest marks it skipped. If the dev libraries are missing, CMake skips that target and still builds the other tests.
 
 The `amlogic-multistream` player target is configured only when libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm are all present. `present_smoke_test` is registered with that target. It decodes a local fixture through `--url --render-dir` and checks that `--renderer drm` fails without a GS-King X. `-DAMLOGIC_DRM_KMS=ON` is off in CI.
 
 ## MQTT
 Without `--url`, the process connects to a broker and blocks until SIGINT or SIGTERM. Defaults are `localhost:1883` and topic prefix `amlogic-multistream` (`MQTT_HOST`, `MQTT_PORT`, `MQTT_TOPIC_PREFIX`). Command topics, JSON fields, and `mosquitto_pub` examples are in [docs/mqtt.md](docs/mqtt.md).
 
-This build does not open DRM/KMS devices or Amlogic decoders. `scripts/launch-coreelec.sh` **requires GS-King X / CoreELEC**. It stops Kodi, runs the player, and starts Kodi again. SIGHUP, SIGTERM, and EXIT still start Kodi if the SSH session drops or the script is killed. Ctrl+C is left to the player.
+This build does not open DRM/KMS devices or Amlogic decoders. `scripts/launch-coreelec.sh` **requires GS-King X / CoreELEC**. It stops Kodi, runs the player, and starts Kodi again. SIGHUP, SIGTERM, and EXIT stop the player and start Kodi if the SSH session drops or the script is killed. A type-2 AppImage is unpacked once and `AppRun` is what the trap signals, so the AppImage runtime cannot keep the player alive. Ctrl+C before the player starts also starts Kodi, including under dash and busybox ash. After the player is running, Ctrl+C belongs to the player.
 
 ## Manual player check
 
@@ -94,7 +94,7 @@ Pass `-DCMAKE_CXX_COMPILER=g++` when `c++` on the PATH is not g++.
 
 ## Tests
 
-`layout_engine_tests` is the layout unit-test binary. CTest registers it as `layout_engine`. The same `ctest` run also executes `stream_manager_test`, `mqtt_smoke_test`, and `software_renderer_tests`. When the FFmpeg libraries are present it also runs `ffmpeg_decoder_tests`, and when the player dependencies are present it runs `present_smoke_test`.
+`layout_engine_tests` is the layout unit-test binary. CTest registers it as `layout_engine`. The same `ctest` run also executes `stream_manager_test`, `mqtt_smoke_test`, `software_renderer_tests`, and `scripts/test-launch-coreelec.sh` (a stand-in for the CoreELEC launch script: bash, dash, and busybox ash when busybox is installed). When the FFmpeg libraries are present it also runs `ffmpeg_decoder_tests`, and when the player dependencies are present it runs `present_smoke_test`.
 
 ```bash
 cmake -S . -B build -DCMAKE_CXX_COMPILER=g++
@@ -145,12 +145,16 @@ The GS-King X runs CoreELEC **Amlogic-ng**, a 32-bit ARM userspace (`CoreELEC-Am
 
 linuxdeploy leaves glibc to the system and bundles the other shared libraries. Do not treat glibc 2.39 as the reason the device image fails. On Ubuntu 24.04 (the CI distro) the player's bundled libraries require `GLIBC_2.38` at most. `GLIBC_2.39` symbols are exports on the host `libc.so.6` and `libm.so.6`, which linuxdeploy does not bundle. CoreELEC 21.3-Omega pins glibc 2.38, so that floor matches. The mismatch is the 32-bit userspace, not a 2.39 requirement, and it is not a reason to retarget the build at Debian bullseye.
 
+Ubuntu's FFmpeg is linked with libX11, VAAPI, VDPAU, and OpenCL. linuxdeploy's excludelist would omit `libX11.so.6` and the libraries behind it (`libxcb`, fontconfig, freetype, harfbuzz, and the rest of that closure), so `--help` fails on a machine that does not have them. `scripts/build-appimage.sh` copies those libraries into the AppDir. The script then runs `--help` in a chroot that only offers glibc, libstdc++, libgcc_s, zlib, and libdrm. A device AppImage should still link CoreELEC's FFmpeg, or one built without X11, VAAPI, VDPAU, and OpenCL, instead of shipping this Ubuntu stack.
+
 **TODO:** Build a real GS-King X AppImage as 32-bit ARM (armv7, hard-float) against a CoreELEC Amlogic-ng sysroot (glibc 2.38 on CoreELEC 21.3-Omega). The `ubuntu-24.04-arm` aarch64 artifact cannot be that file. This repository does not produce the device AppImage yet.
 
 ## Launch on CoreELEC
 
-`scripts/launch-coreelec.sh` **requires GS-King X / CoreELEC**. It stops Kodi, runs `/storage/amlogic-multistream`, and starts Kodi again. If the SSH session drops (SIGHUP) or the shell is killed (SIGTERM), a trap stops the player and starts Kodi. EXIT does the same. Ctrl+C is not trapped: the player handles SIGINT, exits 0, and the script starts Kodi on the normal path.
+`scripts/launch-coreelec.sh` **requires GS-King X / CoreELEC**. It stops Kodi, runs `/storage/amlogic-multistream`, and starts Kodi again. If the SSH session drops (SIGHUP) or the shell is killed (SIGTERM), a trap stops the player and starts Kodi. EXIT does the same. The script is `/bin/sh` (dash and busybox ash). Ctrl+C before the player has been started starts Kodi and exits 130, including while `systemctl stop kodi` or the following `sleep` is still running. After the player is running, the shell ignores SIGINT: the player handles Ctrl+C, exits 0, and the script starts Kodi on the normal path.
 
-The script exports `APPIMAGE_EXTRACT_AND_RUN=1` because the CoreELEC base image has no `fusermount`. A type-2 AppImage otherwise fails in the runtime, before `main`. CI and Codespaces do not call this script.
+CoreELEC has no `fusermount`. A type-2 AppImage is extracted once to `/storage/amlogic-multistream.AppDir` (override with `PLAYER_EXTRACT_DIR`) and `AppRun` is executed directly. The type-2 runtime forks the player and does not forward SIGTERM, so the trap must not wait on the runtime. A bare ELF is executed as itself. `PLAYER_BIN` overrides `/storage/amlogic-multistream`. The script polls until that process has exited (up to 10 seconds, then SIGKILL) before it starts Kodi.
+
+CI runs `scripts/test-launch-coreelec.sh` with a stand-in runtime, and again against the packaged AppImage. It does not boot a GS-King X.
 
 Put a 32-bit ARM build at `/storage/amlogic-multistream` before running it. The aarch64 CI artifact is the wrong binary for that path.

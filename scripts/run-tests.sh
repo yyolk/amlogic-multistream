@@ -5,7 +5,9 @@
 # built or is not registered with CTest. Every other add_test() target runs
 # in the same ctest invocation.
 #
-# scripts/launch-coreelec.sh requires GS-King X / CoreELEC and is not used here.
+# scripts/launch-coreelec.sh requires GS-King X / CoreELEC. CTest runs
+# scripts/test-launch-coreelec.sh, which drives that script with a stand-in
+# runtime and does not boot a device.
 
 set -euo pipefail
 

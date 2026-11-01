@@ -53,6 +53,13 @@ add_test(NAME stream_manager_test COMMAND stream_manager_test)
 add_test(NAME mqtt_smoke_test COMMAND mqtt_smoke_test)
 add_test(NAME software_renderer COMMAND software_renderer_tests)
 
+# Stand-in for scripts/launch-coreelec.sh (that script requires GS-King X /
+# CoreELEC). Checks SIGTERM against a type-2 runtime that does not forward
+# the signal, SIGINT before the player starts, and a bare ELF.
+add_test(NAME launch_coreelec
+    COMMAND "${CMAKE_SOURCE_DIR}/scripts/test-launch-coreelec.sh")
+set_tests_properties(launch_coreelec PROPERTIES TIMEOUT 120)
+
 find_package(PkgConfig QUIET)
 set(AMLOGIC_PLAYER_DEPS_FOUND FALSE)
 if(PkgConfig_FOUND)
@@ -87,7 +94,7 @@ if(FFMPEG_FOUND)
         target_compile_definitions(ffmpeg_decoder_tests PRIVATE FFMPEG_CLI="")
     endif()
     add_test(NAME ffmpeg_decoder COMMAND ffmpeg_decoder_tests)
-    set_tests_properties(ffmpeg_decoder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(ffmpeg_decoder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
 else()
     message(STATUS
         "Skipping ffmpeg_decoder test: need libavformat, libavcodec, libavutil, and libswscale")
