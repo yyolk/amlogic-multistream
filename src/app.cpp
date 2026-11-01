@@ -134,7 +134,9 @@ bool wantsDecodeMode(int argc, char* argv[]) {
             continue;
         }
         const std::string arg = argv[i];
-        if (arg == "--url" || arg == "--frames" || arg == "--render-dir" || arg == "--renderer") {
+        // --render-dir and --viewport belong to MQTT mode unless --url (or
+        // another decode-only flag) selected the one-shot path.
+        if (arg == "--url" || arg == "--frames" || arg == "--renderer") {
             return true;
         }
     }

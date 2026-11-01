@@ -10,9 +10,9 @@ Multi-stream HLS viewer for Amlogic S922X (GS-King X / CoreELEC).
 - RetroArch-style launch: stop Kodi → run app → restart Kodi
 
 ## Status
-Grid layout selection is implemented and unit-tested. MQTT command control is implemented against an in-memory stream table. Single-stream software decode is in place: `FfmpegDecoder` opens one HLS, HTTP, or file URL with libavformat/libavcodec, decodes on the CPU, and pulls 8-bit YUV420P frames through `DecoderBackend::readFrame`. `isHardware()` is false for this backend. An HLS master keeps the video stream `av_find_best_stream` returns — the first variant in playlist order, not the highest bitrate — and sets `AVDISCARD_ALL` on the others so later segments of the remaining variants are not downloaded.
+Grid layout selection is implemented and unit-tested. MQTT command control keeps an in-memory stream table and, while `start` / `play` is set, software-decodes each visible `http://` or `https://` stream and presents it. `FfmpegDecoder` opens HLS, HTTP, or (on the `--url` path only) a file URL with libavformat/libavcodec, decodes on the CPU, and pulls 8-bit YUV420P frames through `DecoderBackend::readFrame`. `isHardware()` is false for this backend. An HLS master keeps the video stream `av_find_best_stream` returns — the first variant in playlist order, not the highest bitrate — and sets `AVDISCARD_ALL` on the others so later segments of the remaining variants are not downloaded.
 
-`--url` presents each decoded frame through the `Renderer` interface. The default implementation is `SoftwareRenderer`: it letterboxes one YUV420P frame into the `1x1` cell from `LayoutEngine`, keeps an RGB buffer, and can write PPM files with `--render-dir`. It does not open `/dev/dri`. Plane pointers stay owned by the decoder until the next `readFrame()` or `close()`; the renderer copies them during `present()`.
+`--url` presents each decoded frame through the `Renderer` interface. The default implementation is `SoftwareRenderer`: it letterboxes one YUV420P frame into the `1x1` cell from `LayoutEngine`, keeps an RGB buffer, and can write PPM files with `--render-dir`. It does not open `/dev/dri`. The MQTT path uses the same renderer for every cell in the grid. Plane pointers stay owned by the decoder until the next `readFrame()` or `close()`; the renderer copies them during `present()`. PPM dumps on the MQTT path are off unless `--render-dir` is set.
 
 `DrmRenderer` is the DRM/KMS hook and **requires GS-King X / CoreELEC**. The default build does not open `/dev/dri`. `-DAMLOGIC_DRM_KMS=ON` compiles an open of `/dev/dri/card0` plus a resource query; atomic plane commit is not implemented, and `present()` does not scan out. Amlogic hwaccel stays a no-op in `prepareAmlogicHwaccel` (`src/ffmpeg_decoder.cpp`), also marked **requires GS-King X / CoreELEC**. It must not grow inside `FfmpegDecoder`; a hardware decoder should be its own `DecoderBackend`.
 
@@ -41,7 +41,7 @@ sudo apt-get install cmake g++ pkg-config \
   libmosquitto-dev libdrm-dev
 ```
 
-The `ffmpeg` CLI is not linked into the player. It is used by `ffmpeg_decoder_tests`, `present_smoke_test`, and by the manual `--url` check below to synthesize a local media fixture. The player target also needs libmosquitto and libdrm. `--url` does not start MQTT. It presents through `SoftwareRenderer` unless `--renderer drm` is set, and the default build does not open DRM.
+The `ffmpeg` CLI is not linked into the player. It is used by `ffmpeg_decoder_tests`, `stream_player_http`, `present_smoke_test`, and by the manual `--url` check below to synthesize a local media fixture. The player target also needs libmosquitto and libdrm. `--url` does not start MQTT. It presents through `SoftwareRenderer` unless `--renderer drm` is set, and the default build does not open DRM.
 
 ## Build
 
@@ -51,16 +51,18 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-`layout_engine_tests`, `stream_manager_test`, and `mqtt_smoke_test` do not need a broker. Layout and stream-table tests also do not need FFmpeg, libmosquitto, or libdrm. `mqtt_smoke_test` parses commands in-process and does not link libmosquitto.
+`layout_engine_tests`, `stream_manager_test`, `mqtt_smoke_test`, and `stream_player_test` do not need a broker. Layout, stream-table, and player-loop tests also do not need FFmpeg, libmosquitto, or libdrm. `mqtt_smoke_test` parses commands in-process and does not link libmosquitto. `stream_player_test` presents fake YUV frames through `SoftwareRenderer`.
 
 `software_renderer_tests` does not need FFmpeg, libmosquitto, libdrm, or a GPU. It checks BT.601 conversion, a fake `Renderer` fed by a one-stream `LayoutEngine` rect, RGB checksums, letterboxing into one cell, and a PPM dump.
 
 `ffmpeg_decoder_tests` is added when libavformat, libavcodec, libavutil, and libswscale are present. It does not need libmosquitto, libdrm, or a network. The test runs the `ffmpeg` CLI to write a tiny local MPEG-4 MP4 and, when libx264 is available, an HLS playlist, then opens each with `FfmpegDecoder` and checks `isHardware() == false` plus at least one YUV420P frame. With libx264 it also serves a two-variant master on `127.0.0.1` and fails if the last segment of the variant that was not selected is still requested. If the CLI is missing, the test exits 77 and ctest marks it skipped. If the dev libraries are missing, CMake skips that target and still builds the other tests.
 
+`stream_player_http` is added with the FFmpeg libraries. It serves one local MPEG-TS file on `127.0.0.1` (no broker) and checks that `StreamPlayer` plus `FfmpegDecoder` present at least one frame, that an unknown restart id does not reopen it, and that `stop` clears the viewport.
+
 The `amlogic-multistream` player target is configured only when libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm are all present. `present_smoke_test` is registered with that target. It decodes a local fixture through `--url --render-dir` and checks that `--renderer drm` fails without a GS-King X. `-DAMLOGIC_DRM_KMS=ON` is off in CI.
 
 ## MQTT
-Without `--url`, the process connects to a broker and blocks until SIGINT or SIGTERM. Defaults are `localhost:1883` and topic prefix `amlogic-multistream` (`MQTT_HOST`, `MQTT_PORT`, `MQTT_TOPIC_PREFIX`). Command topics, JSON fields, and `mosquitto_pub` examples are in [docs/mqtt.md](docs/mqtt.md).
+Without `--url`, the process connects to a broker and software-decodes added streams until SIGINT or SIGTERM. Broker I/O runs on a background thread. The main thread ticks decode and present, so it is not blocked in `sigwait`. `start` / `play` opens an `FfmpegDecoder` per visible `http://` or `https://` stream and presents into `SoftwareRenderer` cells. `stop` closes those decoders and clears the viewport. `restart` with an id reopens that decoder; an unknown id fails and does not restart the others. Defaults are `localhost:1883`, topic prefix `amlogic-multistream`, and a `1280x720` viewport (`MQTT_HOST`, `MQTT_PORT`, `MQTT_TOPIC_PREFIX`, `--viewport`, `--render-dir`). PPM output is off unless `--render-dir` is set. Command topics, JSON fields, and `mosquitto_pub` examples are in [docs/mqtt.md](docs/mqtt.md).
 
 This build does not open DRM/KMS devices or Amlogic decoders. `scripts/launch-coreelec.sh` **requires GS-King X / CoreELEC**. It stops Kodi, runs the player, and starts Kodi again. SIGHUP, SIGTERM, and EXIT stop the player and start Kodi if the SSH session drops or the script is killed. A type-2 AppImage is unpacked once and `AppRun` is what the trap signals, so the AppImage runtime cannot keep the player alive. Ctrl+C before the player starts also starts Kodi, including under dash and busybox ash. After the player is running, Ctrl+C belongs to the player.
 
@@ -94,7 +96,7 @@ Pass `-DCMAKE_CXX_COMPILER=g++` when `c++` on the PATH is not g++.
 
 ## Tests
 
-`layout_engine_tests` is the layout unit-test binary. CTest registers it as `layout_engine`. The same `ctest` run also executes `stream_manager_test`, `mqtt_smoke_test`, `software_renderer_tests`, and `scripts/test-launch-coreelec.sh` (a stand-in for the CoreELEC launch script: bash, dash, and busybox ash when busybox is installed). When the FFmpeg libraries are present it also runs `ffmpeg_decoder_tests`, and when the player dependencies are present it runs `present_smoke_test`.
+`layout_engine_tests` is the layout unit-test binary. CTest registers it as `layout_engine`. The same `ctest` run also executes `stream_manager_test`, `mqtt_smoke_test`, `software_renderer_tests`, `stream_player_test`, and `scripts/test-launch-coreelec.sh` (a stand-in for the CoreELEC launch script: bash, dash, and busybox ash when busybox is installed). When the FFmpeg libraries are present it also runs `ffmpeg_decoder_tests` and `stream_player_http`, and when the player dependencies are present it runs `present_smoke_test`.
 
 ```bash
 cmake -S . -B build -DCMAKE_CXX_COMPILER=g++

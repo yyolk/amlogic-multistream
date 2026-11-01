@@ -1,12 +1,21 @@
 #include "mqtt_controller.h"
+
+#include "ffmpeg_decoder.h"
 #include "mqtt_commands.h"
 #include "mqtt_json.h"
+#include "software_renderer.h"
+#include "stream_player.h"
 
 #include <mosquitto.h>
 
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <exception>
 #include <iostream>
+#include <memory>
 #include <pthread.h>
 
 namespace {
@@ -43,9 +52,57 @@ void stripTrailingSlashes(std::string& prefix) {
     }
 }
 
+// SoftwareRenderer rejects sides above 8192. Match that here so a bad flag
+// fails before the broker connect.
+constexpr int kMaxViewportSide = 8192;
+
+// Pause between decode ticks while waiting for SIGINT/SIGTERM. Signals are
+// blocked process-wide and delivered here, same as the old sigwait, so the
+// mosquitto thread does not race the handler.
+constexpr long kTickWaitNs = 20L * 1000L * 1000L;
+
+bool parseViewport(const std::string& text, int& width, int& height) {
+    const auto lower = text.find('x');
+    const auto upper = text.find('X');
+    if ((lower == std::string::npos) == (upper == std::string::npos)) {
+        return false;
+    }
+    const auto pos = lower == std::string::npos ? upper : lower;
+    if (pos == 0 || pos + 1 >= text.size()) {
+        return false;
+    }
+    const std::string widthText = text.substr(0, pos);
+    const std::string heightText = text.substr(pos + 1);
+    try {
+        size_t used = 0;
+        const int w = std::stoi(widthText, &used);
+        if (used != widthText.size()) {
+            return false;
+        }
+        used = 0;
+        const int h = std::stoi(heightText, &used);
+        if (used != heightText.size()) {
+            return false;
+        }
+        if (w < 1 || h < 1 || w > kMaxViewportSide || h > kMaxViewportSide) {
+            return false;
+        }
+        width = w;
+        height = h;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 }  // namespace
 
-MqttController::MqttController(StreamManager& manager) : manager_(manager) {}
+MqttController::MqttController(StreamManager& manager) : manager_(manager) {
+    static_assert(StreamPlayer::kDefaultViewportWidth == 1280, "MQTT default viewport width");
+    static_assert(StreamPlayer::kDefaultViewportHeight == 720, "MQTT default viewport height");
+    config_.viewportWidth = StreamPlayer::kDefaultViewportWidth;
+    config_.viewportHeight = StreamPlayer::kDefaultViewportHeight;
+}
 
 MqttController::~MqttController() {
     shutdown();
@@ -59,6 +116,16 @@ int MqttController::start(int argc, char* argv[]) {
     }
     if (configError_) {
         printUsage();
+        return 1;
+    }
+
+    SoftwareRenderer renderer(config_.renderDir);
+    StreamPlayer player(
+        manager_, renderer,
+        []() -> std::unique_ptr<DecoderBackend> { return std::make_unique<FfmpegDecoder>(); },
+        config_.viewportWidth, config_.viewportHeight);
+    if (!player.init()) {
+        std::cerr << "Software presenter init failed\n";
         return 1;
     }
 
@@ -124,20 +191,33 @@ int MqttController::start(int argc, char* argv[]) {
     }
     loopStarted_ = true;
 
-    std::cout << "MQTT running. Commands on " << config_.prefix
-              << "/cmd/# . Waiting for SIGINT or SIGTERM.\n";
+    std::cout << "MQTT running. Software decode ticks on this thread; broker I/O stays on the "
+                 "mosquitto thread. Commands on "
+              << config_.prefix << "/cmd/# . Waiting for SIGINT or SIGTERM.\n";
     std::cout << "This build does not start DRM/KMS or Amlogic hardware decode.\n";
 
-    int sig = 0;
-    if (sigwait(&signals, &sig) != 0) {
-        std::cerr << "sigwait failed\n";
-        shutdown();
-        return 1;
+    while (true) {
+        player.tick(playing_.load());
+
+        timespec timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = kTickWaitNs;
+        const int sig = sigtimedwait(&signals, nullptr, &timeout);
+        if (sig > 0) {
+            std::cout << "MQTT shutting down on signal " << sig << "\n";
+            break;
+        }
+        if (sig < 0 && errno != EAGAIN && errno != EINTR) {
+            std::cerr << "sigtimedwait failed: " << std::strerror(errno) << "\n";
+            player.closeAll();
+            shutdown();
+            return 1;
+        }
     }
 
-    std::cout << "MQTT shutting down on signal " << sig << "\n";
-    const std::string offline =
-        buildStatusJson(false, false, manager_.layout(), manager_.layoutSetting(), manager_.list());
+    player.closeAll();
+    const std::string offline = buildStatusJson(false, playing_.load(), manager_.layout(),
+                                                manager_.layoutSetting(), manager_.list());
     publishRaw(statusTopic, offline, true);
     shutdown();
     return 0;
@@ -193,6 +273,21 @@ void MqttController::loadConfig(int argc, char* argv[]) {
             take(config_.password);
         } else if (arg == "--mqtt-client-id") {
             take(config_.clientId);
+        } else if (arg == "--viewport") {
+            if (i + 1 >= argc || !argv[i + 1]) {
+                std::cerr << "Missing value for --viewport\n";
+                configError_ = true;
+            } else if (!parseViewport(argv[++i], config_.viewportWidth, config_.viewportHeight)) {
+                std::cerr << "Invalid --viewport (expected WxH, for example 1280x720)\n";
+                configError_ = true;
+            }
+        } else if (arg == "--render-dir") {
+            if (i + 1 >= argc || !argv[i + 1] || argv[i + 1][0] == '\0') {
+                std::cerr << "--render-dir requires a directory\n";
+                configError_ = true;
+            } else {
+                config_.renderDir = argv[++i];
+            }
         }
     }
 
@@ -229,10 +324,16 @@ void MqttController::printUsage() const {
         << "  --mqtt-user USER\n"
         << "  --mqtt-pass PASS\n"
         << "  --mqtt-client-id ID\n"
+        << "  --viewport WxH       software viewport (default 1280x720)\n"
+        << "  --render-dir DIR     write PPM frames (default off)\n"
         << "  -h, --help\n"
         << "\n"
-        << "The process connects, subscribes to <prefix>/cmd/#, and runs until\n"
-        << "SIGINT or SIGTERM. DRM/KMS and Amlogic hardware decode are not started.\n"
+        << "The process connects, subscribes to <prefix>/cmd/#, and software-decodes\n"
+        << "added http:// and https:// streams into a SoftwareRenderer viewport until\n"
+        << "SIGINT or SIGTERM. Broker I/O runs on a background thread. start/play\n"
+        << "opens decoders and presents; stop closes them. restart with an id\n"
+        << "reopens that decoder. An unknown id does not restart other streams.\n"
+        << "DRM/KMS and Amlogic hardware decode are not started.\n"
         << "Command schema: docs/mqtt.md\n";
 }
 
@@ -266,7 +367,9 @@ void MqttController::handleMessage(const std::string& topic, const std::string& 
     }
 
     const std::string command = resolveCommandName(routed, body);
-    const CommandOutcome outcome = executeCommand(manager_, playing_, command, body);
+    bool playing = playing_.load();
+    const CommandOutcome outcome = executeCommand(manager_, playing, command, body);
+    playing_.store(playing);
     publishRaw(config_.prefix + "/response",
                buildResponseJson(outcome.ok, outcome.command, outcome.id, outcome.message), false);
     if (outcome.publishStatus) {
@@ -278,7 +381,7 @@ void MqttController::handleMessage(const std::string& topic, const std::string& 
 
 void MqttController::publishStatus() {
     const std::string payload =
-        buildStatusJson(true, playing_, manager_.layout(), manager_.layoutSetting(), manager_.list());
+        buildStatusJson(true, playing_.load(), manager_.layout(), manager_.layoutSetting(), manager_.list());
     publishRaw(config_.prefix + "/status", payload, true);
 }
 

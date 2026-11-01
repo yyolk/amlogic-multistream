@@ -1,8 +1,10 @@
 # MQTT command control
 
-The player process connects to an MQTT broker, subscribes to command topics, and keeps an in-memory stream table. `start` / `stop` only flip a player-loop flag. Nothing in this build opens a decoder, a DRM/KMS device, or an Amlogic hardware plane.
+The player process connects to an MQTT broker, subscribes to command topics, and keeps an in-memory stream table. Broker I/O runs on the mosquitto thread. The main thread ticks software decode and present until SIGINT or SIGTERM, so the process is not blocked in `sigwait` with no decode loop.
 
-CoreELEC display takeover is still `scripts/launch-coreelec.sh` (stop Kodi, run this process, start Kodi). The process now stays in the foreground until it receives SIGINT or SIGTERM, so Kodi stays stopped for that whole time.
+`start` / `play` sets the player-loop flag. While it is set, each visible stream is opened with `FfmpegDecoder` (CPU, `isHardware()` false) and one YUV420P frame per tick is presented with `SoftwareRenderer` into the `LayoutEngine` cell for that stream. `stop` clears the flag, closes those decoders, and clears the RGB viewport. The stream table is kept, and MQTT stays connected. DRM/KMS and Amlogic hardware decode are not started.
+
+CoreELEC display takeover is still `scripts/launch-coreelec.sh` (stop Kodi, run this process, start Kodi). The process stays in the foreground until it receives SIGINT or SIGTERM, so Kodi stays stopped for that whole time.
 
 ## Broker
 
@@ -24,6 +26,17 @@ amlogic-multistream --mqtt-host 192.168.1.10 --mqtt-prefix living-room
 ```
 
 `--help` prints the same list and does not connect.
+
+Software present, only on this MQTT path (`--url` still sizes its viewport from the frame):
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--viewport WxH` | `1280x720` | RGB viewport. Each side must be 1..8192. |
+| `--render-dir DIR` | off | Write `frame-NNNNNN.ppm` (P6, the whole viewport) on each successful present. No directory means no files. |
+
+The presenter is always `SoftwareRenderer`. It does not open `/dev/dri`. `--renderer drm` is only valid with `--url`.
+
+The main thread pulls at most one frame from each visible stream, presents it, then waits about 20ms for SIGINT or SIGTERM. A read that blocks inside FFmpeg (the socket `rw_timeout` is 15s) delays the next tick and the signal until that read returns. Streams past the last layout cell are not opened. A failed open or a read that ends retries after one second; `restart` retries immediately.
 
 ## Topics
 
@@ -50,16 +63,16 @@ Publish either to `<prefix>/cmd/<command>` or to `<prefix>/cmd` with `"action"` 
 
 | Command | Payload | Effect |
 | --- | --- | --- |
-| `start`, `play` | none | Set the player-loop flag. MQTT stays connected. |
-| `stop` | none | Clear the player-loop flag. MQTT stays connected. |
-| `add` | `id`, `url` (strings) | Insert a stream. `url` must start with `http://` or `https://` (lowercase scheme). A NUL byte in the URL is rejected, and so is any other scheme (`file`, `tcp`, `pipe`, `concat`, …). The rejected URL is not stored. Same id and url again is success (`already present`). Same id with a different url is rejected. |
-| `remove` | `id` | Remove that stream. |
+| `start`, `play` | none | Set the player-loop flag. On the next ticks, open a software decoder for each visible stream and present frames. MQTT stays connected. |
+| `stop` | none | Clear the player-loop flag, close decoders, and clear the viewport. The stream table stays. MQTT stays connected. Does not exit. |
+| `add` | `id`, `url` (strings) | Insert a stream. `url` must start with `http://` or `https://` (lowercase scheme). A NUL byte in the URL is rejected, and so is any other scheme (`file`, `tcp`, `pipe`, `concat`, …). The rejected URL is not stored, and the player will not open it. Same id and url again is success (`already present`) and does not reopen the decoder. Same id with a different url is rejected. While playing, the next tick opens the new stream. While stopped, it is stored until `start`. |
+| `remove` | `id` | Remove that stream and close its decoder. |
 | `list` | none | Republish `<prefix>/status`. The response message is `ok`. |
-| `layout` | `layout` optional | With no `layout` field, respond with the effective layout and do not change state. Otherwise store the token. `auto` picks a grid from the stream count (`1x1`, `1x2`, `2x2`, `2x3`, `3x3`). Any other non-empty string is stored and echoed back. |
-| `mute` | `id`, `muted` | Set mute for one stream. `muted` is a JSON bool, or the string `"true"` / `"false"`. |
-| `restart` | `id` optional | With `id`, ask that one stream to reconnect and keep its url and mute flag. Without `id`, do the same for every stream. No decoder is opened; the entry is the guidance a later player loop should clear and re-add. |
+| `layout` | `layout` optional | With no `layout` field, respond with the effective layout and do not change state. Otherwise store the token. `auto` picks a grid from the stream count (`1x1`, `1x2`, `2x2`, `2x3`, `3x3`). Any other non-empty string is stored and echoed back. A token `LayoutEngine` cannot parse stops present until it is replaced. Cells that lose a stream are cleared. |
+| `mute` | `id`, `muted` | Set mute for one stream. `muted` is a JSON bool, or the string `"true"` / `"false"`. There is no audio decoder, so mute does not change the picture. |
+| `restart` | `id` optional | With a non-empty string `id`, bump that stream's generation so the player closes and reopens its decoder. The url and mute flag stay. An unknown id fails with `stream not found` and does not restart any other stream. An empty id, or an id that is not a string (for example `true`), fails with `id is required` and also restarts nothing. Omitting `id` restarts every stream. A JSON `null` is not stored, so `"id": null` is the same as omitting `id`. |
 
-`stop` does not exit the process. Kill it with SIGINT or SIGTERM when Kodi should come back.
+`stop` does not exit the process. Kill it with SIGINT or SIGTERM when Kodi should come back. Send `start` (or `play`) after `add` before frames are presented. The examples below do that.
 
 ### Response
 
@@ -89,7 +102,7 @@ Published to `<prefix>/status` after a successful command that changes or report
 }
 ```
 
-`layout` is the effective grid. `layout_setting` is what was stored (`auto` or an explicit token). `streams` is insertion order. `playing` is the player-loop flag, not a decoder state.
+`layout` is the effective grid. `layout_setting` is what was stored (`auto` or an explicit token). `streams` is insertion order. `playing` is the player-loop flag: true means the main thread is decoding and presenting, false means decoders are closed.
 
 ## Examples
 
@@ -101,7 +114,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-`layout_engine` checks grid selection. `stream_manager_test` checks add, remove, list, mute, restart, and layout state. `mqtt_smoke_test` checks JSON parsing, topic routing, and command results. None of these open a socket or link libmosquitto. The `amlogic-multistream` player binary is configured only when FFmpeg, libmosquitto, and libdrm are all present.
+`layout_engine` checks grid selection. `stream_manager_test` checks add, remove, list, mute, restart generation, and layout state. `mqtt_smoke_test` checks JSON parsing, topic routing, and command results, including that an unknown or non-string restart id does not bump other streams. `stream_player_test` drives `StreamPlayer` with a fake decoder and `SoftwareRenderer`: add, play, present into layout cells, stop, and a one-id restart. None of these open a socket or link libmosquitto. `stream_player_http` is added when the FFmpeg libraries are present. It serves one MPEG-TS file on `127.0.0.1` and checks decode and present through the real `FfmpegDecoder`. It does not open a broker. The `amlogic-multistream` player binary is configured only when FFmpeg, libmosquitto, and libdrm are all present.
 
 With a broker and the app running:
 
@@ -110,6 +123,7 @@ mosquitto_sub -h localhost -t 'amlogic-multistream/#' -v
 
 mosquitto_pub -h localhost -t amlogic-multistream/cmd/add \
   -m '{"id":"cam1","url":"http://example/live.m3u8"}'
+mosquitto_pub -h localhost -t amlogic-multistream/cmd/start -m '{}'
 mosquitto_pub -h localhost -t amlogic-multistream/cmd/mute \
   -m '{"id":"cam1","muted":true}'
 mosquitto_pub -h localhost -t amlogic-multistream/cmd/layout \
@@ -117,7 +131,6 @@ mosquitto_pub -h localhost -t amlogic-multistream/cmd/layout \
 mosquitto_pub -h localhost -t amlogic-multistream/cmd/list -m '{}'
 mosquitto_pub -h localhost -t amlogic-multistream/cmd/restart \
   -m '{"id":"cam1"}'
-mosquitto_pub -h localhost -t amlogic-multistream/cmd/start -m '{}'
 mosquitto_pub -h localhost -t amlogic-multistream/cmd/stop -m '{}'
 mosquitto_pub -h localhost -t amlogic-multistream/cmd/remove \
   -m '{"id":"cam1"}'
@@ -129,9 +142,9 @@ mosquitto_pub -h localhost -t amlogic-multistream/cmd \
 
 ## Not in this build
 
-- Amlogic `multi_vdec` / hardware decode
+- Amlogic `multi_vdec` / hardware decode (`FfmpegDecoder::isHardware()` stays false; a backend that reports hardware is closed)
 - DRM/KMS modeset or a plane commit (the `DrmRenderer` hook **requires GS-King X / CoreELEC** and is not started on this path)
-- HLS demux, audio, or a real mute that reaches a decoder
-- TLS, HTTP control, and Home Assistant discovery payloads
+- Audio, or a mute flag that reaches a decoder
+- TLS to the broker, HTTP control, and Home Assistant discovery payloads
 
-`StreamManager` is the source of truth a later player loop can read. `--url` software decode and `SoftwareRenderer` are a separate path and do not start this controller.
+`StreamManager` is the table `StreamPlayer` reads. `--url` is still a separate one-shot decode and does not start this controller. The player does not set `FfmpegDecoder`'s local-file allowance; only `http://` and `https://` are opened from MQTT.

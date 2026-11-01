@@ -192,24 +192,29 @@ CommandOutcome executeCommand(StreamManager& streams, bool& playing, const std::
     }
 
     if (command == "restart") {
-        const std::string id = payload.getString("id");
-        if (id.empty()) {
-            const int count = streams.restartAll();
+        // A present id that is empty, non-string, or unknown must not fall
+        // through to restartAll(). Omitting the field restarts every stream.
+        if (payload.has("id")) {
+            const std::string id = payload.getString("id");
+            if (id.empty()) {
+                return fail(command, "", "id is required");
+            }
+            if (!streams.restartStream(id)) {
+                return fail(command, id, "stream not found");
+            }
             CommandOutcome out;
             out.ok = true;
             out.command = command;
-            out.message = "restarted " + std::to_string(count);
+            out.id = id;
+            out.message = "restart requested";
             out.publishStatus = true;
             return out;
         }
-        if (!streams.restartStream(id)) {
-            return fail(command, id, "stream not found");
-        }
+        const int count = streams.restartAll();
         CommandOutcome out;
         out.ok = true;
         out.command = command;
-        out.id = id;
-        out.message = "restart requested";
+        out.message = "restarted " + std::to_string(count);
         out.publishStatus = true;
         return out;
     }

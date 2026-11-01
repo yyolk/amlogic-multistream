@@ -1,5 +1,6 @@
 #include "software_renderer.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -231,6 +232,13 @@ bool SoftwareRenderer::present(const DecodedFrame& frame, const LayoutEngine::Re
     lastPpmPath_ = std::move(ppmPath);
     ++framesPresented_;
     return true;
+}
+
+void SoftwareRenderer::clearViewport() {
+    if (!ready_) {
+        return;
+    }
+    std::fill(pixels_.begin(), pixels_.end(), static_cast<uint8_t>(0));
 }
 
 void SoftwareRenderer::shutdown() {

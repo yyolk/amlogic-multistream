@@ -169,14 +169,26 @@ int main() {
 
     auto restartMissing = executeCommand(streams, playing, "restart", mustParse(R"({"id":"missing"})"));
     CHECK(!restartMissing.ok && restartMissing.message == "stream not found");
+    CHECK(streams.list()[0].restartGeneration == 0);
+    CHECK(streams.list()[1].restartGeneration == 0);
+    auto restartEmpty = executeCommand(streams, playing, "restart", mustParse(R"({"id":""})"));
+    CHECK(!restartEmpty.ok && restartEmpty.message == "id is required");
+    auto restartBool = executeCommand(streams, playing, "restart", mustParse(R"({"id":true})"));
+    CHECK(!restartBool.ok && restartBool.message == "id is required");
+    CHECK(streams.list()[0].restartGeneration == 0);
+    CHECK(streams.list()[1].restartGeneration == 0);
     streams.muteStream("cam1", true);
     auto restartOne = executeCommand(streams, playing, "restart", mustParse(R"({"id":"cam1"})"));
     CHECK(restartOne.ok && restartOne.message == "restart requested");
     CHECK(streams.list()[0].muted);
     CHECK(streams.list()[0].url == "http://example/a.m3u8");
+    CHECK(streams.list()[0].restartGeneration == 1);
+    CHECK(streams.list()[1].restartGeneration == 0);
     auto restartAll = executeCommand(streams, playing, "restart", mustParse("{}"));
     CHECK(restartAll.ok && restartAll.message == "restarted 2");
     CHECK(streams.list().size() == 2 && streams.list()[0].muted);
+    CHECK(streams.list()[0].restartGeneration == 2);
+    CHECK(streams.list()[1].restartGeneration == 1);
 
     auto listCmd = executeCommand(streams, playing, "list", mustParse(""));
     CHECK(listCmd.ok && listCmd.message == "ok" && listCmd.publishStatus);

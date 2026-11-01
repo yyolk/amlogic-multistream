@@ -75,6 +75,8 @@ int main() {
 
     CHECK(!streams.restartStream("missing"));
     CHECK(streams.list().size() == 2);
+    CHECK(streams.list()[0].restartGeneration == 0);
+    CHECK(streams.list()[1].restartGeneration == 0);
     CHECK(streams.muteStream("cam2", true));
     CHECK(streams.restartStream("cam2"));
     CHECK(streams.list().size() == 2);
@@ -82,10 +84,16 @@ int main() {
     CHECK(streams.list()[1].id == "cam2");
     CHECK(streams.list()[1].muted);
     CHECK(streams.list()[1].url == "http://example/b.m3u8");
+    CHECK(streams.list()[0].restartGeneration == 0);
+    CHECK(streams.list()[1].restartGeneration == 1);
+    CHECK(streams.addStream("cam2", "http://example/b.m3u8"));
+    CHECK(streams.list()[1].restartGeneration == 1);
     CHECK(streams.restartAll() == 2);
     CHECK(streams.list().size() == 2);
     CHECK(streams.list()[1].muted);
     CHECK(streams.list()[1].url == "http://example/b.m3u8");
+    CHECK(streams.list()[0].restartGeneration == 1);
+    CHECK(streams.list()[1].restartGeneration == 2);
 
     CHECK(!streams.removeStream("missing"));
     CHECK(streams.removeStream("cam1"));
