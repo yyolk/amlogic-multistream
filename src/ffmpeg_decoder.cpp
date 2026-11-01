@@ -172,9 +172,11 @@ std::string trimCopy(const std::string& s) {
     return s.substr(b, e - b);
 }
 
-// Same separators as FFmpeg 6.1.1 ff_parse_key_value: skip commas and
-// whitespace, quoted values may contain escapes, an unclosed quote takes
-// the rest of the string, duplicate keys last-win.
+// Same walk as FFmpeg 6.1.1 ff_parse_key_value: skip commas and
+// whitespace, then strchr('=') from that point so a bare token
+// swallows the next attribute (`NOTAKEY URI=` is one key). Quoted
+// values may contain escapes, an unclosed quote takes the rest,
+// duplicate exact keys last-win.
 struct HlsMediaAttrs {
     std::string type;
     std::string uri;
@@ -195,20 +197,12 @@ HlsMediaAttrs parseHlsMediaAttrs(const std::string& attrs) {
         if (i >= attrs.size()) {
             break;
         }
-        const size_t key_b = i;
-        while (i < attrs.size() && attrs[i] != '=' && attrs[i] != ',' &&
-               !std::isspace(static_cast<unsigned char>(attrs[i]))) {
-            ++i;
+        const size_t eq = attrs.find('=', i);
+        if (eq == std::string::npos) {
+            break;
         }
-        if (i >= attrs.size() || attrs[i] != '=') {
-            while (i < attrs.size() && attrs[i] != ',' &&
-                   !std::isspace(static_cast<unsigned char>(attrs[i]))) {
-                ++i;
-            }
-            continue;
-        }
-        const std::string key = attrs.substr(key_b, i - key_b);
-        ++i;
+        const std::string key = attrs.substr(i, eq - i);
+        i = eq + 1;
         std::string value;
         if (i < attrs.size() && attrs[i] == '"') {
             ++i;
@@ -241,7 +235,11 @@ HlsMediaAttrs parseHlsMediaAttrs(const std::string& attrs) {
 }
 
 // Same terminators as FFmpeg 6.1.1 ff_get_line: \n, \r, and \0. A \r\n
-// pair is one break. The terminator is not part of the line.
+// pair is one break. The terminator is not part of the line. Stored
+// length is capped at 4095 (ff_get_line(buf, MAX_URL_SIZE) with
+// MAX_URL_SIZE == 4096); the rest of the line is still consumed.
+constexpr size_t kFfGetLineMax = 4095;
+
 bool hlsNextLine(const std::string& text, size_t* pos, std::string* line) {
     if (pos == nullptr || line == nullptr || *pos >= text.size()) {
         return false;
@@ -255,7 +253,8 @@ bool hlsNextLine(const std::string& text, size_t* pos, std::string* line) {
         }
         ++i;
     }
-    *line = text.substr(start, i - start);
+    const size_t raw = i - start;
+    *line = text.substr(start, raw > kFfGetLineMax ? kFfGetLineMax : raw);
     if (i < text.size()) {
         const char c = text[i];
         ++i;
@@ -516,9 +515,10 @@ bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AV
             seen.push_back(resolved);
             continue;
         }
-        // http(s) peek failed (TLS close, reset, empty after error): the
-        // next avformat_open_input can still get a master. Refuse instead.
-        if (urlIsRemoteHttp(*url) && (prev.open_error || prev.body.empty())) {
+        // Bytes then error (short read + RST, TLS close, empty after
+        // error): the next avformat_open_input can still get a master.
+        if (prev.read_error ||
+            (urlIsRemoteHttp(*url) && (prev.open_error || prev.body.empty()))) {
             return false;
         }
         if (firstLineIsExtm3u(prev.body) || prev.mpegurl) {

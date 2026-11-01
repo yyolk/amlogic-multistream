@@ -138,6 +138,14 @@ bool ppmLooksValid(const std::filesystem::path& path) {
            std::filesystem::file_size(path) > 32;
 }
 
+void rstClose(int fd) {
+    linger lin{};
+    lin.l_onoff = 1;
+    lin.l_linger = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+    ::close(fd);
+}
+
 void sendAll(int fd, const char* data, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -301,6 +309,17 @@ struct LocalHttp {
                     "Connection: close\r\n\r\nX";
                 sendAll(client, stub, std::char_traits<char>::length(stub));
                 ::close(client);
+                continue;
+            }
+        }
+        if (ok && rel == "partial.m3u8") {
+            static int partial_hits = 0;
+            if (partial_hits++ == 0) {
+                const char* stub =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n"
+                    "Content-Type: video/mp2t\r\nConnection: close\r\n\r\nX";
+                sendAll(client, stub, std::char_traits<char>::length(stub));
+                rstClose(client);
                 continue;
             }
         }
@@ -1031,6 +1050,83 @@ int main() {
                 return 1;
             }
 
+            const std::filesystem::path notakeyUri = tmp.path() / "d4-notakey-uri.m3u8";
+            const std::filesystem::path notakeyType = tmp.path() / "d4-notakey-type.m3u8";
+            const std::filesystem::path notakeyExtinf = tmp.path() / "d4-notakey-extinf.m3u8";
+            const std::filesystem::path overlong = tmp.path() / "d4-overlong.m3u8";
+            {
+                std::ofstream(notakeyUri)
+                    << "#EXTM3U\n"
+                    << "#EXT-X-VERSION:4\n"
+                    << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                    << audioHls.filename().string() << "\",NOTAKEY URI=\"\"\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                    << videoHls.filename().string() << "\n";
+                std::ofstream(notakeyType)
+                    << "#EXTM3U\n"
+                    << "#EXT-X-VERSION:4\n"
+                    << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                    << audioHls.filename().string() << "\",NOTAKEY TYPE=VIDEO\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                    << videoHls.filename().string() << "\n";
+                std::ofstream(notakeyExtinf)
+                    << "#EXTM3U\n"
+                    << "#EXT-X-VERSION:4\n"
+                    << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                    << audioHls.filename().string() << "\",NOTAKEY URI=\"\"\n"
+                    << "#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                    << "#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n"
+                    << "#EXT-X-ENDLIST\n";
+                std::string media =
+                    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"";
+                media += audioHls.filename().string();
+                media += "\",PAD=";
+                if (media.size() < 4095) {
+                    media.append(4095 - media.size(), 'x');
+                }
+                media += ",TYPE=VIDEO,URI=\"\"";
+                std::string longBody = "#EXTM3U\n#EXT-X-VERSION:4\n";
+                longBody += media;
+                longBody += "\n#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n";
+                longBody += videoHls.filename().string();
+                longBody += '\n';
+                std::ofstream(overlong, std::ios::binary) << longBody;
+                std::ifstream src(notakeyUri);
+                std::ofstream(tmp.path() / "notakey-http.m3u8") << src.rdbuf();
+                std::ifstream masterSrc(masterAudio);
+                std::ofstream(tmp.path() / "partial.m3u8") << masterSrc.rdbuf();
+            }
+            long nkUriRss = 0;
+            const int nkUriRc =
+                run({player, "--url", notakeyUri.string(), "--frames", "1"}, out, err, &nkUriRss);
+            if (!d4MustStayCapped("NOTAKEY URI=", nkUriRc, nkUriRss, readFile(out), readFile(err),
+                                  true)) {
+                return 1;
+            }
+            long nkTypeRss = 0;
+            const int nkTypeRc =
+                run({player, "--url", notakeyType.string(), "--frames", "1"}, out, err, &nkTypeRss);
+            if (!d4MustStayCapped("NOTAKEY TYPE=VIDEO", nkTypeRc, nkTypeRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+            long nkExtRss = 0;
+            const int nkExtRc =
+                run({player, "--url", notakeyExtinf.string(), "--frames", "1"}, out, err, &nkExtRss);
+            if (!d4MustStayCapped("NOTAKEY URI= EXTINF media", nkExtRc, nkExtRss, readFile(out),
+                                  readFile(err), false)) {
+                return 1;
+            }
+            long overRss = 0;
+            const int overRc =
+                run({player, "--url", overlong.string(), "--frames", "1"}, out, err, &overRss);
+            if (!d4MustStayCapped("overlong MEDIA line", overRc, overRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+
             // Extensionless HTTP URL, Content-Type mpegurl. The first peek
             // only ran for .m3u8 / hls+.
             const std::filesystem::path extless = tmp.path() / "playlist";
@@ -1097,8 +1193,28 @@ int main() {
             const int garbageRc =
                 run({player, "--url", httpBase + "/garbage.m3u8", "--frames", "1"}, out, err,
                     &garbageRss);
-            d4http.stop();
             if (!d4MustStayCapped("mpegurl body X", garbageRc, garbageRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long nkHttpRss = 0;
+            const int nkHttpRc =
+                run({player, "--url", httpBase + "/notakey-http.m3u8", "--frames", "1"}, out, err,
+                    &nkHttpRss);
+            if (!d4MustStayCapped("NOTAKEY URI= HTTP", nkHttpRc, nkHttpRss, readFile(out),
+                                  readFile(err), true)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long partialRss = 0;
+            const int partialRc =
+                run({player, "--url", httpBase + "/partial.m3u8", "--frames", "1"}, out, err,
+                    &partialRss);
+            d4http.stop();
+            if (!d4MustStayCapped("partial peek reset", partialRc, partialRss, readFile(out),
                                   readFile(err), false)) {
                 return 1;
             }

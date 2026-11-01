@@ -311,6 +311,14 @@ bool safeRelative(const std::string& url, std::filesystem::path& rel) {
     return true;
 }
 
+void rstClose(int fd) {
+    linger lin{};
+    lin.l_onoff = 1;
+    lin.l_linger = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+    ::close(fd);
+}
+
 void sendAll(int fd, const char* data, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -382,6 +390,17 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
             if (garbage_hits++ == 0) {
                 sendResponse(client, 200, "X", "application/vnd.apple.mpegurl");
                 ::close(client);
+                continue;
+            }
+        }
+        if (ok && rel == "partial.m3u8") {
+            static int partial_hits = 0;
+            if (partial_hits++ == 0) {
+                const char* stub =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n"
+                    "Content-Type: video/mp2t\r\nConnection: close\r\n\r\nX";
+                sendAll(client, stub, std::char_traits<char>::length(stub));
+                rstClose(client);
                 continue;
             }
         }
@@ -1154,6 +1173,68 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
     writeD4Master(dir / "d4-streaminf-cr-media.m3u8", std::string(1, '\r'), true);
     testDecode((dir / "d4-streaminf-cr-media.m3u8").string());
 
+    g_case = "hls NOTAKEY URI= presents small stream";
+    {
+        std::ofstream playlist(dir / "d4-notakey-uri.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\",NOTAKEY URI=\"\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-notakey-uri.m3u8").string());
+
+    g_case = "hls NOTAKEY TYPE=VIDEO presents small stream";
+    {
+        std::ofstream playlist(dir / "d4-notakey-type.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\",NOTAKEY TYPE=VIDEO\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-notakey-type.m3u8").string());
+
+    g_case = "hls NOTAKEY URI= EXTINF media refuses";
+    {
+        std::ofstream playlist(dir / "d4-notakey-extinf.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\",NOTAKEY URI=\"\"\n"
+                 << "#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                 << "#EXTINF:0.400,\n"
+                 << smallPmt.filename().string() << "\n"
+                 << "#EXT-X-ENDLIST\n";
+    }
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open((dir / "d4-notakey-extinf.m3u8").string()));
+        decoder.close();
+    }
+
+    g_case = "hls overlong MEDIA line presents small stream";
+    {
+        std::string media = "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"";
+        media += d4audio.filename().string();
+        media += "\",PAD=";
+        if (media.size() < 4095) {
+            media.append(4095 - media.size(), 'x');
+        }
+        media += ",TYPE=VIDEO,URI=\"\"";
+        std::string body = "#EXTM3U\n#EXT-X-VERSION:4\n";
+        body += media;
+        body += "\n#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n";
+        body += d4video.filename().string();
+        body += '\n';
+        std::ofstream(dir / "d4-overlong.m3u8", std::ios::binary) << body;
+    }
+    testDecode((dir / "d4-overlong.m3u8").string());
+
     {
         std::ifstream src(d4master);
         std::ofstream(dir / "failpeek.m3u8") << src.rdbuf();
@@ -1161,6 +1242,14 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
     {
         std::ifstream src(d4master);
         std::ofstream(dir / "garbage.m3u8") << src.rdbuf();
+    }
+    {
+        std::ifstream src(d4master);
+        std::ofstream(dir / "partial.m3u8") << src.rdbuf();
+    }
+    {
+        std::ifstream src(dir / "d4-notakey-uri.m3u8");
+        std::ofstream(dir / "notakey-http.m3u8") << src.rdbuf();
     }
 
     g_case = "hls extensionless http master audio";
@@ -1203,6 +1292,12 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         FfmpegDecoder garbage;
         CHECK(!garbage.open(httpBase + "/garbage.m3u8"));
         garbage.close();
+        g_case = "hls NOTAKEY URI= http presents small stream";
+        openHttpSmall(httpBase + "/notakey-http.m3u8");
+        g_case = "hls partial peek reset refuses";
+        FfmpegDecoder partial;
+        CHECK(!partial.open(httpBase + "/partial.m3u8"));
+        partial.close();
     }
     server.stop();
 }
