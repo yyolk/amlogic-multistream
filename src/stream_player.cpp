@@ -2,9 +2,12 @@
 
 #include "layout_engine.h"
 
+#include <cstdio>
+#include <exception>
 #include <iostream>
 #include <new>
 #include <system_error>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -45,21 +48,6 @@ bool StreamPlayer::copyOwned(const DecodedFrame& src, OwnedFrame& dst) {
     return true;
 }
 
-StreamPlayer::Session::~Session() {
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        workerStop = true;
-    }
-    cv.notify_all();
-    if (decoder) {
-        decoder->abort();
-    }
-    if (worker.joinable()) {
-        worker.join();
-    }
-    decoder.reset();
-}
-
 StreamPlayer::StreamPlayer(StreamManager& streams,
                            SoftwareRenderer& renderer,
                            DecoderFactory factory,
@@ -73,6 +61,17 @@ StreamPlayer::StreamPlayer(StreamManager& streams,
 
 StreamPlayer::~StreamPlayer() {
     closeAll();
+    // A worker still inside getaddrinfo cannot be joined here. Process exit
+    // calls exitIfBusy() and _exit(0) before this destructor runs.
+    for (auto& worker : reaper_) {
+        if (worker && worker->thread.joinable()) {
+            worker->thread.join();
+        }
+        if (worker) {
+            releaseDecoder(*worker);
+        }
+    }
+    reaper_.clear();
 }
 
 bool StreamPlayer::init() {
@@ -101,64 +100,86 @@ bool StreamPlayer::urlAllowed(const std::string& url) {
     return url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0;
 }
 
-void StreamPlayer::requestStop(Session& session) {
+void StreamPlayer::requestStop(Worker& worker) {
     {
-        std::lock_guard<std::mutex> lock(session.mu);
-        session.workerStop = true;
+        std::lock_guard<std::mutex> lock(worker.mu);
+        worker.stop = true;
     }
-    session.cv.notify_all();
-    if (session.decoder) {
-        session.decoder->abort();
+    worker.cv.notify_all();
+    if (worker.decoder) {
+        worker.decoder->abort();
     }
 }
 
-void StreamPlayer::finishWorker(const std::string& id, Session& session) {
-    requestStop(session);
-    if (session.worker.joinable()) {
-        session.worker.join();
+void StreamPlayer::releaseDecoder(Worker& worker) {
+    if (!worker.decoder) {
+        return;
     }
-    const bool announced = session.announcedOpen;
-    session.announcedOpen = false;
-    session.workerRunning = false;
-    session.workerFailed = WorkerFail::None;
-    session.frameReady = false;
-    session.frame = OwnedFrame{};
-    session.workerStop = false;
-    if (session.decoder) {
-        if (announced) {
-            std::cout << "StreamPlayer close " << id << "\n";
+    if (worker.announcedOpen) {
+        std::cout << "StreamPlayer close " << worker.id << "\n";
+        worker.announcedOpen = false;
+    }
+    worker.decoder->close();
+    worker.decoder.reset();
+}
+
+void StreamPlayer::retireWorker(Session& session) {
+    if (!session.worker) {
+        return;
+    }
+    requestStop(*session.worker);
+    reaper_.push_back(std::move(session.worker));
+}
+
+void StreamPlayer::reapFinished() {
+    std::vector<std::unique_ptr<Worker>> pending;
+    for (auto& worker : reaper_) {
+        if (!worker) {
+            continue;
         }
-        session.decoder->close();
-        session.decoder.reset();
+        bool done = false;
+        {
+            std::lock_guard<std::mutex> lock(worker->mu);
+            done = worker->done;
+        }
+        if (!done) {
+            pending.push_back(std::move(worker));
+            continue;
+        }
+        if (worker->thread.joinable()) {
+            worker->thread.join();
+        }
+        releaseDecoder(*worker);
     }
+    reaper_ = std::move(pending);
 }
 
-void StreamPlayer::sessionLoop(Session* session, std::string id, std::string url) {
-    DecoderBackend* decoder = session->decoder.get();
+void StreamPlayer::sessionLoop(Worker* worker, const std::string& id, const std::string& url) {
+    DecoderBackend* decoder = worker->decoder.get();
     const bool opened = decoder != nullptr && decoder->open(url);
     const bool hardware = opened && decoder->isHardware();
     if (!opened || hardware) {
-        std::lock_guard<std::mutex> lock(session->mu);
-        if (!session->workerStop) {
-            session->workerFailed = hardware ? WorkerFail::Hardware : WorkerFail::Open;
+        std::lock_guard<std::mutex> lock(worker->mu);
+        if (!worker->stop) {
+            worker->failed = hardware ? WorkerFail::Hardware : WorkerFail::Open;
         }
-        session->cv.notify_all();
+        worker->cv.notify_all();
         return;
     }
     {
-        std::lock_guard<std::mutex> lock(session->mu);
-        if (session->workerStop) {
+        std::lock_guard<std::mutex> lock(worker->mu);
+        if (worker->stop) {
             return;
         }
-        session->announcedOpen = true;
+        worker->announcedOpen = true;
     }
     std::cout << "StreamPlayer open " << id << "\n";
 
     while (true) {
         {
-            std::unique_lock<std::mutex> lock(session->mu);
-            session->cv.wait(lock, [&] { return session->workerStop || !session->frameReady; });
-            if (session->workerStop) {
+            std::unique_lock<std::mutex> lock(worker->mu);
+            worker->cv.wait(lock, [&] { return worker->stop || !worker->frameReady; });
+            if (worker->stop) {
                 return;
             }
         }
@@ -168,68 +189,103 @@ void StreamPlayer::sessionLoop(Session* session, std::string id, std::string url
         OwnedFrame copy;
         const bool copied = got && copyOwned(frame, copy);
         {
-            std::lock_guard<std::mutex> lock(session->mu);
-            if (session->workerStop) {
+            std::lock_guard<std::mutex> lock(worker->mu);
+            if (worker->stop) {
                 return;
             }
             if (!copied) {
-                session->workerFailed = WorkerFail::Read;
-                session->cv.notify_all();
+                worker->failed = WorkerFail::Read;
+                worker->cv.notify_all();
                 return;
             }
-            session->frame = std::move(copy);
-            session->frameReady = true;
+            worker->frame = std::move(copy);
+            worker->frameReady = true;
         }
-        session->cv.notify_all();
+        worker->cv.notify_all();
     }
 }
 
 void StreamPlayer::startWorker(const StreamInfo& info, Session& session) {
-    if (session.worker.joinable()) {
-        finishWorker(info.id, session);
+    if (session.worker) {
+        retireWorker(session);
     }
     session.url = info.url;
     session.haveGeneration = true;
     session.appliedGeneration = info.restartGeneration;
     session.framesPresented = 0;
-    session.workerStop = false;
-    session.workerFailed = WorkerFail::None;
-    session.announcedOpen = false;
-    session.frameReady = false;
-    session.frame = OwnedFrame{};
-    session.decoder = factory_ ? factory_() : nullptr;
-    if (!session.decoder) {
+    auto worker = std::make_unique<Worker>();
+    worker->id = info.id;
+    worker->decoder = factory_ ? factory_() : nullptr;
+    if (!worker->decoder) {
         std::cerr << "StreamPlayer: open failed for " << info.id << "\n";
         session.backoff = true;
         session.retryAfter = std::chrono::steady_clock::now() + kRetryDelay;
-        session.workerRunning = false;
         return;
     }
-    Session* raw = &session;
+    Worker* raw = worker.get();
     const std::string url = info.url;
     const std::string id = info.id;
     try {
-        session.worker = std::thread([this, raw, url, id] { sessionLoop(raw, id, url); });
+        worker->thread = std::thread([this, raw, url, id] {
+            try {
+                sessionLoop(raw, id, url);
+            } catch (const std::exception& ex) {
+                std::cerr << "StreamPlayer: worker failed for " << id << ": " << ex.what() << "\n";
+            } catch (...) {
+                std::cerr << "StreamPlayer: worker failed for " << id << "\n";
+            }
+            {
+                std::lock_guard<std::mutex> lock(raw->mu);
+                raw->done = true;
+            }
+            raw->cv.notify_all();
+        });
     } catch (const std::system_error& ex) {
         std::cerr << "StreamPlayer: thread failed for " << id << ": " << ex.what() << "\n";
-        session.decoder->close();
-        session.decoder.reset();
+        worker->decoder->close();
+        worker->decoder.reset();
         session.backoff = true;
         session.retryAfter = std::chrono::steady_clock::now() + kRetryDelay;
-        session.workerRunning = false;
         return;
     }
-    session.workerRunning = true;
+    session.worker = std::move(worker);
 }
 
 void StreamPlayer::closeAll() {
     for (auto& entry : sessions_) {
-        requestStop(*entry.second);
-    }
-    for (auto& entry : sessions_) {
-        finishWorker(entry.first, *entry.second);
+        retireWorker(*entry.second);
     }
     sessions_.clear();
+    reapFinished();
+}
+
+bool StreamPlayer::drain(std::chrono::milliseconds deadline) {
+    const auto deadlineAt = std::chrono::steady_clock::now() + deadline;
+    while (true) {
+        reapFinished();
+        if (reaper_.empty()) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadlineAt) {
+            return false;
+        }
+        Worker& worker = *reaper_.front();
+        std::unique_lock<std::mutex> lock(worker.mu);
+        if (worker.done) {
+            continue;
+        }
+        worker.cv.wait_until(lock, deadlineAt, [&] { return worker.done; });
+    }
+}
+
+void StreamPlayer::exitIfBusy(std::chrono::milliseconds deadline) {
+    if (drain(deadline)) {
+        return;
+    }
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(nullptr);
+    _exit(0);
 }
 
 void StreamPlayer::dropMissing(const std::vector<StreamInfo>& streams) {
@@ -251,7 +307,7 @@ void StreamPlayer::dropMissing(const std::vector<StreamInfo>& streams) {
         if (it == sessions_.end()) {
             continue;
         }
-        finishWorker(id, *it->second);
+        retireWorker(*it->second);
         sessions_.erase(it);
     }
 }
@@ -281,6 +337,7 @@ int StreamPlayer::tick(bool playing) {
     if (!ready_) {
         return 0;
     }
+    reapFinished();
     if (!playing) {
         if (wasPlaying_) {
             closeAll();
@@ -336,18 +393,18 @@ int StreamPlayer::tick(bool playing) {
         Session& session = *it->second;
 
         if (i >= layout.tiles.size()) {
-            finishWorker(info.id, session);
+            retireWorker(session);
             continue;
         }
 
         const bool generationChanged =
             !session.haveGeneration || session.appliedGeneration != info.restartGeneration;
         const bool urlChanged = session.haveGeneration && session.url != info.url;
-        if (session.workerRunning && (generationChanged || urlChanged)) {
-            finishWorker(info.id, session);
+        if (session.worker && (generationChanged || urlChanged)) {
+            retireWorker(session);
         }
 
-        if (!session.workerRunning) {
+        if (!session.worker) {
             if (!generationChanged && !urlChanged && session.backoff && now < session.retryAfter) {
                 continue;
             }
@@ -370,21 +427,25 @@ int StreamPlayer::tick(bool playing) {
             startWorker(info, session);
         }
 
+        if (!session.worker) {
+            continue;
+        }
+
         OwnedFrame taken;
         bool haveFrame = false;
         WorkerFail failed = WorkerFail::None;
         {
-            std::lock_guard<std::mutex> lock(session.mu);
-            if (session.frameReady) {
-                taken = std::move(session.frame);
-                session.frameReady = false;
+            std::lock_guard<std::mutex> lock(session.worker->mu);
+            if (session.worker->frameReady) {
+                taken = std::move(session.worker->frame);
+                session.worker->frameReady = false;
                 haveFrame = true;
-            } else if (session.workerFailed != WorkerFail::None) {
-                failed = session.workerFailed;
+            } else if (session.worker->failed != WorkerFail::None) {
+                failed = session.worker->failed;
             }
         }
         if (haveFrame) {
-            session.cv.notify_all();
+            session.worker->cv.notify_all();
             const LayoutEngine::Rect& dest = layout.tiles[i].rect;
             const DecodedFrame view = taken.view();
             if (!renderer_.present(view, dest)) {
@@ -411,9 +472,10 @@ int StreamPlayer::tick(bool playing) {
         } else {
             std::cerr << "StreamPlayer: no frame from " << info.id << " (will retry)\n";
         }
-        finishWorker(info.id, session);
+        retireWorker(session);
         session.backoff = true;
         session.retryAfter = std::chrono::steady_clock::now() + kRetryDelay;
     }
+    reapFinished();
     return presented;
 }

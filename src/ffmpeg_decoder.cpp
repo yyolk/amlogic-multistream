@@ -70,6 +70,8 @@ FfmpegDecoder::~FfmpegDecoder() {
 // FFmpeg 6.1, interrupting that wait surfaces as EOF / AVERROR_EXIT and the
 // HLS demuxer does not deliver the next segment. Each stream therefore has
 // its own thread, and this callback is only the stop/shutdown latch.
+// tcp_open calls getaddrinfo before any of those waits. glibc does not
+// consult this callback there, and this player does not replace that lookup.
 int FfmpegDecoder::interruptCallback(void* opaque) {
     if (opaque == nullptr) {
         return 0;
