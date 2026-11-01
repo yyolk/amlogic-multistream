@@ -6,12 +6,29 @@ still refuses to scan out. Every hardware statement below **requires GS-King X
 / CoreELEC** to confirm; the ones marked *verify* have not been checked on a
 box and the design keeps a fallback for each.
 
-This proposes `AmlogicV4l2Decoder`, a second `DecoderBackend` beside
-`FfmpegDecoder`, that demuxes with libavformat, decodes through the kernel's
-V4L2 memory-to-memory stateful decoder, and hands DMA-BUF frames to
-`DrmRenderer` without a CPU copy. It is written against the interfaces in
-`src/decoder_backend.h`, `src/renderer.h`, `src/stream_player.h`, and the
-AUDIT4 / AUDIT5 / SURVIVING notes in those files.
+> **Correction (Path 5, 2026-11-01).** §§2–3 and §7 below were drafted as if
+> CoreELEC 22 ran mainline `meson-vdec` + `meson_drm`. Cross-check of
+> research drafts [#36](https://github.com/yyolk/amlogic-multistream/pull/36)–[#41](https://github.com/yyolk/amlogic-multistream/pull/41)
+> and [#43](https://github.com/yyolk/amlogic-multistream/pull/43) against the
+> current `main` interfaces shows both device images are the **vendor**
+> stack: CE21 = Amlogic-ng kernel **4.9** + `libamcodec`; CE22 = Amlogic-no
+> kernel **5.15** + `libamcodec`. CoreELEC's FFmpeg is built
+> `--disable-v4l2_m2m`. The vendor V4L2 M2M node (`aml-vcodec-dec`,
+> `/dev/video26`) exists in `media_modules-aml` source and may be loaded by
+> a boot script, but `CONFIG_AMLOGIC_MEDIA_V4L_DEC` is unset in the CE22
+> kernel config — presence on a GS-King X is Q1, not a given. Display on
+> the vendor kernel is `amvideo` + VFM (Kodi's path); vendor DRM
+> (`CONFIG_AMLOGIC_DRM`) may also exist on CE22 (Q3).
+>
+> The implementation-ready `DecoderBackend` contract, threading / reaper
+> proof, shape A vs B, stage-1 spike, host tests, and the ten blocking
+> questions are in [Appendix A](#appendix-a-decoderbackend-contract-path-5).
+> A coder should spike from the appendix, not from §§2–3.
+
+This first half proposes a V4L2-shaped backend beside `FfmpegDecoder`. It is
+written against `src/decoder_backend.h`, `src/renderer.h`,
+`src/stream_player.h`, and the AUDIT4 / AUDIT5 / SURVIVING notes. Treat it
+as background; Appendix A is the contract.
 
 ## 1. Constraints taken from the current design
 
@@ -65,13 +82,14 @@ useful as a bring-up probe on the box
 
 | | CoreELEC 21 Amlogic-ng (`coreelec21-ng-armv7hf`) | CoreELEC 22 Amlogic-no (`coreelec22-no-aarch64`) |
 | --- | --- | --- |
-| Kernel | Amlogic vendor 4.9 | Mainline-derived 6.x |
-| V4L2 decoder | Vendor `aml_vcodec_dec` ("multi_vdec" ports, several instances) — *verify* node name and instance cap | Staging `meson-vdec` (`drivers/staging/media/meson/vdec`) |
-| Codecs via V4L2 | H.264, HEVC, VP9, MPEG-1/2/4, MJPEG (vendor) — *verify* | MPEG-1/2, H.264, VP9 upstream; HEVC only with CoreELEC/LibreELEC patches — *verify* with `VIDIOC_ENUM_FMT` |
-| Capture pixel format | `NV21M` / `NV12M` with vendor "double write" controls — *verify* | `NV12M` (two DMA-BUFs) |
-| `V4L2_BUF_CAP_SUPPORTS_ORPHANED_BUFS` | No (pre-5.0 vb2) | Yes (vb2 sets it unconditionally since 5.0) |
-| DRM/KMS | Vendor kernel; CoreELEC-ng Kodi draws through fbdev + `/dev/amvideo`. Whether `/dev/dri/card0` exists with an atomic video plane is *verify*; likely **no** | Mainline `meson_drm`: `/dev/dri/card0`, atomic, one primary (OSD1) plane plus **one** video overlay plane (VD1) with NV12/NV21/YUV420 |
-| 32/64-bit | 32-bit userspace: build with `-D_FILE_OFFSET_BITS=64` so `mmap()` offsets from `VIDIOC_QUERYBUF` fit | 64-bit |
+| Kernel | Vendor `amlogic-4.9` (`KODI_VENDOR=amlogic-4.9`) | Vendor `amlogic-5.15` (`KODI_VENDOR=amlogic-5.15`). **Not** mainline `meson-vdec`. |
+| Kodi player | `KODIPLAYER_DRIVER=libamcodec` | `KODIPLAYER_DRIVER=libamcodec` |
+| Decode userspace | `libamcodec.so` (armhf tarball) → `/dev/amstream*` | `libamcodec.so` (aarch64 tarball) → `/dev/amstream*` |
+| Instance cap in tree | Patch 003: `MAX_INSTANCE_MUN` 9 → **2** | No `patches/`; header stays **9**. Running value is Q2. |
+| Vendor V4L2 M2M | `amvdec_ports` listed in `modules-load.d`; node `/dev/video26` if it registered | Same source; `CONFIG_AMLOGIC_MEDIA_V4L_DEC` unset in `linux.aarch64.conf`. Node presence is Q1. |
+| Display Kodi uses | fbdev OSD + `/dev/amvideo` + `/sys/class/vfm/map` | Same vendor path. `CONFIG_AMLOGIC_DRM` may also be on; plane inventory is Q3. |
+| FFmpeg in the image | 6.0.1, `--disable-v4l2_m2m` (v4l2 patches applied then compiled out) | 9.0.2, `--disable-v4l2_m2m` (v4l2 patches not applied) |
+| 32/64-bit | 32-bit ARM HF; `-D_FILE_OFFSET_BITS=64` if any `mmap` of V4L2 buffers | 64-bit aarch64 |
 
 The DRM handoff in §6 and §7 is designed against CE22. On CE21 the decoder
 half may work while the display half has no DRM device at all. That is a
@@ -197,7 +215,7 @@ probeDecoderNode(fourcc):
     if !(device_caps & V4L2_CAP_VIDEO_M2M_MPLANE): close; continue
     if fourcc not in ENUM_FMT(OUTPUT_MPLANE): close; continue
     if none of {NV12M, NV12, NV21M, NV21} in ENUM_FMT(CAPTURE_MPLANE): close; continue
-    close(fd); return node                         # "meson-vdec" on CE22; vendor name on CE21 (verify)
+    close(fd); return node                         # vendor aml-vcodec-dec if present (Q1); not mainline meson-vdec
   return none
 ```
 
@@ -710,22 +728,630 @@ Listed so the scope is visible. All are small; none is implemented here.
 | `CMakeLists.txt` | `option(AMLOGIC_V4L2_DECODE ... OFF)`; `src/amlogic_v4l2_decoder.cpp` compiled only when on; `-D_FILE_OFFSET_BITS=64` for the armv7hf target; the new unit test target. |
 | `scripts/build-coreelec-appimage.sh` | Stage 2 only: mesa/EGL in the link set if the GPU composer is chosen. |
 
-## 11. Open questions
+## 11. Open questions (superseded)
 
-1. CE21 (Amlogic-ng): does `/dev/dri/card0` exist with a usable video plane,
-   or is the display path `/dev/amvideo` + fbdev? If the latter, the
-   "multi_vdec" goal needs an `AmvideoRenderer`, and the token contract above
-   is what it would consume.
-2. HEVC on CE22: present in CoreELEC's `meson-vdec` build, or only H.264 /
-   MPEG-2 / VP9? Decides whether HEVC HLS falls back to the CPU.
-3. Capture format on each kernel: `NV12M` linear, or an AFBC/compressed
-   format that the video plane can scan out but a GPU composer cannot import
-   without the matching modifier.
-4. Instance cap and CMA budget for nine simultaneous decoders at the
-   variants the test streams actually serve.
-5. Whether `STREAMOFF` on the vendor driver can hang in practice, which
-   decides how much the `quiesce()` machinery matters versus being insurance.
-6. Presentation pacing: `tick()` presents whatever is ready every ~20ms with
-   no pts clock. Hardware decode makes the burstiness of HLS segments
-   visible on screen. A pts-paced present is a separate change; the token
-   design allows holding a frame until its time without blocking the decoder.
+The six questions that were here assumed a mainline CE22 decoder. They are
+replaced by the ten blocking probes in [Appendix A §A.6](#a6-open-questions-that-block-freezing-the-design).
+
+---
+
+# Appendix A. `DecoderBackend` contract (Path 5)
+
+Implementation-ready. Cross-checked against `origin/main` at `6d9d146`
+(`decoder_backend.h`, `stream_player.{h,cpp}`, `renderer.h`,
+`drm_renderer.{h,cpp}`, `mqtt_controller.cpp` after AUDIT5 #33/#34) and
+research drafts [#36](https://github.com/yyolk/amlogic-multistream/pull/36)
+(Kodi/`amcodec` history),
+[#37](https://github.com/yyolk/amlogic-multistream/pull/37) (CE21 vs CE22 ABI),
+[#38](https://github.com/yyolk/amlogic-multistream/pull/38) (9-stream limits),
+[#39](https://github.com/yyolk/amlogic-multistream/pull/39) (vendor SDK / `libamcodec`),
+[#40](https://github.com/yyolk/amlogic-multistream/pull/40) (vendor DRM + UVM),
+[#41](https://github.com/yyolk/amlogic-multistream/pull/41) (FFmpeg: no `v4l2m2m` in the image),
+[#43](https://github.com/yyolk/amlogic-multistream/pull/43) (code examples + three backend shapes).
+Nothing in this appendix is compiled. Do not edit `src/` from it until a
+spike lands.
+
+## A.0 What a coder is allowed to assume
+
+| Fact | Source on `main` | Do not break |
+| --- | --- | --- |
+| `open` / `close` / `readFrame` / `isHardware` are single-threaded; only `abort()` is cross-thread and it latches | `decoder_backend.h:40–47` | Hardware teardown that can sit in D state must not run on the tick thread. |
+| `close()` is invoked from `StreamPlayer::releaseDecoder` **after** `sessionLoop` returned and the worker was `join`ed (`reapFinished`) | `stream_player.cpp:116–125, 136–156` | `close()` on a hardware backend must be CPU-only once `quiesce()` has run. |
+| `tick()` never joins an in-flight `open`/`read`. A call that ignores `abort()` (getaddrinfo) stays on the reaper | `stream_player.h:26–34` | A wedged `codec_close` / `VIDIOC_STREAMOFF` is the same shape. |
+| Per-id restart waits for `reaperBusy(id)` (AUDIT4 A3). New opens wait while `busyRetiredCount() >= kMaxBusyRetired` (AUDIT5 F3). Bound is `kMaxStreams + kMaxBusyRetired - 1` = 17 | `stream_player.h:37–50`, `stream_player.cpp:444–459` | Hardware must add **no** threads and **no** new caps. |
+| MQTT exit after #34: `finishProcess` is `[[noreturn]]`. It `closeAll()`, publishes offline under `closeMu_`, `drain(2s)`, optional 500 ms DISCONNECT, then `_exit`. `exitIfBusy` has no production caller | `mqtt_controller.cpp:305–329`; AUDIT6 N4 | A wedged worker is abandoned by `_exit`. Do not put `codec_close` / `STREAMOFF` on this thread either — it would miss the 2 s bound the way the pre-#34 MQTT join did (AUDIT5 X1). |
+| `isHardware()` is a hard refuse (`WorkerFail::Hardware`) in `sessionLoop` and in `decodeUrl` | `stream_player.cpp:189–196`; `app.cpp:187–191` | Flip only through `Renderer::accepts`. |
+| Headers stay free of FFmpeg and libdrm types | `decoder_backend.h:14`, `renderer.h:10` | DMA-BUF description is plain ints. |
+| `FfmpegDecoder` stays software. `prepareAmlogicHwaccel` stays a no-op | `ffmpeg_decoder.cpp:55–67` | New class, new file. |
+| CE22 is vendor 5.15 + `libamcodec`, not mainline `meson-vdec` | #37, #39, #41, #43 | Stage-1 spike is shape A. Shape B is conditional on Q1. |
+
+## A.1 Precise API delta (proposed headers, doc only)
+
+Current `FramePixelFormat` is `{Unknown, Yuv420p}`. Current `DecoderBackend`
+has `open` / `close` / `isHardware` / `abort` / default-false `readFrame`.
+Current `Renderer` has `init` / `present` / `shutdown`. Current
+`StreamPlayer` is constructed with `SoftwareRenderer&` and copies YUV bytes
+into `OwnedFrame`.
+
+The delta is three virtuals (`quiesce`, `accepts`, `commit`), one promoted
+method (`clearViewport`), two formats, and a token. Defaults keep every
+existing test green.
+
+### A.1.1 `src/decoder_backend.h` (proposed whole file)
+
+```cpp
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+
+constexpr int64_t kDecodedFrameNoPts = INT64_MIN;
+
+// CPU image (Yuv420p) or a DMA-BUF image (DrmPrime) or a heartbeat from a
+// backend that presents through the kernel video layer (SelfPresented).
+//
+// Yuv420p: plane pointers owned by the DecoderBackend. Valid until the next
+// readFrame() or close() on that instance. A renderer that needs the bytes
+// longer must copy them.
+//
+// DrmPrime: data[] are null. drm and hold describe the image. hold keeps
+// the capture slot out of the decoder queue until the last copy is dropped,
+// on any thread. The decoder must not VIDIOC_QBUF (or equivalent) that slot
+// until then.
+//
+// SelfPresented: data[] are null, hold is empty, width/height/pts may be
+// filled from codec_get_vdec_info so tick() can count a live tile. The
+// kernel video layer is already showing the picture.
+enum class FramePixelFormat {
+    Unknown = 0,
+    Yuv420p,
+    DrmPrime,
+    SelfPresented,
+};
+
+// Plain-int DMA-BUF description. fourcc/modifier use the DRM numeric
+// values (DRM_FORMAT_NV12 == 0x3231564E, DRM_FORMAT_MOD_LINEAR == 0) so
+// this header does not include libdrm. fd[i] are dup()'ed descriptors
+// owned by DecodedFrame::hold; the receiver must not close them.
+struct DrmPrimeDesc {
+    static constexpr int kMaxPlanes = 4;
+    int num_planes = 0;
+    int fd[kMaxPlanes] = {-1, -1, -1, -1};
+    uint32_t offset[kMaxPlanes] = {};
+    uint32_t pitch[kMaxPlanes] = {};
+    uint32_t fourcc = 0;
+    uint64_t modifier = 0;
+    enum class Matrix { Bt601, Bt709, Bt2020 };
+    enum class Range { Limited, Full };
+    Matrix matrix = Matrix::Bt709;
+    Range range = Range::Limited;
+    // Stable identity for GEM-handle caching:
+    // (decoder_instance_id << 32) | (capture_generation << 16) | index.
+    uint64_t buffer_id = 0;
+};
+
+struct DecodedFrame {
+    const uint8_t* data[4] = {};
+    int linesize[4] = {};
+    int width = 0;
+    int height = 0;
+    FramePixelFormat format = FramePixelFormat::Unknown;
+    int64_t pts = kDecodedFrameNoPts;
+    int time_base_num = 0;
+    int time_base_den = 0;
+    DrmPrimeDesc drm;
+    // Lifetime token. Empty for Yuv420p and SelfPresented.
+    std::shared_ptr<const void> hold;
+};
+
+// Demux/decode backend. close() must be safe to call more than once,
+// including after a failed open().
+//
+// open(), close(), readFrame(), isHardware(), and quiesce() run on one
+// thread and must not be called concurrently with each other. abort() is
+// the exception: a different thread may call it while open() or
+// readFrame() is blocked. abort() latches for the life of the object.
+// The in-flight open() or readFrame() then returns, and a later open()
+// or readFrame() fails without blocking.
+//
+// close() runs after that call has returned, on the thread that owns the
+// session. Under StreamPlayer that is the tick thread, after reapFinished()
+// joined. A libc call that ignores abort() (getaddrinfo) and a driver call
+// that ignores abort() (codec_close, VIDIOC_STREAMOFF) do not return until
+// the call itself finishes — those calls belong in quiesce(), on the
+// worker, never in close() on the tick thread.
+class DecoderBackend {
+public:
+    virtual ~DecoderBackend() = default;
+    virtual bool open(const std::string& url) = 0;
+    virtual void close() = 0;
+    virtual bool isHardware() const = 0;
+
+    // Unblock an in-flight open() or readFrame(). Safe from another thread
+    // and safe more than once. Default is a no-op.
+    virtual void abort() {}
+
+    // Release the device on the session thread before close() runs
+    // elsewhere. StreamPlayer calls this from a destructor guard in
+    // sessionLoop, after abort(), on every exit path, never concurrently
+    // with open() or readFrame(). May block in the driver; that is why it
+    // is here. After a completed quiesce(), close() must not block.
+    // Default is a no-op so FfmpegDecoder stays unchanged.
+    virtual void quiesce() {}
+
+    // Format this instance will produce after a successful open().
+    // Default Yuv420p matches FfmpegDecoder. A hardware backend returns
+    // DrmPrime or SelfPresented so the gate in sessionLoop can ask the
+    // renderer before the first readFrame().
+    virtual FramePixelFormat outputFormat() const {
+        return FramePixelFormat::Yuv420p;
+    }
+
+    // Pull one decoded video frame.
+    // true  -> frame is filled. For Yuv420p, plane pointers stay valid
+    //          until the next readFrame() or close(). For DrmPrime, the
+    //          image stays valid while hold is alive. For SelfPresented,
+    //          width/height/pts are informational.
+    // false -> end of stream or a hard error. frame is left zeroed.
+    virtual bool readFrame(DecodedFrame& frame) {
+        frame = DecodedFrame{};
+        return false;
+    }
+};
+```
+
+### A.1.2 `src/renderer.h` (proposed whole file)
+
+```cpp
+#pragma once
+
+#include "decoder_backend.h"
+#include "layout_engine.h"
+
+// Presents one frame into a layout cell, or (SelfPresented) records that
+// the decoder already showed it.
+//
+// Implementations that consume Yuv420p copy plane bytes during present().
+// Implementations that consume DrmPrime take a copy of DecodedFrame::hold
+// and must drop it when the FB is no longer on screen or pending. This
+// header does not include FFmpeg or libdrm types.
+//
+// The caller places the stream. LayoutEngine::compute() supplies dest.
+// One present() draws one stream. Unused cells stay untouched.
+//
+// init() prepares a viewport. shutdown() releases it and is safe more
+// than once. Not thread-safe: tick thread only.
+class Renderer {
+public:
+    virtual ~Renderer() = default;
+
+    virtual bool init(int viewportWidth, int viewportHeight) = 0;
+    virtual bool present(const DecodedFrame& frame, const LayoutEngine::Rect& dest) = 0;
+    virtual void shutdown() = 0;
+
+    // Hardware gate. SoftwareRenderer keeps the default (Yuv420p only),
+    // so StreamPlayer's existing "refusing hardware decoder" test stays
+    // green. DrmRenderer returns true for DrmPrime. An AmvideoRenderer
+    // returns true for SelfPresented.
+    virtual bool accepts(FramePixelFormat format) const {
+        return format == FramePixelFormat::Yuv420p;
+    }
+
+    // Wall-level transaction. StreamPlayer calls this once per tick after
+    // the tile loop. SoftwareRenderer ignores it. DrmRenderer submits one
+    // non-blocking atomic commit for every staged tile.
+    virtual void commit() {}
+
+    // Drop every retained token / RGB cell. Safe more than once. No-op
+    // before init(). StreamPlayer already calls SoftwareRenderer's method
+    // of this name on stop and topology change; promoting it is the only
+    // way a hardware renderer can release on-screen FBs.
+    virtual void clearViewport() {}
+};
+```
+
+### A.1.3 `StreamPlayer` / `OwnedFrame` / `sessionLoop` (proposed delta, not applied)
+
+`StreamPlayer` is constructed with `Renderer&`, not `SoftwareRenderer&`.
+`OwnedFrame` gains `FramePixelFormat format`, `DrmPrimeDesc drm`, and
+`std::shared_ptr<const void> hold`. `copyOwned` becomes `takeOwned`:
+
+```
+takeOwned(src, dst):
+  if src.format == Yuv420p: copy the three planes as today; dst.hold = {}
+  if src.format == DrmPrime:
+      if src.hold is empty or src.drm.num_planes < 1: return false
+      dst.drm = src.drm; dst.hold = src.hold; dst.planes stay empty
+  if src.format == SelfPresented:
+      dst.width/height/pts/time_base = src; dst.hold = {}; dst.planes empty
+  dst.format = src.format
+  return true
+```
+
+`sessionLoop` (only the changed bits):
+
+```
+sessionLoop(worker, id, url):
+  decoder = worker->decoder.get()
+  struct QuiesceOnExit {
+      DecoderBackend* d;
+      ~QuiesceOnExit() { if (d) d->quiesce(); }     // worker thread, every path
+  } guard{decoder};
+
+  opened = decoder && decoder->open(url)
+  if !opened: set failed=Open unless stop; return
+  if !renderer.accepts(decoder->outputFormat()):    // replaces isHardware() refuse
+      set failed=Hardware unless stop; return       // SoftwareRenderer still refuses DrmPrime/SelfPresented
+  announcedOpen = true
+  loop:
+      wait until stop || !frameReady
+      if stop: return
+      got = decoder->readFrame(frame)
+      if stop: return                               // drop frame (token dtor → mailbox)
+      if !takeOwned(frame, copy): failed=Read; return
+      worker->frame = move(copy); frameReady = true
+```
+
+`tick()` after the tile loop calls `renderer_.commit()`.
+`requestStop` is unchanged: `stop=true`, `cv.notify`, `decoder->abort()`
+only — no ioctl, no `codec_close`, no `STREAMOFF`.
+
+`releaseDecoder` is unchanged in *shape*: it still calls `close()` on the
+tick thread after `join`. The contract is that `close()` after `quiesce()`
+does not touch the device.
+
+`WorkerFail::Hardware` message stays
+`"refusing hardware decoder for <id> (requires GS-King X / CoreELEC)"`
+when the renderer rejects the format. That keeps
+`tests/stream_player_test.cpp:785–798` (`stats->hardware.store(true)` plus
+a `SoftwareRenderer`) passing if the fake's `outputFormat()` is `DrmPrime`
+or `SelfPresented`. A fake that reports `isHardware()` true and
+`outputFormat() == Yuv420p` against a software renderer is accepted — that
+is the CPU-copy fallback of shape A.
+
+### A.1.4 What does **not** change
+
+- `abort()` signature and latch rule.
+- `FfmpegDecoder` (default `quiesce` / `outputFormat` / `accepts`).
+- `kMaxBusyRetired`, `reaperBusy`, `busyRetiredCount`, `kExitJoinDeadline`.
+- MQTT command JSON, stream-table cap of 9, layout names.
+- `prepareAmlogicHwaccel`.
+- Production `exitIfBusy` (still a test helper after #34).
+
+## A.2 Threading map — worker vs tick
+
+Three threads exist today. The backend adds none.
+
+```
+tick / main (mqtt_controller loop)     mosquitto thread          worker (one per visible stream)
+----------------------------------     -----------------         --------------------------------
+tick() / reapFinished()                broker I/O, commands      sessionLoop:
+present() / commit() / clearViewport() closeMu_ / closing_         open(url)          ← all device calls
+requestStop: stop=true; abort()        (no decoder calls)          readFrame()        ← poll + feed
+drain() waits on worker.done                                       QuiesceOnExit      ← STREAMOFF / codec_close
+releaseDecoder → close()  [CPU only]                               done = true
+finishProcess: closeAll, publish, drain(2s), _exit
+```
+
+`abort()` body, both shapes: `abort_.store(true); write(wake_fd_, 1)`. No
+ioctl. No `codec_close`. No sysfs. That is the only decoder entry from the
+tick thread while the worker is alive.
+
+### A.2.1 Shape A — `libamcodec` (recommended stage-1)
+
+| Call | Thread | Can it ignore `abort()`? | Bound |
+| --- | --- | --- | --- |
+| `avformat_open_input` / `av_read_frame` | worker | getaddrinfo yes; socket no (`AVIOInterruptCB` + `rw_timeout`) | Same as `FfmpegDecoder`. Reaper already covers the lookup. |
+| `dlopen("libamcodec.so")` | worker, once per process | No | Cached. |
+| sysfs: `vcodec_profile`, `dec_control`, `nal_skip_policy`, `tsync/enable`, `freerun_mode`, `vfm/map` | worker, inside `open` | Unlikely | Worker. |
+| `codec_init` / `codec_init_cntl` | worker | Firmware load, rare hang | Worker. Lands on the reaper if it never returns. |
+| `codec_write` (blocking ES push) | worker | **Yes** — Kodi and moonlight retry on `EAGAIN`; a full VDEC can block | `poll({amstream_fd, wake_fd_})` or non-blocking `codec_write` in 100 ms slices. `abort()` writes `wake_fd_`. |
+| `codec_checkin_pts_us64` | worker | No | — |
+| `codec_get_vdec_info` / `codec_get_vdec_state` | worker | Should be ioctl-fast | Heartbeat for `SelfPresented` `readFrame`. |
+| `/dev/video10` `DQBUF`/`QBUF` pump (amlvideo; moonlight-embedded needs this or the pipeline stalls) | **worker**, same instance | `DQBUF` if blocking | `O_NONBLOCK` + `poll` with `wake_fd_`. Do not spawn a second thread (#43 example 12 does; that would break the 17-thread bound). |
+| `/sys/class/video/axis` (window) | tick, inside `present(SelfPresented)` | sysfs write | Not a decoder ioctl. One layer — see Q6. |
+| `codec_reset` / `codec_close` / close(`/dev/amstream*`) / close(`/dev/video10`) | **worker, `quiesce()` only** | **Yes.** CoreELEC's own notes call Kodi's open/close "faulty"; `vfree()` on a non-multi close is a reported teardown bug (#36, #38 §8.2.3) | Reaper + 2 s `_exit`. |
+| `close()` after `quiesce()` | tick | Must not | `dlclose` is not taken (process-lifetime handle). Free FFmpeg contexts only. |
+
+### A.2.2 Shape B — direct V4L2 + PRIME (conditional on Q1)
+
+| Call | Thread | Can it ignore `abort()`? | Bound |
+| --- | --- | --- | --- |
+| Demux / BSF / `av_read_frame` | worker | Same as A | Same. |
+| `open(/dev/videoN)`, `S_FMT`, `REQBUFS`, `EXPBUF`, `STREAMON`, `SUBSCRIBE_EVENT` | worker | `STREAMON` may load firmware | Worker. |
+| `DQBUF` | worker | If blocking | Never blocking: `O_NONBLOCK` + `poll({fd, wake_fd_}, 100ms)`. |
+| `QBUF` (OUTPUT feed, CAPTURE requeue) | worker | Wedged driver can take its lock | Capture requeue **only** via the mailbox drained at the top of `readFrame` on the worker. Token dtor on the tick thread pushes an index, it does not ioctl. |
+| `DECODER_CMD STOP` + drain | worker | Driver may never emit `FLAG_LAST` | 2 s + `abort_`. |
+| `VIDIOC_STREAMOFF`, `REQBUFS(0)`, `close(fd)` | **worker, `quiesce()` only** | **Yes.** Vendor vb2 / firmware reset | Reaper + 2 s `_exit`. |
+| `drmPrimeFDToHandle`, `AddFB2`, atomic commit, `drmHandleEvent` | tick | `EBUSY` if previous flip pending | Non-blocking commit; retry next tick. Token keeps the buffer. |
+| `close()` after `quiesce()` | tick | Must not | `munmap` OUTPUT, drop unused fds, `mailbox->detach()`, free FFmpeg. |
+
+### A.2.3 Proof: no `STREAMOFF` / `codec_close` / `close(device fd)` on tick
+
+Walk of the production call graph on `main` plus the proposed guard:
+
+1. `requestStop` (`stream_player.cpp:105–114`) sets `stop`, notifies, calls
+   `abort()`. That is the entire decoder surface from tick while the worker
+   lives. `abort()` is specified as atomic + `eventfd` write.
+2. `sessionLoop` returns only after `open`/`readFrame` returned. The
+   proposed `QuiesceOnExit` then runs **on that same worker**, before
+   `done = true` (`stream_player.cpp:266–270` sets `done` in the thread
+   lambda after `sessionLoop` returns — put the guard *inside*
+   `sessionLoop` so `quiesce()` happens before `done`).
+3. `reapFinished` (`:136–156`) `join`s only when `done` is true, then
+   calls `releaseDecoder` → `close()` on the tick thread.
+4. Therefore `close()` on tick is reached only after `quiesce()` returned.
+   A backend that puts `codec_close` / `STREAMOFF` / `close(fd)` exclusively
+   in `quiesce()` cannot issue them on tick.
+5. If `quiesce()` hangs, `done` stays false, `reapFinished` leaves the
+   worker on `reaper_`, `tick()` does not join it, `drain(2s)` returns
+   false, `finishProcess` `_exit`s. That is AUDIT4 A1 applied to the
+   device, and AUDIT5 X1 applied to the network thread: the presenting
+   thread and the process-exit path never sit out an uninterruptible
+   driver call.
+6. The `--url` path (`app.cpp:decodeUrl`) is single-threaded: `close()`
+   may call `quiesce()` itself. That is the owning thread, so it is
+   allowed (and already noted in §4.7).
+7. `startWorker`'s `std::thread` failure (`stream_player.cpp:272–278`)
+   calls `close()` before `open()` ran. No device is open.
+
+A forbidden alternative, recorded so it is not re-proposed: `abort()`
+itself issuing `STREAMOFF` or `codec_close` from the tick thread "to
+speed the worker out". That puts the hang on the wrong thread and races
+the worker's own ioctls on the same fd.
+
+## A.3 Reaper / F3 / busy-retired if a hardware ioctl wedges
+
+No new fields. The existing two gates already compose (AUDIT6: "The two
+gates compose. A pending restart waits on both (`stream_player.cpp:444-459`)
+and still runs once.").
+
+| Event | What the current code does | Hardware case |
+| --- | --- | --- |
+| `stop` / `remove` / `restart` / hide / `closeAll` | `requestStop` + move worker onto `reaper_` | Same. `abort()` wakes `poll`/`codec_write` if the call is interruptible. |
+| Worker still inside `open`/`read`/`quiesce` | `done == false` → `reaperBusy(id)` true → no second open for that id (A3) | A wedged `codec_init` / `codec_write` / `codec_close` / `STREAMOFF` occupies that slot until the driver returns or `_exit`. |
+| Nine such workers, any ids | `busyRetiredCount() >= kMaxBusyRetired` (9) → `tick` starts no new open for any id; logs once; live tiles keep presenting (F3) | Same cap. A wall of nine wedged `codec_close`s blocks a tenth `add` from opening — the stream table still accepts it, MQTT still answers `added`, there is just no picture. |
+| Thread bound | start requires `busyRetired < 9` and live sessions ≤ 8 after a retire, so running decode threads ≤ 17 | Holds if and only if the backend creates **zero** extra threads. Shape A's amlvideo pump stays on the worker, not a helper thread. |
+| Process exit | `finishProcess`: `closeAll` + offline + `drain(2s)` + `_exit` | A worker in `quiesce()` makes `drain` return false (or true only after it unsticks). Either way `_exit` within ~2.5 s (AUDIT6 worst case with a blackholed broker was 2.52 s). Kernel then closes the fds. |
+| AUDIT6 N3 | A full F3 cap also delays *healthy* reopens until one lookup finishes | Same trade-off for a healthy stream while nine `codec_close`s are stuck. Do not add a per-id reservation in the spike. |
+
+`StallingDecoder` in `tests/stream_player_test.cpp:167–208` already models
+"open ignores abort". The hardware equivalent is that class with the sleep
+moved into `quiesce()`: T1 / A3 / F3 / `mqtt_exit_test` stay the tests;
+only the blocking virtual changes.
+
+## A.4 Two backend shapes — pick stage-1
+
+#43's three shapes collapse to the two the task asked for. Shape B's
+"CPU-copy V4L2" is listed as a fallback *inside* B, not as a third
+contract.
+
+| | **A. `libamcodec` self-present** (CPU-copy optional) | **B. Direct V4L2 + PRIME** |
+| --- | --- | --- |
+| Kernel interface | `/dev/amstream*`, `AMSTREAM_IOC_*`, VFM, `/dev/video10` (amlvideo metadata), `/dev/amvideo` | `/dev/videoN` M2M (`aml-vcodec-dec`, node 26 in source). `VIDIOC_*`, `VB2_DMABUF` or `EXPBUF` |
+| Userspace lib | `dlopen("libamcodec.so")` — proprietary, binary in the image (#43). Headers from CoreELEC's `libamcodec` tarball | None. Raw ioctl. FFmpeg for demux/BSF only. CoreELEC's `libavcodec` has **no** `*_v4l2m2m` (#41) |
+| What `readFrame` returns | `SelfPresented` heartbeat (`codec_get_vdec_info`). Optional later: mmap a post-processed buffer into `Yuv420p` if a dump path exists (not the Kodi path) | `DrmPrime` + token. CPU-copy fallback: `Yuv420p` from `mmap` CAPTURE (shape B-copy) |
+| Who draws | Kernel video layer. `present()` writes `/sys/class/video/axis` (and z-order) for that tile | `DrmRenderer` imports the token and commits, **or** a GPU/GE2D compositor writes one OSD FB (#40) |
+| Multi-stream decode | Vendor `MAX_INSTANCE_MUN`: 2 on CE21 (patch 003), 9 on CE22 source. Time-sliced, one VPU (#38) | Same `vdec_create` pool **if** the node is the vendor port (#43). Mainline `meson-vdec` is 1 session and is **not** what CE boots |
+| Multi-stream display | One `amvideo` layer is what Kodi drives. N VFM maps into N windows is **unproven** (Q6). Community 2-stream PiP needed a kernel rebuild (#38) | Vendor DRM: 3 OSD + 2 video planes in the G12B DT (#40) — still not 9. A 3×3 wall is composition either way |
+| Abort | `wake_fd_` in the `codec_write` / `video10` poll set | `wake_fd_` in the V4L2 `poll` set |
+| Quiesce | `codec_close` + close amstream/video10 + restore VFM map | `STREAMOFF` both queues + `close(fd)` |
+| Proven on this class? | **Yes, 1 stream** — Kodi `AMLCodec.cpp` on both CE lines. 2+ streams: one VDR report with the cap patch removed | **No** on stock CoreELEC. `v4lplayer` in `media_modules-aml/tools` is the source-level sample (#40); the node may not be registered (Q1) |
+| License / AppImage | `dlopen` avoids a link-time dep. Header redistribution is unresolved (#43 licensing). CE21 needs the **armhf** tarball (Q5) | No proprietary link. Fits the existing "link CoreELEC's FFmpeg + libdrm" rule |
+
+### A.4.1 Recommended stage-1 for the device spike: **shape A, one stream, CE22**
+
+CE22 is vendor 5.15 + `libamcodec`. The V4L2 M2M node is not a given.
+CoreELEC's FFmpeg cannot open `h264_v4l2m2m`. Mainline `meson-vdec` is a
+different distribution. The only path a non-Kodi process has actually
+used on this OS is shape A (#43 examples 1, 12, 13).
+
+Spike goal, in order, on one GS-King X running the CE22 image the AppImage
+targets:
+
+1. **Contract, not the wall.** One `http://` H.264 HLS rendition, Kodi
+   stopped. `AmlogicAmcodecDecoder` (`isHardware()==true`,
+   `outputFormat()==SelfPresented`) + a 20-line `AmvideoRenderer`
+   (`accepts(SelfPresented)`, `present` writes `axis` for the 1x1 cell).
+   Prove: picture on HDMI, `abort()` unblocks `codec_write` within one
+   100 ms slice, `quiesce()`/`codec_close` returns or sits on the reaper,
+   SIGTERM publishes offline and `_exit`s inside 2.5 s with the worker
+   wedged (force a hang by commenting out `codec_close` and sleeping in
+   `quiesce()` if the driver is well-behaved).
+2. **Two instances, decode only.** Second `codec_init` while the first is
+   running. Watch `dmesg | grep vdec_create`. This is Q2/Q10 and decides
+   whether CE22's header value of 9 is real for a non-Kodi client.
+3. **Two pictures.** If step 2 opened, try two VFM maps and two `axis`
+   windows (Q6). Expected failure: one layer, second picture black or
+   replacing the first. That failure selects composition (stage-2) rather
+   than "N video layers".
+4. **Only if Q1 is yes:** a 200-line V4L2 client against `/dev/video26`
+   (OUTPUT H264, CAPTURE NV12, mmap copy to a PPM). This is shape B-copy,
+   and it reuses `SoftwareRenderer` + `accepts(Yuv420p)` so the hardware
+   gate does not even open. Do not start PRIME work until this decode
+   loop is stable.
+
+Do **not** start stage-1 as shape B-PRIME. It needs a registered M2M node
+(Q1), a DRM master with a video plane that accepts the decoder's
+fourcc/modifier (Q3), and a token/FB cache — three unverified surfaces —
+and it is not what Kodi on this image does.
+
+Shape B-PRIME remains the right *architecture* for a 3×3 wall if Q1 and
+the compositor import (EGL or GE2D, #40) both pass. The contract in A.1
+is written so that swap is a new class + a renderer that `accepts(DrmPrime)`,
+not a `StreamPlayer` rewrite. `OwnedFrame` already carries the token;
+`QuiesceOnExit` already covers `STREAMOFF`.
+
+## A.5 Test plan
+
+### A.5.1 Host / CI — no GS-King X, no `/dev/video*`, no `libamcodec`
+
+All of these hook the new virtuals through fakes. None opens a device.
+`AMLOGIC_V4L2_DECODE` / `AMLOGIC_AMCODEC` stay off in CI, same as
+`AMLOGIC_DRM_KMS`.
+
+| Test (proposed target) | What it pins | Existing analogue |
+| --- | --- | --- |
+| `stream_player_test` + `QuiescingStallDecoder` | `quiesce()` sleeps 1.2 s ignoring `abort()`. Other tile keeps presenting. `reaperBusy(id)` blocks restart (A3). Nine ids hit F3 (`maxInFlight` ≤ 9). `drain(2s)` false. `exitIfBusy(0)` taken in a child | `StallingDecoder` (`SURVIVING4 T1`, `AUDIT4 A3`, `AUDIT5 F3`) with the sleep moved to `quiesce()` |
+| `stream_player_test` + `FakeHardwareDecoder` (`outputFormat()==DrmPrime`, `isHardware()==true`) against `SoftwareRenderer` | Gate still refuses; `WorkerFail::Hardware`; one open, one close, zero presents | `stats->hardware.store(true)` at `:785` |
+| same fake against `AcceptingRenderer` (`accepts(DrmPrime)==true`) | Gate opens; `takeOwned` moves the token; `present` sees `hold.use_count()>=2`; `clearViewport` / `remove` / shutdown drop to 0; mailbox index is **not** ioctled on the tick thread (fake records the calling `thread::id`) | new |
+| `stream_player_test` + `SelfPresentedDecoder` + `AmvideoFakeRenderer` | `accepts(SelfPresented)`; `present` called with empty `data[]`; `commit` is a no-op | new |
+| `amlogic_v4l2_decoder_test` + `FakeV4l2Device` | Init order; pts ring; mailbox requeue on the worker; token outliving the decoder only `close`s fds; `SOURCE_CHANGE` with/without `ORPHANED_BUFS`; watchdog ignores an idle queue; `abort()` leaves `poll` in one slice; `STREAMOFF` wedge never runs on the test's "tick" thread | §9 seam, still valid for shape B |
+| `amlogic_amcodec_decoder_test` + `FakeAmcodec` | `codec_init` / `write` / `checkin_pts` / `close` order; `write` blocked until `wake_fd_`; `close` wedge is `quiesce` not `close`; VFM map save/restore | new, no real `.so` |
+| `mqtt_exit_test` | Decoder stuck in `quiesce()` (not `open()`). SIGTERM, broker up: offline retained, rc 0, ≤2.5 s (AUDIT4 A1, AUDIT5 F1/X1). Auth give-up: rc 1, same bound (A2) | current `mqtt_exit_test` with the interpose moved |
+| `present_smoke_test` | `--renderer drm` still fails without `AMLOGIC_DRM_KMS`; `--decoder amlogic` is rejected or not compiled on the host build | existing |
+
+TSan: run `stream_player_test` and `mqtt_exit_test` with
+`-fsanitize=thread` as AUDIT6 did. The token mailbox mutex is the new
+shared surface.
+
+### A.5.2 Must-run-on-device checklist (GS-King X, CE22 first, then CE21)
+
+Kodi stopped (`systemctl stop kodi` / `launch-coreelec.sh` path). Record
+`/etc/os-release` and `uname -r` at the top of the log.
+
+1. Run the ten probes in A.6. Stop if Q1/Q2/Q3/Q5 disagree with the
+   assumed CE22 vendor stack; update this appendix before writing more
+   code.
+2. Shape A 1-stream spike (A.4.1 step 1) against a local H.264 HLS
+   fixture on disk **and** one live HTTP URL. Confirm HDMI picture, then
+   `stop` / `restart` / SIGTERM.
+3. Force-wedge: `abort()` during `codec_write` (pull the Ethernet cable
+   mid-segment) and during `quiesce()` (inject a 5 s sleep if the driver
+   returns). Confirm the other tile — if any — still ticks, and that
+   process exit is ≤2.5 s.
+4. A.4.1 steps 2–3 (second instance, second picture).
+5. Q1 follow-up: if `/dev/video26` exists, shape B-copy one clip to a PPM
+   via `v4l2-ctl` or the 200-line client. Do not import PRIME yet.
+6. Soak: 30 min one-stream shape A. Watch `dmesg` for `vfree`,
+   `codec_mm`, `DECODER_EMERGENCY_NO_MEM`.
+7. Repeat 1–3 on CE21. Expect instance cap 2 and no usable DRM video
+   plane.
+
+## A.6 Open questions that block freezing the design
+
+Ten questions. Each one changes the stage-1 class or the renderer. Run
+on the box; do not freeze A.1–A.4 until Q1, Q2, Q3, and Q5 are answered
+for the image being shipped.
+
+1. **Is the vendor V4L2 M2M node registered on stock CE22?**
+   Decides whether shape B exists at all, or only after a custom kernel.
+   ```sh
+   ls -l /dev/video* /dev/media* 2>/dev/null
+   lsmod | grep -E 'amvdec_ports|aml_vcodec|vdec'
+   # v4l-utils may be missing; a static v4l2-ctl or a 20-line QUERYCAP loop is enough:
+   for n in /dev/video*; do echo "== $n"; v4l2-ctl -d "$n" --info --list-formats-out --list-formats 2>/dev/null; done
+   dmesg | grep -iE 'aml-vcodec|video26|amvdec_ports'
+   ```
+
+2. **What instance cap does the running kernel enforce?**
+   Decides the hardware admission number under the UI cap of 9.
+   ```sh
+   grep -R "MAX_INSTANCE" /sys/module/*/parameters 2>/dev/null
+   dmesg | grep -E 'vdec_create|vdec_init|max_decode_instance'
+   # then open N copies of a tiny H.264 ES via the spike (or a 10-line codec_init loop)
+   # and record the first failure + `dmesg | grep vdec_create`
+   ```
+
+3. **What display path is actually usable with Kodi stopped?**
+   Decides `AmvideoRenderer` vs `DrmRenderer` for stage-1 `present()`.
+   ```sh
+   ls -l /dev/dri /dev/fb0 /dev/amvideo /dev/video10 2>/dev/null
+   cat /sys/class/vfm/map
+   readlink -f /sys/class/drm/card0/device/driver 2>/dev/null
+   cat /sys/kernel/debug/dri/0/state 2>/dev/null
+   # if drm_info/modetest exist:
+   drm_info /dev/dri/card0 2>/dev/null | head
+   fuser -v /dev/dri/card0 /dev/amvideo /dev/fb0 2>/dev/null
+   ```
+
+4. **Does `codec_close` / `VIDIOC_STREAMOFF` hang after `abort()`?**
+   Decides whether `quiesce()` is insurance or the load-bearing A1 fix.
+   ```sh
+   # during the shape-A spike: SIGSTOP the worker (or break in gdb) mid-codec_write,
+   # then from another thread call codec_close / STREAMOFF and time it.
+   # dmesg | grep -iE 'vfree|timeout|vdec_release|stuck'
+   ```
+
+5. **Which `libamcodec.so` is on the box, and may we `dlopen` it from the AppImage?**
+   CE22 tarball is aarch64; CE21 userspace is armhf. Wrong ELF = stage-1
+   cannot even `codec_init`.
+   ```sh
+   ls -l /usr/lib/libamcodec* /usr/include/amcodec/codec.h 2>/dev/null
+   file /usr/lib/libamcodec.so*
+   readelf -h /usr/lib/libamcodec.so* | grep -E 'Class|Machine'
+   # headers present? if not, they are only in the CoreELEC package tarball
+   ```
+
+6. **Can two `STREAM_TYPE_FRAME` instances show two independent pictures?**
+   Decides whether shape A can ever be a wall or is a 1-stream HDMI proof.
+   ```sh
+   cat /sys/class/vfm/map
+   ls /sys/class/video/
+   # after two codec_init: write two axis rectangles
+   # echo "x y x2 y2" > /sys/class/video/axis
+   # look for video2 / pip / path0 vs path1 nodes; record whether the second
+   # picture replaces the first
+   dmesg | grep -iE 'vfm|amvideo|video_composer'
+   ```
+
+7. **How big is `codec_mm` / CMA on this GS-King X image?**
+   Decides 1080p vs tile-sized renditions before any 9-up attempt (#38 §6).
+   ```sh
+   grep -iE 'Cma|cma|codec' /proc/meminfo
+   dmesg | grep -iE 'codec_mm|ion-dev|reserved'
+   ls /proc/device-tree/reserved-memory/ 2>/dev/null
+   # if dtc is present: dtc -I fs -O dts /proc/device-tree 2>/dev/null | grep -A2 codec_mm
+   ```
+
+8. **Does the image FFmpeg actually lack `v4l2m2m`?**
+   Confirms #41 on the box; if symbols exist, shape B-copy can use
+   `h264_v4l2m2m` instead of raw ioctl (still not the backend — no abort
+   hook — but a faster probe).
+   ```sh
+   ffmpeg -hide_banner -decoders 2>/dev/null | grep v4l2
+   ffmpeg -hide_banner -hwaccels 2>/dev/null
+   strings /usr/lib/libavcodec.so* | grep -c v4l2m2m   # expect 0
+   ```
+
+9. **If Q1 is yes: capture fourcc, modifier, `EXPBUF` vs `DMABUF` import, min buffers?**
+   Decides token layout and whether PRIME can feed DRM or only CPU copy.
+   ```sh
+   v4l2-ctl -d /dev/video26 --all
+   v4l2-ctl -d /dev/video26 --list-ctrls
+   v4l2-ctl -d /dev/video26 --get-ctrl min_buffers_for_capture
+   # REQBUFS + EXPBUF probe (or the 200-line client). Record ORPHANED_BUFS in capabilities.
+   ```
+
+10. **What VFM map does a non-Kodi `STREAM_TYPE_FRAME` instance need so the picture is not black?**
+    The #36/#39 blank-output failure is the most-reported multi-decode
+    "success". Stage-1 is worthless if HDMI stays black with a live decoder.
+    ```sh
+    cat /sys/class/vfm/map
+    # Kodi's working single-stream map (forum): 
+    # echo "rm default" > /sys/class/vfm/map
+    # echo "add default vdec.h264.00 ppmgr amvideo" > /sys/class/vfm/map
+    # record maps created automatically by codec_init, and the dmesg line
+    # `vdec_init ... VDEC_TYPE_FRAME_BLOCK`
+    dmesg | grep -iE 'vdec_init|VDEC_TYPE|vfm'
+    ```
+
+## A.7 Spike file list (still not this PR)
+
+When Q1–Q3 and Q5 are answered for CE22, the first production PR is
+expected to touch only:
+
+| File | Why |
+| --- | --- |
+| `src/decoder_backend.h` | Apply A.1.1 (defaults keep CI green). |
+| `src/renderer.h` | Apply A.1.2. |
+| `src/software_renderer.h` | `clearViewport` becomes `override`; `accepts` stays default. |
+| `src/stream_player.{h,cpp}` | `Renderer&`, `QuiesceOnExit`, `takeOwned`, `accepts` gate, `commit()`. |
+| `src/amlogic_amcodec_decoder.{h,cpp}` | Shape A. Compiled only with `-DAMLOGIC_AMCODEC=ON`. |
+| `src/amvideo_renderer.{h,cpp}` | `accepts(SelfPresented)`. Same flag. |
+| `tests/stream_player_test.cpp` | `QuiescingStallDecoder` + accepting-renderer cases. |
+| `CMakeLists.txt` | Option off by default. |
+
+Shape B (`amlogic_v4l2_decoder.*`, `DrmRenderer` growth) waits on Q1 and
+Q3. `FfmpegDecoder` is not in that list.
