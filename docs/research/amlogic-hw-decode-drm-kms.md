@@ -9,7 +9,7 @@ must be treated as a separate port.
 
 ## Conclusion
 
-The viable CoreELEC 22 design is:
+The proposed CoreELEC 22 design is:
 
 1. stop Kodi and take DRM master;
 2. decode each stream with the Amlogic V4L2 mem2mem decoder into
@@ -36,6 +36,9 @@ API. It exchanges Amlogic `vframe` objects with `/dev/video10` and presents
 through the vendor `amvideo` path. The separate CoreELEC 22 V4L2 decoder is
 the better integration point: its capture queue accepts dma-bufs allocated
 by the application, as demonstrated by CoreELEC's `v4lplayer` sample.
+That source-level path is conditional on the matching external media module
+and mem2mem node being present in the installed image; this has not yet been
+verified on the GS-King X.
 
 ## Scope and terminology
 
@@ -66,9 +69,15 @@ reject export, mapping, or import by an untrusted display client.
 
 | Stack | Relevant behavior | Implication for this project |
 | --- | --- | --- |
-| CoreELEC 21 `Amlogic-ng`, vendor 4.9 | 32-bit userspace, legacy Amlogic media/display integration | Keep the existing build target, but do not infer the CoreELEC 22 dma-buf or KMS ABI. It needs separate device research and testing. |
-| CoreELEC 22 `Amlogic-no`, vendor 5.15 | 64-bit userspace; vendor Meson DRM; Kodi `libamcodec`; an additional V4L2 mem2mem decoder whose capture queue imports dma-bufs | Recommended first hardware target. The source contains the pieces needed for a no-CPU-copy decode/composition path. |
+| CoreELEC 21 `Amlogic-ng`, vendor 4.9 | 32-bit userspace, legacy Amlogic media/display integration; the stock kernel config disables Amlogic DRM | The DRM/KMS design in this document is not available on the stock image. Keep the existing software build target, but treat hardware display as a separate kernel-stack port. |
+| CoreELEC 22 `Amlogic-no`, vendor 5.15 | 64-bit userspace; vendor Meson DRM; Kodi `libamcodec`; an external-media-tree V4L2 mem2mem implementation whose capture queue imports dma-bufs | Recommended first hardware target. The source contains the pieces needed for a no-CPU-copy path, subject to runtime module/node verification. |
 | Upstream Linux `drm/meson` | Different driver and exposed plane model from the CoreELEC vendor tree | Useful for DRM concepts, not as evidence of the CoreELEC ABI or plane inventory. |
+
+CoreELEC 22 enables its vendor `CONFIG_AMLOGIC_DRM` implementation rather
+than upstream `CONFIG_DRM_MESON`. Its in-tree `CONFIG_AMLOGIC_V4L2` option is
+disabled; the decoder implementation examined here comes from
+`media_modules-aml`. Therefore the kernel config, loaded modules, and actual
+device nodes all need to be checked on the target image.
 
 The upstream Meson documentation describes the hardware blocks, while
 current upstream source exposes a primary RGB plane and a YUV overlay in
@@ -157,6 +166,12 @@ consumer. That is still a zero-copy decoder-to-compositor handoff.
 research, but device minor numbers are not an ABI. Production code must
 enumerate media/V4L2 devices, query capabilities and formats, and select the
 matching decoder node.
+
+The sample proves the intended buffer contract in the external media source;
+it does not prove that a given CoreELEC release installs and registers that
+decoder on the GS-King X. If no matching mem2mem node is present, `/dev/video10`
+is not a substitute: enabling/building the external decoder module or changing
+the image is a prerequisite.
 
 Each completed frame needs a descriptor containing at least:
 
@@ -380,12 +395,17 @@ fallback. Device-only classes should be compiled only for the appropriate
 CoreELEC target and should fail closed when capabilities differ from the
 validated set.
 
-The main integration issue is that the current player presents one stream
-at a time. Hardware composition needs a wall-level transaction: collect the
-latest retained frame for every visible stream, render the complete grid,
-then submit one scanout. Calling a KMS commit independently from each
-decoder thread would tear layouts, race buffer lifetimes, and make one
-atomic display state impossible.
+`StreamPlayer` currently treats `isHardware() == true` as a worker failure,
+and the renderer contract accepts only `DecodedFrame` CPU pointers. Adding a
+hardware backend alone will therefore not activate hardware playback. The
+player, frame queue, and presentation contract must change together.
+
+The other main integration issue is that the current player presents one
+stream at a time. Hardware composition needs a wall-level transaction:
+collect the latest retained frame for every visible stream, render the
+complete grid, then submit one scanout. Calling a KMS commit independently
+from each decoder thread would tear layouts, race buffer lifetimes, and make
+one atomic display state impossible.
 
 ## Device discovery
 
@@ -480,9 +500,11 @@ Kernel interfaces:
 - [Upstream Meson RGB plane](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/meson/meson_plane.c)
 - [Upstream Meson YUV overlay](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/meson/meson_overlay.c)
 
-CoreELEC 22 vendor sources examined at the pinned `5.15.196_20260225`
-snapshot:
+CoreELEC kernel configurations and CoreELEC 22 vendor sources examined at
+the pinned `5.15.196_20260225` vendor-source snapshot:
 
+- [CoreELEC 21 Amlogic-ng kernel config](https://github.com/CoreELEC/CoreELEC/blob/coreelec-21/projects/Amlogic-ce/devices/Amlogic-ng/linux/linux.aarch64.conf)
+- [CoreELEC 22 Amlogic-no kernel config](https://github.com/CoreELEC/CoreELEC/blob/coreelec-22/projects/Amlogic-ce/devices/Amlogic-no/linux/linux.aarch64.conf)
 - [Meson DRM plane formats, modifiers, and UVM import](https://github.com/CoreELEC/common_drivers/blob/5.15.196_20260225/drivers/drm/meson_plane.c)
 - [G12B DRM topology](https://github.com/CoreELEC/common_drivers/blob/5.15.196_20260225/arch/arm64/boot/dts/amlogic/mesong12b_drm.dtsi)
 - [G12B dual-display additions](https://github.com/CoreELEC/common_drivers/blob/5.15.196_20260225/arch/arm64/boot/dts/amlogic/mesong12b_drm_dual_disp.dtsi)
