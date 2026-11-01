@@ -169,6 +169,20 @@ bool StreamPlayer::reaperBusy(const std::string& id) const {
     return false;
 }
 
+int StreamPlayer::busyRetiredCount() const {
+    int busy = 0;
+    for (const auto& worker : reaper_) {
+        if (!worker) {
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(worker->mu);
+        if (!worker->done) {
+            ++busy;
+        }
+    }
+    return busy;
+}
+
 void StreamPlayer::sessionLoop(Worker* worker, const std::string& id, const std::string& url) {
     DecoderBackend* decoder = worker->decoder.get();
     const bool opened = decoder != nullptr && decoder->open(url);
@@ -430,6 +444,19 @@ int StreamPlayer::tick(bool playing) {
             if (reaperBusy(info.id)) {
                 continue;
             }
+            // AUDIT5 F3: the check above is per id, so add/remove churn under
+            // new ids still stacked one stuck lookup each. Leave the session
+            // pending, like the per-id case, until the reaper drains.
+            const int busyRetired = busyRetiredCount();
+            if (busyRetired >= kMaxBusyRetired) {
+                if (!retiredLimitLogged_) {
+                    std::cerr << "StreamPlayer: " << busyRetired
+                              << " retired decoders still blocked; new opens wait\n";
+                    retiredLimitLogged_ = true;
+                }
+                continue;
+            }
+            retiredLimitLogged_ = false;
             if (!generationChanged && !urlChanged && session.backoff && now < session.retryAfter) {
                 continue;
             }
