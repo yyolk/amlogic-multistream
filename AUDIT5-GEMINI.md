@@ -52,3 +52,38 @@ Independent second-look audit of `yyolk/amlogic-multistream` at `bf00f31598d1a17
 - **A3 (reaperBusy no restart pile-up):** Verified. `session.appliedGeneration` is updated *after* the `reaperBusy` check, ensuring `generationChanged` remains true and the new worker is not started until the old one finishes.
 - **A4 (dual demuxer allowlist):** Verified. `kTopLevelFormatWhitelist` correctly rejects a top-level `mp3` (even with a cover art that probes as `mjpeg`), while `kFormatWhitelist` allows HLS to open packed-audio renditions.
 - **A5 (mp3float):** Verified. `mp3float` is added to `kCodecWhitelist`, fixing the FFmpeg 6.1 probe warning.
+
+## CROSSCHECK vs AUDIT5 (Opus)
+
+### Opus's Findings
+- **F1 (must-fix): A command during the exit drain leaves a dead player retained as `"online":true`**
+  - **Agree.** `handleMessage` runs concurrently and can overwrite the offline status during the 2s drain.
+- **F2 (should-fix): A broker drop during the drain makes SIGTERM exceed the launch poll**
+  - **Agree.** If `sent` is true but the broker drops before `shutdown()`, `mosquitto_loop_stop` will hang on the reconnect's `getaddrinfo`. (Note: This overlaps with my Must-Fix #1).
+- **F3 (should-fix): `add`/`remove` with fresh ids still stacks decode threads**
+  - **Agree.** The `reaperBusy` check is per-id, so minting new ids bypasses it and can exhaust address space.
+- **F4 (nit): Re-adding an id with a corrected URL waits out the old lookup**
+  - **Agree.** The per-id gate intentionally blocks the new open, though it delays recovery.
+- **F5 (nit): An `.m4a` with JPEG cover art still opens via `mov`**
+  - **Agree.** The `mov` demuxer is allowed, so MP4s with cover art bypass the A4 fix.
+- **F6 (nit): Tests do not pin #30's gate, F1, F2, or most packed-audio types**
+  - **Agree.** The tests use `127.0.0.1` which doesn't simulate `getaddrinfo` stalls for the broker connection.
+- **F7 (nit): The MQTT regression tests are skippable**
+  - **Agree.** They should be required by `AMS_REQUIRE_DECODER_TESTS=1`.
+- **F8 (nit): `~StreamPlayer` comment overstates the exit paths**
+  - **Agree.** The comment is slightly inaccurate regarding when `_exit` is called.
+
+### Gemini's Findings
+- **1 (must-fix): `SIGTERM` hangs if the broker is down and `drain()` returns true**
+  - **Opus missed this.** Opus tested the "broker down before SIGTERM" case *with* a stuck decoder worker (where `drain()` returns false, skipping `shutdown()`). If no decoder is stuck, `drain()` returns true, `finishProcess` returns, and `start()` unconditionally calls `shutdown()`, which hangs on the reconnect's `getaddrinfo`.
+- **2 (nit): `exitIfBusy` returning can trigger the same hang**
+  - **Opus missed this.** If a stuck worker finishes exactly between the two `drain()` checks, `exitIfBusy` returns normally, leading to the same unconditional `shutdown()` hang.
+
+### Discrepancies & Overlaps
+- **Overlap:** Opus's F2 and my Must-Fix #1 both identify that `mosquitto_loop_stop` inside `shutdown()` hangs on a reconnect `getaddrinfo`. Opus found it happens if the broker drops *during* the drain (because `sent` was true). I found it happens if the broker drops *before* the drain but no workers are stuck (because `drain()` returns true).
+- **Severity:** Opus rated F2 as `should-fix` because it requires a specific timing (broker dropping *during* the drain). However, my finding shows the hang also occurs if the broker is *already* down, as long as no streams are stuck. This makes the hang much more likely (e.g., any SIGTERM while the broker is down and no streams are playing). Therefore, this combined issue must be a **must-fix**.
+
+### Agreed Survivor List
+- **Must-Fix:** F1 (Command during drain overwrites offline status).
+- **Must-Fix:** `shutdown()` hangs on reconnect `getaddrinfo` if the broker is down (Combines Opus F2 and Gemini #1/#2).
+- **Should-Fix:** F3 (Address space exhaustion from `add`/`remove` id churn).

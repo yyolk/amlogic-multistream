@@ -290,3 +290,13 @@ else()
     message(STATUS
         "Skipping amlogic-multistream player: need libavformat, libavcodec, libavutil, libswscale, libmosquitto, and libdrm")
 endif()
+
+add_executable(test_sigterm_down_empty tests/test_sigterm_down_empty.cpp src/mqtt_controller.cpp src/mqtt_json.cpp src/mqtt_commands.cpp src/ffmpeg_decoder.cpp src/software_renderer.cpp src/stream_player.cpp src/stream_manager.cpp src/layout_engine.cpp)
+target_include_directories(test_sigterm_down_empty PRIVATE ${FFMPEG_INCLUDE_DIRS} ${MOSQUITTO_INCLUDE_DIRS} src)
+target_link_directories(test_sigterm_down_empty PRIVATE ${FFMPEG_LIBRARY_DIRS} ${MOSQUITTO_LIBRARY_DIRS})
+target_link_libraries(test_sigterm_down_empty PRIVATE ${FFMPEG_LIBRARIES} ${MOSQUITTO_LIBRARIES} Threads::Threads)
+
+add_executable(test_publish_down tests/test_publish_down.cpp)
+target_include_directories(test_publish_down PRIVATE ${MOSQUITTO_INCLUDE_DIRS})
+target_link_directories(test_publish_down PRIVATE ${MOSQUITTO_LIBRARY_DIRS})
+target_link_libraries(test_publish_down PRIVATE ${MOSQUITTO_LIBRARIES})
