@@ -62,7 +62,7 @@ The `amlogic-multistream` player target is configured only when libavformat, lib
 ## MQTT
 Without `--url`, the process connects to a broker and blocks until SIGINT or SIGTERM. Defaults are `localhost:1883` and topic prefix `amlogic-multistream` (`MQTT_HOST`, `MQTT_PORT`, `MQTT_TOPIC_PREFIX`). Command topics, JSON fields, and `mosquitto_pub` examples are in [docs/mqtt.md](docs/mqtt.md).
 
-This build does not open DRM/KMS devices or Amlogic decoders. `scripts/launch-coreelec.sh` requires GS-King X / CoreELEC. It stops Kodi for the lifetime of this process.
+This build does not open DRM/KMS devices or Amlogic decoders. `scripts/launch-coreelec.sh` **requires GS-King X / CoreELEC**. It stops Kodi, runs the player, and starts Kodi again. SIGHUP, SIGTERM, and EXIT still start Kodi if the SSH session drops or the script is killed. Ctrl+C is left to the player.
 
 ## Manual player check
 
@@ -118,7 +118,7 @@ ctest --test-dir build --output-on-failure
 
 Rebuild after source changes with `cmake --build build`. The CMake Tools extension uses this `build/` directory, so its test runner calls the same CTest list.
 
-`./scripts/build-appimage.sh` in the codespace packages the codespace's own architecture. `scripts/launch-coreelec.sh` requires GS-King X / CoreELEC and is unused here.
+`./scripts/build-appimage.sh` in the codespace packages the codespace's own architecture. `scripts/launch-coreelec.sh` **requires GS-King X / CoreELEC** and is unused here.
 
 ## AppImage
 
@@ -129,9 +129,9 @@ The workflow is a two-runner matrix. Each runner installs the dev-container pack
 | Artifact | Runner | Role |
 | --- | --- | --- |
 | `amlogic-multistream-appimage-x86_64` | `ubuntu-24.04` | Host and Codespaces smoke build |
-| `amlogic-multistream-appimage-aarch64` | `ubuntu-24.04-arm` | Amlogic S922X device build |
+| `amlogic-multistream-appimage-aarch64` | `ubuntu-24.04-arm` | Native aarch64 build. **Not** the GS-King X / CoreELEC binary |
 
-Download both from the workflow run's Artifacts list. The file inside each artifact is `amlogic-multistream-<version>-<arch>.AppImage`.
+Download both from the workflow run's Artifacts list. The file inside each artifact is `amlogic-multistream-<version>-<arch>.AppImage`. The `aarch64` in that name is the runner architecture. It is not a CoreELEC Amlogic-ng image.
 
 On your own machine the same script follows `uname -m`:
 
@@ -139,10 +139,18 @@ On your own machine the same script follows `uname -m`:
 ./scripts/build-appimage.sh
 ```
 
-That needs the build packages above plus `curl`, `patchelf`, `binutils`, and `file`. An x86_64 host produces the smoke image. An aarch64 host produces the device image. Packaging does not need a GS-King X. Copy the aarch64 AppImage to the device when you are ready to launch it there.
+That needs the build packages above plus `curl`, `patchelf`, `binutils`, and `file`. An x86_64 host produces the smoke image. An aarch64 host produces another aarch64 image. Packaging does not need a GS-King X. Neither file is the GS-King X binary.
 
-linuxdeploy leaves glibc to the system and bundles the other shared libraries. A CoreELEC image with a 32-bit userspace will not run the aarch64 file; the device userspace needs to be aarch64.
+The GS-King X runs CoreELEC **Amlogic-ng**, a 32-bit ARM userspace (`CoreELEC-Amlogic-ng.arm`, device tree `g12b_s922x_beelink_gs_king_x`). That kernel will not load an aarch64 userspace binary. CI does not cross-compile armv7. A full CoreELEC sysroot build is not part of this workflow.
+
+linuxdeploy leaves glibc to the system and bundles the other shared libraries. Do not treat glibc 2.39 as the reason the device image fails. On Ubuntu 24.04 (the CI distro) the player's bundled libraries require `GLIBC_2.38` at most. `GLIBC_2.39` symbols are exports on the host `libc.so.6` and `libm.so.6`, which linuxdeploy does not bundle. CoreELEC 21.3-Omega pins glibc 2.38, so that floor matches. The mismatch is the 32-bit userspace, not a 2.39 requirement, and it is not a reason to retarget the build at Debian bullseye.
+
+**TODO:** Build a real GS-King X AppImage as 32-bit ARM (armv7, hard-float) against a CoreELEC Amlogic-ng sysroot (glibc 2.38 on CoreELEC 21.3-Omega). The `ubuntu-24.04-arm` aarch64 artifact cannot be that file. This repository does not produce the device AppImage yet.
 
 ## Launch on CoreELEC
 
-`scripts/launch-coreelec.sh` requires GS-King X / CoreELEC. It stops Kodi, runs `/storage/amlogic-multistream`, and starts Kodi again. CI and Codespaces do not call it.
+`scripts/launch-coreelec.sh` **requires GS-King X / CoreELEC**. It stops Kodi, runs `/storage/amlogic-multistream`, and starts Kodi again. If the SSH session drops (SIGHUP) or the shell is killed (SIGTERM), a trap stops the player and starts Kodi. EXIT does the same. Ctrl+C is not trapped: the player handles SIGINT, exits 0, and the script starts Kodi on the normal path.
+
+The script exports `APPIMAGE_EXTRACT_AND_RUN=1` because the CoreELEC base image has no `fusermount`. A type-2 AppImage otherwise fails in the runtime, before `main`. CI and Codespaces do not call this script.
+
+Put a 32-bit ARM build at `/storage/amlogic-multistream` before running it. The aarch64 CI artifact is the wrong binary for that path.

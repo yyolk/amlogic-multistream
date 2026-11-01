@@ -2,10 +2,11 @@
 # (that script requires GS-King X / CoreELEC).
 #
 # - ubuntu-24.04: x86_64 host/Codespaces smoke AppImage
-# - ubuntu-24.04-arm: aarch64 AppImage for Amlogic S922X
+# - ubuntu-24.04-arm: native aarch64 AppImage. This is NOT the GS-King X
+#   binary. CoreELEC Amlogic-ng is a 32-bit ARM userspace, and this
+#   workflow does not cross-compile armv7 or use a CoreELEC sysroot.
 #
-# Both runners execute the player and the unit tests natively, so this
-# workflow does not cross-compile.
+# Both runners execute the player and the unit tests natively.
 
 name: CI
 

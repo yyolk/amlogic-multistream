@@ -2,8 +2,10 @@
 # Build amlogic-multistream and package it as an AppImage.
 #
 # Host: normal Linux. The AppImage matches this machine: x86_64 for a host
-# smoke build, aarch64 for an Amlogic S922X device build. CI runs the script
-# once on each runner. No GS-King X or CoreELEC image is required to package.
+# smoke build, aarch64 for a native 64-bit ARM build. The aarch64 image is
+# not the GS-King X binary. CoreELEC Amlogic-ng is 32-bit ARM userspace, and
+# this script does not cross-compile it. CI runs the script once on each
+# native runner. No GS-King X or CoreELEC image is required to package.
 #
 # linuxdeploy fills the AppDir (binary, desktop file, icon, shared libraries).
 # linuxdeploy-plugin-appimage then runs appimagetool. A copy of appimagetool
