@@ -58,6 +58,27 @@
             <heading>30205</heading>
           </control>
         </setting>
+        <setting id="mqtt_username" type="string" label="30207" help="30208">
+          <level>0</level>
+          <default></default>
+          <constraints>
+            <allowempty>true</allowempty>
+          </constraints>
+          <control type="edit" format="string">
+            <heading>30207</heading>
+          </control>
+        </setting>
+        <setting id="mqtt_password" type="string" label="30209" help="30210">
+          <level>0</level>
+          <default></default>
+          <constraints>
+            <allowempty>true</allowempty>
+          </constraints>
+          <control type="edit" format="string">
+            <heading>30209</heading>
+            <hidden>true</hidden>
+          </control>
+        </setting>
       </group>
     </category>
   </section>

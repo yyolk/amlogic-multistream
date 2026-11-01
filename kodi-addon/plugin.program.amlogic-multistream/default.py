@@ -35,12 +35,26 @@ def list_root(handle):
     xbmcplugin.endOfDirectory(handle)
 
 
+def addon_profile_dir():
+    raw = ADDON.getAddonInfo("profile") or ""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if raw.startswith("special://"):
+        import xbmcvfs
+        raw = xbmcvfs.translatePath(raw)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+    return raw.rstrip("/\\")
+
+
 def run_launch():
     script = amlogic_launcher.resolve_launch_script(
         ADDON_PATH, ADDON.getSettingString("launch_script").strip())
     player_bin = (ADDON.getSettingString("player_bin").strip()
                   or amlogic_launcher.DEFAULT_PLAYER_BIN)
     mqtt_port = ADDON.getSettingInt("mqtt_port")
+    # Do not strip the password. Leading or trailing spaces can be part of it.
+    mqtt_password = ADDON.getSettingString("mqtt_password")
     try:
         argv = amlogic_launcher.launch(
             script,
@@ -48,6 +62,9 @@ def run_launch():
             mqtt_host=ADDON.getSettingString("mqtt_host").strip(),
             mqtt_port=str(mqtt_port) if mqtt_port > 0 else "",
             mqtt_topic_prefix=ADDON.getSettingString("mqtt_topic_prefix").strip(),
+            mqtt_username=ADDON.getSettingString("mqtt_username").strip(),
+            mqtt_password=mqtt_password,
+            profile_dir=addon_profile_dir(),
         )
     except (amlogic_launcher.LaunchError, OSError) as exc:
         log("launch failed: %s" % exc, xbmc.LOGERROR)
