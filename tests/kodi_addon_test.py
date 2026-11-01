@@ -8,7 +8,8 @@ bundled launch-coreelec.sh through the stand-in systemd-run.
 
 Device-only, not covered here (requires GS-King X / CoreELEC): Kodi loading
 the add-on, the real systemd transient unit surviving `systemctl stop kodi`,
-the display handover, and a 32-bit ARM player.
+the display handover, and running a device player. The install helper's
+--target checks run against synthetic ELF headers and AppImages.
 """
 
 import json
@@ -68,6 +69,23 @@ def elf_header(ei_class, machine):
     head[16] = 2
     head[18:20] = machine.to_bytes(2, "little")
     return bytes(head)
+
+
+def appimage_bytes(ei_class, machine, squashfs):
+    """A type-2 AppImage: ELF header with the AI\\x02 magic, then squashfs.
+
+    The runtime's ELF ends at e_shoff + e_shentsize * e_shnum; with no
+    section headers that is e_shoff, which points just past the header.
+    """
+    head = bytearray(elf_header(ei_class, machine))
+    head[8:11] = b"AI\x02"
+    if ei_class == 2:
+        head[40:48] = (64).to_bytes(8, "little")
+        head[58:60] = (64).to_bytes(2, "little")
+    else:
+        head[32:36] = (64).to_bytes(4, "little")
+        head[46:48] = (40).to_bytes(2, "little")
+    return bytes(head) + squashfs
 
 
 STUBS = {
@@ -467,8 +485,86 @@ class InstallHelperTest(unittest.TestCase):
         res = self.install("--host", "root@coreelec", "--player", arm32, "--dry-run")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("ssh root@coreelec", res.stdout)
+        self.assertIn("/etc/os-release", res.stdout)
+        self.assertIn("expect Amlogic-ng.arm", res.stdout)
         self.assertIn("tar -C /storage/.kodi/addons -xf -", res.stdout)
         self.assertIn("/storage/amlogic-multistream", res.stdout)
+
+    def test_coreelec22_target_wants_aarch64(self):
+        aarch64 = self.player("aarch64", elf_header(2, 183))
+        res = self.install("--storage", self.storage, "--target", "coreelec22-no-aarch64",
+                           "--player", aarch64)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(read(os.path.join(self.storage, "amlogic-multistream"), "rb"),
+                         read(aarch64, "rb"))
+        os.remove(os.path.join(self.storage, "amlogic-multistream"))
+        for name, header in (("arm32", elf_header(1, 40)), ("x86_64", elf_header(2, 62))):
+            path = self.player(name, header)
+            res = self.install("--storage", self.storage, "--target", "coreelec22-no-aarch64",
+                               "--player", path)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("64-bit ARM (aarch64)", res.stderr)
+            self.assertFalse(os.path.exists(os.path.join(self.storage, "amlogic-multistream")))
+
+        res = self.install("--host", "root@coreelec", "--target", "coreelec22-no-aarch64",
+                           "--player", aarch64, "--dry-run")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("expect Amlogic-no.aarch64", res.stdout)
+
+    def test_unknown_target(self):
+        res = self.install("--storage", self.storage, "--target", "aarch64")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("coreelec22-no-aarch64", res.stderr)
+
+    def appimage(self, name, ei_class, machine, target=None):
+        tree = os.path.join(self.tmp, name + ".AppDir")
+        os.makedirs(os.path.join(tree, "usr", "share", "amlogic-multistream"))
+        write_exec(os.path.join(tree, "AppRun"), "#!/bin/sh\n")
+        if target:
+            with open(os.path.join(tree, "usr", "share", "amlogic-multistream",
+                                   "coreelec-target"), "w") as fh:
+                fh.write("target=%s\ncoreelec_release=test\n" % target)
+        sqfs = os.path.join(self.tmp, name + ".squashfs")
+        subprocess.run(["mksquashfs", tree, sqfs, "-noappend", "-quiet", "-all-root"],
+                       check=True, stdout=subprocess.DEVNULL)
+        path = os.path.join(self.tmp, name + ".AppImage")
+        with open(path, "wb") as fh:
+            fh.write(appimage_bytes(ei_class, machine, read(sqfs, "rb")))
+        return path
+
+    def test_device_appimage_marker(self):
+        if not (shutil.which("mksquashfs") and shutil.which("unsquashfs")):
+            if os.environ.get("CI") == "true":
+                self.fail("CI needs squashfs-tools for the device AppImage marker check")
+            self.skipTest("squashfs-tools is not installed")
+        ce22 = ("--target", "coreelec22-no-aarch64")
+
+        device = self.appimage("ce22", 2, 183, "coreelec22-no-aarch64")
+        res = self.install("--storage", self.storage, *ce22, "--player", device)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("coreelec22-no-aarch64 device AppImage", res.stdout)
+
+        # The ubuntu-24.04-arm CI AppImage is aarch64 too, but has no marker.
+        smoke = self.appimage("smoke", 2, 183)
+        os.remove(os.path.join(self.storage, "amlogic-multistream"))
+        res = self.install("--storage", self.storage, *ce22, "--player", smoke)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("host smoke", res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.storage, "amlogic-multistream")))
+        res = self.install("--storage", self.storage, *ce22, "--player", smoke,
+                           "--allow-target-mismatch")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("warning", res.stderr)
+
+        ce21 = self.appimage("ce21", 1, 40, "coreelec21-ng-armv7hf")
+        res = self.install("--storage", self.storage, "--player", ce21)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("coreelec21-ng-armv7hf device AppImage", res.stdout)
+
+        wrong = self.appimage("wrong", 1, 40, "coreelec99-test")
+        res = self.install("--storage", self.storage, "--player", wrong)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("built for coreelec99-test", res.stderr)
 
 
 if __name__ == "__main__":
