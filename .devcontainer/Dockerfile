@@ -3,6 +3,7 @@ FROM mcr.microsoft.com/devcontainers/cpp:ubuntu24.04
 # Compiler, CMake, pkg-config, FFmpeg, libmosquitto, and libdrm so
 # `cmake`, `layout_engine_tests`, and the player all configure.
 # curl, patchelf, file, and binutils are for scripts/build-appimage.sh.
+# squashfs-tools lets the kodi_addon test read a device AppImage marker.
 # Keep this list aligned with .github/workflows/ci.yml.
 USER root
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
@@ -24,6 +25,7 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
         libswscale-dev \
         patchelf \
         pkg-config \
+        squashfs-tools \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 USER vscode

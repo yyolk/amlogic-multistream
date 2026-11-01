@@ -1,0 +1,132 @@
+# Device AppImages for the GS-King X (S922X), one per CoreELEC line:
+#
+# - coreelec21-ng-armv7hf: CoreELEC 21 (Omega) Amlogic-ng, 32-bit ARM
+#   userspace, armv7 hard-float.
+# - coreelec22-no-aarch64: CoreELEC 22 (Piers) Amlogic-no, 64-bit ARM
+#   userspace. Pinned to a CoreELEC 22 pre-release (scripts/coreelec-targets.sh).
+#
+# Each job cross-compiles on x86_64 against a sysroot unpacked from the
+# official CoreELEC update archive and links that image's glibc, libstdc++,
+# FFmpeg, and libdrm. Only libmosquitto is bundled.
+# scripts/verify-coreelec-appimage.sh then runs the AppImage under
+# qemu-user with the CoreELEC libraries (--appimage-extract, --help, a local
+# decode, an MQTT connect). No GS-King X is involved: DRM/KMS, Amlogic
+# hardware decode, and the Kodi handover are not tested here.
+#
+# The host smoke AppImages (x86_64, Ubuntu aarch64) are built by ci.yml.
+
+name: CoreELEC device AppImages
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coreelec-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  device:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: coreelec21-ng-armv7hf
+            cross: g++-arm-linux-gnueabihf
+            file_pattern: 'ELF 32-bit LSB .*ARM, EABI5'
+          - target: coreelec22-no-aarch64
+            cross: g++-aarch64-linux-gnu
+            file_pattern: 'ELF 64-bit LSB .*ARM aarch64'
+    env:
+      CMAKE_BUILD_TYPE: Release
+      AMS_REQUIRE_DEVICE_CHECKS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Sysroot (shared libraries from the CoreELEC image), FFmpeg headers,
+      # libmosquitto, and the pinned AppImage tools. The CoreELEC archive
+      # itself is deleted after extraction, so it is not cached.
+      - name: Cache CoreELEC sysroot and dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            .cache/coreelec/${{ matrix.target }}
+            .cache/coreelec/downloads
+          key: coreelec-${{ matrix.target }}-${{ hashFiles('scripts/coreelec-targets.sh', 'scripts/fetch-coreelec-sysroot.sh', 'scripts/build-coreelec-appimage.sh') }}
+
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ccache
+          key: ccache-coreelec-${{ matrix.target }}-${{ hashFiles('CMakeLists.txt', 'src/**') }}
+          restore-keys: |
+            ccache-coreelec-${{ matrix.target }}-
+
+      - name: Install cross toolchain and check tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ${{ matrix.cross }} \
+            ca-certificates \
+            ccache \
+            cmake \
+            curl \
+            ffmpeg \
+            file \
+            make \
+            mosquitto \
+            patchelf \
+            pkg-config \
+            qemu-user-static \
+            squashfs-tools \
+            xz-utils
+
+      - name: Fetch CoreELEC sysroot
+        run: ./scripts/fetch-coreelec-sysroot.sh ${{ matrix.target }}
+
+      - name: Build and verify device AppImage
+        run: ./scripts/build-coreelec-appimage.sh --no-fetch ${{ matrix.target }}
+
+      - name: Check AppImage architecture
+        run: |
+          set -euo pipefail
+          mapfile -t images < <(find dist/${{ matrix.target }} -maxdepth 1 -type f -name '*.AppImage' | sort)
+          if [[ "${#images[@]}" -ne 1 ]]; then
+            echo "expected one AppImage, found ${#images[@]}" >&2
+            exit 1
+          fi
+          case "$(basename "${images[0]}")" in
+            amlogic-multistream-*-${{ matrix.target }}.AppImage) ;;
+            *) echo "unexpected name ${images[0]}" >&2; exit 1 ;;
+          esac
+          file "${images[0]}"
+          file "${images[0]}" | grep -E -q '${{ matrix.file_pattern }}'
+          file dist/${{ matrix.target }}/AppDir/usr/bin/amlogic-multistream
+          file dist/${{ matrix.target }}/AppDir/usr/bin/amlogic-multistream | grep -E -q '${{ matrix.file_pattern }}'
+
+      # The installer must accept this artifact for its own CoreELEC line.
+      - name: Install helper accepts the artifact
+        run: |
+          set -euo pipefail
+          image=$(find dist/${{ matrix.target }} -maxdepth 1 -type f -name '*.AppImage' | head -n 1)
+          storage=$(mktemp -d)
+          ./scripts/install-kodi-addon.sh --storage "$storage" --target ${{ matrix.target }} --player "$image"
+          cmp "$image" "$storage/amlogic-multistream"
+
+      - name: Upload device AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: amlogic-multistream-appimage-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/*.AppImage
+          if-no-files-found: error
+          compression-level: 0

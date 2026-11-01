@@ -87,7 +87,7 @@ coreelec_download() {
   fi
   echo "Downloading $url"
   mkdir -p "$(dirname "$dest")"
-  curl -fL --retry 3 --retry-delay 2 -sS -o "$dest.partial" "$url"
+  curl -fL --retry 5 --retry-delay 3 --retry-all-errors -sS -o "$dest.partial" "$url"
   if ! echo "$sha  $dest.partial" | sha256sum -c --status; then
     echo "error: sha256 mismatch for $url" >&2
     echo "  expected $sha" >&2
