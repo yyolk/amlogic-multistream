@@ -171,11 +171,20 @@ bool frameLooksComplete(const DecodedFrame& frame) {
            frame.linesize[2] >= chroma_w;
 }
 
-// Same prefix check as MQTT add / StreamPlayer: only lowercase http(s).
-// An HTTP(S) --url must not inherit the file protocol, or a playlist
-// segment of file:///… would decode a local file (AUDIT7 B2).
-bool urlIsRemoteHttp(const std::string& url) {
-    return url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0;
+// FFmpeg opens a scheme-less path and file: / file:// as the file protocol.
+// Only those --url forms may enable that protocol. Inverting the MQTT
+// http(s) prefix check is wrong: hls+http:// is already on the whitelist
+// and is not a local file source (AUDIT7 B2).
+bool urlIsLocalFileSource(const std::string& url) {
+    if (url.compare(0, 5, "file:") == 0) {
+        return true;
+    }
+    const auto colon = url.find(':');
+    if (colon == std::string::npos) {
+        return true;
+    }
+    const auto slash = url.find('/');
+    return slash != std::string::npos && slash < colon;
 }
 
 // Single-stream software decode, then one Renderer::present() per frame.
@@ -185,10 +194,11 @@ bool urlIsRemoteHttp(const std::string& url) {
 int decodeUrl(const std::string& url, int frames, PresenterKind presenter, const std::string& renderDir) {
     std::cout << "Software decode isHardware=0 url=" << url << "\n";
     FfmpegDecoder decoder;
-    // CLI --url is the local-file allowance only for a path or file:// URL
-    // (fixture tests, a path on disk). http:// and https:// leave the flag
-    // off so a playlist file:// segment stays rejected, same as MQTT add.
-    if (!urlIsRemoteHttp(url)) {
+    // CLI --url is the local-file allowance only for a scheme-less path or
+    // file: / file:// (fixture tests, a path on disk). Nested remote forms
+    // such as hls+http:// leave the flag off so a playlist file:// segment
+    // stays rejected, same as MQTT add.
+    if (urlIsLocalFileSource(url)) {
         decoder.setAllowLocalFile(true);
     }
     if (!decoder.open(url)) {

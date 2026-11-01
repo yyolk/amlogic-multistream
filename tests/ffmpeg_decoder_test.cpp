@@ -757,11 +757,19 @@ void testHttpPlaylistFileSegment(const std::filesystem::path& mp4, const std::fi
     if (server.pid <= 0 || server.port <= 0) {
         return;
     }
-    const std::string url = "http://127.0.0.1:" + std::to_string(server.port) + "/file_seg.m3u8";
+    const std::string hostPath = "127.0.0.1:" + std::to_string(server.port) + "/file_seg.m3u8";
+    const std::string url = "http://" + hostPath;
+    const std::string hlsUrl = "hls+http://" + hostPath;
 
     FfmpegDecoder remote;
     CHECK(!remote.open(url));
     remote.close();
+
+    g_case = "hls+http playlist file:// segment";
+    FfmpegDecoder nested;
+    CHECK(!nested.open(hlsUrl));
+    nested.close();
+    g_case = "http playlist file:// segment";
 
     FfmpegDecoder local;
     local.setAllowLocalFile(true);

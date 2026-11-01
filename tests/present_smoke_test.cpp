@@ -20,8 +20,9 @@
 // the ffmpeg CLI, presents two frames through the software renderer, and
 // checks that --renderer drm fails without opening a successful scanout.
 // AUDIT7 B2: an HTTP playlist whose only segment is file:///… must be
-// rejected on --url (same as MQTT add). Exit 77 when the ffmpeg CLI is
-// missing so ctest can skip.
+// rejected on --url, including hls+http:// (same as MQTT add). A path or
+// file:// of the fixture must still present. Exit 77 when the ffmpeg CLI
+// is missing so ctest can skip.
 
 #ifndef PLAYER_BIN
 #define PLAYER_BIN ""
@@ -335,6 +336,7 @@ int main() {
 
         // AUDIT7 B2: --url of an HTTP playlist whose only segment is file:///…
         // must reject the local file, same as MQTT add (flag stays off).
+        // hls+http:// is on the protocol whitelist and must not inherit file.
         {
             std::ostringstream playlist;
             playlist << "#EXTM3U\n"
@@ -349,19 +351,32 @@ int main() {
                 std::cerr << "file-segment playlist server failed to start\n";
                 return 1;
             }
-            const std::string evilUrl =
-                "http://127.0.0.1:" + std::to_string(server.port) + "/file_seg.m3u8";
-            const int leaked = run({player, "--url", evilUrl, "--frames", "1"}, out, err);
-            const std::string leakOut = readFile(out);
-            const std::string leakErr = readFile(err);
-            server.stop();
-            if (leaked == 0 || leakOut.find("Decoded ") != std::string::npos ||
-                leakOut.find("fmt=yuv420p") != std::string::npos) {
-                std::cerr << "http --url with file:// segment must be rejected (exit " << leaked
-                          << ")\n"
-                          << leakOut << leakErr;
-                return 1;
+            const std::string hostPath =
+                "127.0.0.1:" + std::to_string(server.port) + "/file_seg.m3u8";
+            const char* prefixes[] = {"http://", "hls+http://"};
+            for (const char* prefix : prefixes) {
+                const std::string evilUrl = std::string(prefix) + hostPath;
+                const int leaked = run({player, "--url", evilUrl, "--frames", "1"}, out, err);
+                const std::string leakOut = readFile(out);
+                const std::string leakErr = readFile(err);
+                if (leaked == 0 || leakOut.find("Decoded ") != std::string::npos ||
+                    leakOut.find("fmt=yuv420p") != std::string::npos) {
+                    server.stop();
+                    std::cerr << prefix << " --url with file:// segment must be rejected (exit "
+                              << leaked << ")\n"
+                              << leakOut << leakErr;
+                    return 1;
+                }
             }
+            server.stop();
+        }
+
+        const int fileScheme = run({player, "--url", "file://" + mp4.string(), "--frames", "1"}, out, err);
+        if (fileScheme != 0) {
+            std::cerr << "file:// --url of a local fixture should still present (exit " << fileScheme
+                      << ")\n"
+                      << readFile(out) << readFile(err);
+            return 1;
         }
 
         const std::filesystem::path drmOut = tmp.path() / "drm.out";
