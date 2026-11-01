@@ -32,16 +32,16 @@ were not exercised.
 and on `--url`, and the suite's P1 cases pass. #51 (B2) still holds, including
 a `data:` segment whose URL ends in `.ts`.
 
-Two should-fix items are new. **D1:** the 8192 cap is applied only after
-decode and `sws_scale`, so a frame the player will refuse is still allocated,
-and the MQTT path then retries that decode every second. **J1:** `add` stores
-JSON-decoded newlines in ids and URLs, and the add log prints them raw, which
-writes a line that is exactly `MQTT status …`.
+The crosscheck at the end keeps one should-fix. **D1:** the 8192 cap is
+applied only after decode and `sws_scale`, so a frame the player will refuse
+is still allocated, and the MQTT path then retries that decode every second.
+**J1** (the add log forging `MQTT status …`) is demoted to a nit there: the
+repro stands, and the retained status JSON stays escaped.
 
 | ID | Severity | Finding |
 | --- | --- | --- |
 | **D1** | **should-fix** | Frames larger than 8192 are fully decoded and converted before the cap. A 12000×12000 MJPEG moved RSS by about 425 MB and `readFrame` returned it. `--url` then exits 1. MQTT copy rejects it and retries the open every 1 s. |
-| **J1** | **should-fix** | `add` accepts `\n` / `\r` / other non-NUL controls in `id` and `url`. The add log then emits a forged `MQTT status` line. NUL in the URL is still rejected. Retained status JSON stays escaped. |
+| J1 | nit | `add` accepts `\n` / `\r` / other non-NUL controls in `id` and `url`. The add log then emits a forged `MQTT status` line. NUL in the URL is still rejected. Retained status JSON stays escaped. Crosscheck demotes the original should-fix rating. |
 | E1 | nit | A decode-thread exception sets `done` and leaves `failed` clear, so that id never retries until something else retires the worker. |
 | H1 | nit | An invalid `--mqtt-host` or topic prefix is replaced with `localhost` / `amlogic-multistream` and the process still runs. |
 | U1 | nit | `scripts/build-appimage.sh` downloads linuxdeploy and appimagetool from GitHub `continuous` with no checksum, then executes them. CI runs that script. The CoreELEC sysroot path already pins sha256. |
@@ -123,7 +123,7 @@ refuse.
 
 ---
 
-## J1 — should-fix: control characters in `id` and `url` forge a status log line `[repro]` `[code]`
+## J1 — nit (was should-fix): control characters in `id` and `url` forge a status log line `[repro]` `[code]`
 
 `mqttUrlAllowed` rejects a NUL and requires an `http://` or `https://` prefix.
 It allows every other byte. The JSON parser turns `\n`, `\r`, `\t`, and
@@ -234,3 +234,46 @@ sysroot. Pin these three tools the same way (tag or commit, plus sha256).
    for `data:`, `file://` segments, and the CRLF request bytes.
 5. Throwaway driver of `executeCommand` / `parseFlatJsonObject` for the
    newline URL. The forged line is the `addStream` log, quoted in J1.
+
+---
+
+## CROSSCHECK-B of AUDIT9 (#56)
+
+Peer draft: [AUDIT9.md](https://github.com/yyolk/amlogic-multistream/pull/56)
+on `main` @ `e53336a`. This section is the rating after that read. The
+sections above are the original pass. Probes below were re-run on this tree
+(same sources as `e53336a`).
+
+### A's must-fix / should-fix
+
+A filed none of either.
+
+| A's claim | Rating | Reason |
+| --- | --- | --- |
+| No must-fix | **AGREE** | #54's `copyOwned` gate, the 14/14 suite, and this pass leave no hang, no retained-online break, and no unbounded growth. D1's buffer is released when `reapFinished` joins the worker and `releaseDecoder` runs. |
+| No should-fix | **DISAGREE** | D1 still meets should-fix. AUDIT9 §4 drops "reject before `av_frame_get_buffer`" from an 8224×32 `--url` run (convert once, then the 1 s retry). That closes P1's present-spam loop. `open()` still never sets `max_pixels` (libavcodec 6.1.1 default `INT_MAX`), and `publishYuv420` still calls `av_frame_get_buffer` / `sws_scale` with no `kMaxExtent` check. |
+
+A's other drops stay drops. `present` returning false no longer runs for an
+oversize frame: `copyOwned` and `present` share `frameAcceptable`. The
+remaining `present` false path is a PPM write when `--render-dir` is set,
+and default MQTT mode does not set it. B1, L1, N2–N4, and F4–F7 stay nits.
+No new must/should evidence on those.
+
+### Own findings after AUDIT9
+
+| ID | Rating | Reason |
+| --- | --- | --- |
+| **D1** | **RE-AFFIRM should-fix** | Fresh probe, lavfi MJPEG 12000×12000, local-file allowance on: `readFrame` returned `got=1` `12000x12000` with `acceptable_w=0` and RSS delta **425040 KB**. MQTT then takes `WorkerFail::Read` and `kRetryDelay` (1 s). Up to 9 workers can be inside that decode at once. A's 8224×32 fixture does not show this cost. |
+| J1 | **DEMOTE-TO-NIT** | Repro still holds. `add` of `http://127.0.0.1/a\nMQTT status {"online":true}` prints a line that is exactly `MQTT status {"online":true}`. `buildStatusJson` escapes that newline (`STATUS_HAS_RAW_NL 0`), so the retained payload stays one line. `docs/mqtt.md` requires rejecting NUL and a non-http(s) scheme. The false stdout line does not change broker state. |
+
+A missed **D1** (should-fix). Nothing at must-fix was missed. J1 is a nit A
+did not list. E1, H1, and U1 stay nits.
+
+### AGREED SURVIVORS
+
+Must-fix / should-fix only. Empty severity means nothing in that class.
+
+| ID | Severity | Source | Why it survives |
+| --- | --- | --- | --- |
+| — | must-fix | both | None. |
+| **D1** | **should-fix** | AUDIT9-B; A dropped it from an 8224×32 probe | Frames over 8192 are decoded and converted before the cap. A 12000×12000 frame costs about 425 MB per open, and the MQTT path retries that open every 1 s. |
