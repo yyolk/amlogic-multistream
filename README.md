@@ -96,7 +96,7 @@ Pass `-DCMAKE_CXX_COMPILER=g++` when `c++` on the PATH is not g++.
 
 ## Tests
 
-`layout_engine_tests` is the layout unit-test binary. CTest registers it as `layout_engine`. The same `ctest` run also executes `stream_manager_test`, `mqtt_smoke_test`, `software_renderer_tests`, `stream_player_test`, `scripts/test-ctest-require.sh` (the CI guard that rejects a run where `ffmpeg_decoder`, `present_smoke`, or `stream_player_http` was omitted or skipped), and `scripts/test-launch-coreelec.sh` (a stand-in for the CoreELEC launch script: bash, dash, and busybox ash when busybox is installed). When the FFmpeg libraries are present it also runs `ffmpeg_decoder_tests` and `stream_player_http`, and when the player dependencies are present it runs `present_smoke_test`.
+`layout_engine_tests` is the layout unit-test binary. CTest registers it as `layout_engine`. The same `ctest` run also executes `stream_manager_test`, `mqtt_smoke_test`, `software_renderer_tests`, `stream_player_test`, `scripts/test-ctest-require.sh` (the CI guard that rejects a run where `ffmpeg_decoder`, `present_smoke`, or `stream_player_http` was omitted or skipped), `scripts/test-launch-coreelec.sh` (a stand-in for the CoreELEC launch script: bash, dash, and busybox ash when busybox is installed), and `tests/kodi_addon_test.py` (the Kodi add-on against stub Kodi modules, when `python3` is found). When the FFmpeg libraries are present it also runs `ffmpeg_decoder_tests` and `stream_player_http`, and when the player dependencies are present it runs `present_smoke_test`.
 
 ```bash
 cmake -S . -B build -DCMAKE_CXX_COMPILER=g++
