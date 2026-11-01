@@ -146,6 +146,14 @@ bool urlIsRemoteHttp(const std::string& url) {
            url.compare(0, 11, "hls+http://") == 0 || url.compare(0, 12, "hls+https://") == 0;
 }
 
+// avio_open2 speaks http(s); hls+ is only a demuxer scheme.
+std::string avioPeekUrl(const std::string& url) {
+    if (url.compare(0, 4, "hls+") == 0) {
+        return url.substr(4);
+    }
+    return url;
+}
+
 // Local .ts / .mp4 skip the extra read (D2 still caps after open). http(s)
 // always peeks: a .ts path may be mpegurl or a redirect to a master.
 bool shouldPeekForHls(const std::string& url) {
@@ -232,13 +240,37 @@ HlsMediaAttrs parseHlsMediaAttrs(const std::string& attrs) {
     return out;
 }
 
-bool hlsMasterHasExternalAudio(const std::string& text) {
-    std::string line;
-    std::istringstream in(text);
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
+// Same terminators as FFmpeg 6.1.1 ff_get_line: \n, \r, and \0. A \r\n
+// pair is one break. The terminator is not part of the line.
+bool hlsNextLine(const std::string& text, size_t* pos, std::string* line) {
+    if (pos == nullptr || line == nullptr || *pos >= text.size()) {
+        return false;
+    }
+    const size_t start = *pos;
+    size_t i = start;
+    while (i < text.size()) {
+        const char c = text[i];
+        if (c == '\n' || c == '\r' || c == '\0') {
+            break;
         }
+        ++i;
+    }
+    *line = text.substr(start, i - start);
+    if (i < text.size()) {
+        const char c = text[i];
+        ++i;
+        if (c == '\r' && i < text.size() && text[i] == '\n') {
+            ++i;
+        }
+    }
+    *pos = i;
+    return true;
+}
+
+bool hlsMasterHasExternalAudio(const std::string& text) {
+    size_t pos = 0;
+    std::string line;
+    while (hlsNextLine(text, &pos, &line)) {
         if (line.compare(0, 13, "#EXT-X-MEDIA:") != 0) {
             continue;
         }
@@ -255,12 +287,9 @@ bool hlsMasterHasExternalAudio(const std::string& text) {
 }
 
 bool hlsHasExtInf(const std::string& text) {
+    size_t pos = 0;
     std::string line;
-    std::istringstream in(text);
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
+    while (hlsNextLine(text, &pos, &line)) {
         if (line.compare(0, 8, "#EXTINF:") == 0) {
             return true;
         }
@@ -269,19 +298,18 @@ bool hlsHasExtInf(const std::string& text) {
 }
 
 std::string firstHlsStreamInfUri(const std::string& text) {
+    size_t pos = 0;
     std::string line;
-    std::istringstream in(text);
     bool want_uri = false;
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
+    while (hlsNextLine(text, &pos, &line)) {
         const std::string trimmed = trimCopy(line);
         if (trimmed.empty()) {
             continue;
         }
         if (trimmed[0] == '#') {
-            want_uri = trimmed.compare(0, 18, "#EXT-X-STREAM-INF:") == 0;
+            if (trimmed.compare(0, 18, "#EXT-X-STREAM-INF:") == 0) {
+                want_uri = true;
+            }
             continue;
         }
         if (want_uri) {
@@ -351,9 +379,12 @@ void stripUtf8Bom(std::string* text) {
 }
 
 bool firstLineIsExtm3u(const std::string& text) {
-    const auto nl = text.find('\n');
-    const std::string start = trimCopy(text.substr(0, nl == std::string::npos ? text.size() : nl));
-    return start.compare(0, 7, "#EXTM3U") == 0;
+    size_t pos = 0;
+    std::string line;
+    if (!hlsNextLine(text, &pos, &line)) {
+        return false;
+    }
+    return trimCopy(line).compare(0, 7, "#EXTM3U") == 0;
 }
 
 bool samePlaylistUrl(const std::string& a, const std::string& b) {
@@ -395,6 +426,7 @@ struct PlaylistPreview {
     std::string body;
     std::string final_url;
     bool mpegurl = false;
+    bool open_error = false;
     bool read_error = false;
     bool hit_max = false;
 };
@@ -404,9 +436,11 @@ PlaylistPreview readHlsPlaylistPreview(const std::string& url, bool allow_local,
     AVDictionary* opts = nullptr;
     setDecoderIoOptions(&opts, allow_local);
     AVIOContext* pb = nullptr;
-    const int rc = avio_open2(&pb, url.c_str(), AVIO_FLAG_READ, cb, &opts);
+    const std::string peek_url = avioPeekUrl(url);
+    const int rc = avio_open2(&pb, peek_url.c_str(), AVIO_FLAG_READ, cb, &opts);
     av_dict_free(&opts);
     if (rc < 0 || pb == nullptr) {
+        out.open_error = true;
         return out;
     }
     out.mpegurl = mimeLooksMpegurl(avioChildString(pb, "mime_type"));
@@ -442,9 +476,9 @@ PlaylistPreview readHlsPlaylistPreview(const std::string& url, bool allow_local,
 
 bool hlsPreviewIncomplete(const PlaylistPreview& prev) {
     if (!firstLineIsExtm3u(prev.body)) {
-        return prev.mpegurl && prev.body.empty();
+        return prev.mpegurl;
     }
-    if (prev.read_error || prev.hit_max) {
+    if (prev.open_error || prev.read_error || prev.hit_max) {
         return true;
     }
     return firstHlsStreamInfUri(prev.body).empty() && !hlsHasExtInf(prev.body);
@@ -481,6 +515,11 @@ bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AV
             *url = resolved;
             seen.push_back(resolved);
             continue;
+        }
+        // http(s) peek failed (TLS close, reset, empty after error): the
+        // next avformat_open_input can still get a master. Refuse instead.
+        if (urlIsRemoteHttp(*url) && (prev.open_error || prev.body.empty())) {
+            return false;
         }
         if (firstLineIsExtm3u(prev.body) || prev.mpegurl) {
             return !hlsPreviewIncomplete(prev);

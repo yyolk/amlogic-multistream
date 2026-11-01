@@ -285,6 +285,25 @@ struct LocalHttp {
             ::close(client);
             continue;
         }
+        if (ok && rel == "failpeek.m3u8") {
+            static int failpeek_hits = 0;
+            if (failpeek_hits++ == 0) {
+                ::close(client);
+                continue;
+            }
+        }
+        if (ok && rel == "garbage.m3u8") {
+            static int garbage_hits = 0;
+            if (garbage_hits++ == 0) {
+                const char* stub =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n"
+                    "Content-Type: application/vnd.apple.mpegurl\r\n"
+                    "Connection: close\r\n\r\nX";
+                sendAll(client, stub, std::char_traits<char>::length(stub));
+                ::close(client);
+                continue;
+            }
+        }
         if (ok && rel == "trunc.m3u8") {
             static int trunc_hits = 0;
             if (trunc_hits++ == 0) {
@@ -944,6 +963,74 @@ int main() {
                 return 1;
             }
 
+            auto writeD4Master = [&](const std::filesystem::path& path, const std::string& mediaPrefix,
+                                     bool mediaAfterStreaminf) {
+                std::string body = "#EXTM3U\n#EXT-X-VERSION:4\n";
+                const std::string media = std::string("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",") +
+                                          "NAME=\"en\",DEFAULT=YES,URI=\"" +
+                                          audioHls.filename().string() + "\"";
+                const std::string stream = "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"";
+                if (mediaAfterStreaminf) {
+                    body += stream;
+                    body += mediaPrefix;
+                    body += media;
+                    body += '\n';
+                } else {
+                    body += mediaPrefix;
+                    body += media;
+                    body += '\n';
+                    body += stream;
+                    body += '\n';
+                }
+                body += videoHls.filename().string();
+                body += '\n';
+                std::ofstream(path, std::ios::binary) << body;
+            };
+            const std::filesystem::path crMedia = tmp.path() / "d4-cr-media.m3u8";
+            const std::filesystem::path nulMedia = tmp.path() / "d4-nul-media.m3u8";
+            const std::filesystem::path cNulMedia = tmp.path() / "d4-cnul-media.m3u8";
+            const std::filesystem::path streamCr = tmp.path() / "d4-streaminf-cr-media.m3u8";
+            writeD4Master(crMedia, std::string(1, '\r'), false);
+            writeD4Master(nulMedia, std::string(1, '\0'), false);
+            writeD4Master(cNulMedia, std::string("#c") + '\0', false);
+            writeD4Master(streamCr, std::string(1, '\r'), true);
+            {
+                std::ifstream src(masterAudio);
+                std::ofstream(tmp.path() / "failpeek.m3u8") << src.rdbuf();
+            }
+            {
+                std::ifstream src(masterAudio);
+                std::ofstream(tmp.path() / "garbage.m3u8") << src.rdbuf();
+            }
+            long crRss = 0;
+            const int crRc =
+                run({player, "--url", crMedia.string(), "--frames", "1"}, out, err, &crRss);
+            if (!d4MustStayCapped("CR-prefixed MEDIA", crRc, crRss, readFile(out), readFile(err),
+                                  true)) {
+                return 1;
+            }
+            long nulRss = 0;
+            const int nulRc =
+                run({player, "--url", nulMedia.string(), "--frames", "1"}, out, err, &nulRss);
+            if (!d4MustStayCapped("NUL-prefixed MEDIA", nulRc, nulRss, readFile(out), readFile(err),
+                                  true)) {
+                return 1;
+            }
+            long cNulRss = 0;
+            const int cNulRc =
+                run({player, "--url", cNulMedia.string(), "--frames", "1"}, out, err, &cNulRss);
+            if (!d4MustStayCapped("comment-NUL MEDIA", cNulRc, cNulRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+            long streamCrRss = 0;
+            const int streamCrRc =
+                run({player, "--url", streamCr.string(), "--frames", "1"}, out, err, &streamCrRss);
+            if (!d4MustStayCapped("STREAM-INF CR MEDIA", streamCrRc, streamCrRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+
             // Extensionless HTTP URL, Content-Type mpegurl. The first peek
             // only ran for .m3u8 / hls+.
             const std::filesystem::path extless = tmp.path() / "playlist";
@@ -990,8 +1077,28 @@ int main() {
             const int truncRc =
                 run({player, "--url", httpBase + "/trunc.m3u8", "--frames", "1"}, out, err,
                     &truncRss);
-            d4http.stop();
             if (!d4MustStayCapped("truncated EXTM3U preview", truncRc, truncRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long failRss = 0;
+            const int failRc =
+                run({player, "--url", httpBase + "/failpeek.m3u8", "--frames", "1"}, out, err,
+                    &failRss);
+            if (!d4MustStayCapped("http peek failure", failRc, failRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long garbageRss = 0;
+            const int garbageRc =
+                run({player, "--url", httpBase + "/garbage.m3u8", "--frames", "1"}, out, err,
+                    &garbageRss);
+            d4http.stop();
+            if (!d4MustStayCapped("mpegurl body X", garbageRc, garbageRss, readFile(out),
                                   readFile(err), false)) {
                 return 1;
             }

@@ -370,6 +370,21 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
             ::close(client);
             continue;
         }
+        if (ok && rel == "failpeek.m3u8") {
+            static int failpeek_hits = 0;
+            if (failpeek_hits++ == 0) {
+                ::close(client);
+                continue;
+            }
+        }
+        if (ok && rel == "garbage.m3u8") {
+            static int garbage_hits = 0;
+            if (garbage_hits++ == 0) {
+                sendResponse(client, 200, "X", "application/vnd.apple.mpegurl");
+                ::close(client);
+                continue;
+            }
+        }
         if (ok) {
             const std::filesystem::path full = root / rel;
             std::ifstream in(full, std::ios::binary);
@@ -1099,6 +1114,55 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
     }
     testDecode(d4unclosed.string());
 
+    auto writeD4Master = [&](const std::filesystem::path& path, const std::string& media_prefix,
+                             bool media_after_streaminf) {
+        std::string body = "#EXTM3U\n#EXT-X-VERSION:4\n";
+        const std::string media = std::string("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",") +
+                                  "NAME=\"en\",DEFAULT=YES,URI=\"" + d4audio.filename().string() +
+                                  "\"";
+        const std::string stream = "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"";
+        if (media_after_streaminf) {
+            body += stream;
+            body += media_prefix;
+            body += media;
+            body += '\n';
+        } else {
+            body += media_prefix;
+            body += media;
+            body += '\n';
+            body += stream;
+            body += '\n';
+        }
+        body += d4video.filename().string();
+        body += '\n';
+        std::ofstream(path, std::ios::binary) << body;
+    };
+
+    g_case = "hls CR-prefixed MEDIA presents small stream";
+    writeD4Master(dir / "d4-cr-media.m3u8", std::string(1, '\r'), false);
+    testDecode((dir / "d4-cr-media.m3u8").string());
+
+    g_case = "hls NUL-prefixed MEDIA presents small stream";
+    writeD4Master(dir / "d4-nul-media.m3u8", std::string(1, '\0'), false);
+    testDecode((dir / "d4-nul-media.m3u8").string());
+
+    g_case = "hls comment-NUL MEDIA presents small stream";
+    writeD4Master(dir / "d4-cnul-media.m3u8", std::string("#c") + '\0', false);
+    testDecode((dir / "d4-cnul-media.m3u8").string());
+
+    g_case = "hls STREAM-INF CR MEDIA presents small stream";
+    writeD4Master(dir / "d4-streaminf-cr-media.m3u8", std::string(1, '\r'), true);
+    testDecode((dir / "d4-streaminf-cr-media.m3u8").string());
+
+    {
+        std::ifstream src(d4master);
+        std::ofstream(dir / "failpeek.m3u8") << src.rdbuf();
+    }
+    {
+        std::ifstream src(d4master);
+        std::ofstream(dir / "garbage.m3u8") << src.rdbuf();
+    }
+
     g_case = "hls extensionless http master audio";
     {
         std::ifstream src(d4master);
@@ -1131,6 +1195,14 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         FfmpegDecoder trunc;
         CHECK(!trunc.open(httpBase + "/trunc.m3u8"));
         trunc.close();
+        g_case = "hls http peek failure refuses";
+        FfmpegDecoder failpeek;
+        CHECK(!failpeek.open(httpBase + "/failpeek.m3u8"));
+        failpeek.close();
+        g_case = "hls mpegurl body X refuses";
+        FfmpegDecoder garbage;
+        CHECK(!garbage.open(httpBase + "/garbage.m3u8"));
+        garbage.close();
     }
     server.stop();
 }

@@ -63,9 +63,11 @@ public:
     // read_header with find_stream_info(NULL), so that nested decoder
     // would keep max_pixels == INT_MAX. open() peeks http(s) even when
     // the path ends in .ts (mpegurl Content-Type or a redirect to a
-    // master). MEDIA attributes follow ff_parse_key_value (spaces,
-    // last-wins, unclosed quotes). A truncated #EXTM3U preview is
-    // refused rather than opened uncapped (AUDIT12 D4).
+    // master). Playlist lines end on \\n / \\r / \\0 like ff_get_line.
+    // MEDIA attributes follow ff_parse_key_value (spaces, last-wins,
+    // unclosed quotes). A truncated #EXTM3U, a failed http(s) peek, or
+    // mpegurl that is not #EXTM3U is refused rather than opened
+    // uncapped (AUDIT12 D4).
     // readFrame() also refuses to convert a frame that fails those
     // extent and stride caps (AUDIT9 D1).
     void setAllowLocalFile(bool allow);
