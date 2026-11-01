@@ -961,6 +961,26 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
     const std::filesystem::path extraHls = dir / "extra-pid.m3u8";
     writeMediaPlaylist(extraHls, extraPid.filename().string());
     testDecode(extraHls.string());
+
+    // AUDIT12 D4: AUDIO group points at the 12000x12000 TS; video is small.
+    g_case = "hls master audio huge ts presents small stream";
+    const std::filesystem::path d4audio = dir / "d4-audio.m3u8";
+    const std::filesystem::path d4video = dir / "d4-video.m3u8";
+    const std::filesystem::path d4master = dir / "d4-master-audio.m3u8";
+    writeMediaPlaylist(d4audio, hugePmt.filename().string());
+    writeMediaPlaylist(d4video, smallPmt.filename().string());
+    {
+        std::ofstream master(d4master);
+        master << "#EXTM3U\n"
+               << "#EXT-X-VERSION:4\n"
+               << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,"
+                  "AUTOSELECT=YES,URI=\""
+               << d4audio.filename().string() << "\"\n"
+               << "#EXT-X-STREAM-INF:BANDWIDTH=400000,CODECS=\"avc1.42e01e,mp4a.40.2\","
+                  "AUDIO=\"aud\"\n"
+               << d4video.filename().string() << "\n";
+    }
+    testDecode(d4master.string());
 }
 
 void testMissingFile(const std::filesystem::path& dir) {

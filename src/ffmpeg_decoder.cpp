@@ -2,9 +2,11 @@
 
 #include "software_renderer.h"
 
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <iostream>
+#include <sstream>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -95,6 +97,243 @@ bool decodedFramePresentable(const AVFrame* src) {
 
 void setPresentableMaxPixels(AVDictionary** opts) {
     av_dict_set_int(opts, "max_pixels", presentableMaxPixels(), 0);
+}
+
+void setDecoderIoOptions(AVDictionary** opts, bool allow_local) {
+    av_dict_set(opts, "rw_timeout", kRwTimeoutUs, 0);
+    av_dict_set(opts, "user_agent", "amlogic-multistream/0.1", 0);
+    av_dict_set(opts, "protocol_whitelist",
+                allow_local ? "file,http,https,tls,tcp,crypto,hls"
+                            : "http,https,tls,tcp,crypto,hls",
+                0);
+}
+
+std::string stripUrlQuery(const std::string& url) {
+    const auto cut = url.find_first_of("?#");
+    return cut == std::string::npos ? url : url.substr(0, cut);
+}
+
+bool endsWithIgnoreCase(const std::string& s, const char* suffix) {
+    const size_t n = std::char_traits<char>::length(suffix);
+    if (s.size() < n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (std::tolower(static_cast<unsigned char>(s[s.size() - n + i])) !=
+            std::tolower(static_cast<unsigned char>(suffix[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Peek only playlist-looking URLs. A .ts / .mp4 open must not pay an extra
+// read; D4's master and the ADTS-audio master are .m3u8 (or hls+).
+bool urlLooksLikeHlsPlaylist(const std::string& url) {
+    if (url.compare(0, 4, "hls+") == 0 || url.compare(0, 4, "HLS+") == 0) {
+        return true;
+    }
+    const std::string path = stripUrlQuery(url);
+    return endsWithIgnoreCase(path, ".m3u8") || endsWithIgnoreCase(path, ".m3u");
+}
+
+std::string trimCopy(const std::string& s) {
+    size_t b = 0;
+    size_t e = s.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) {
+        ++b;
+    }
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) {
+        --e;
+    }
+    return s.substr(b, e - b);
+}
+
+// HLS attribute list after the ':'. Commas inside quoted values stay inside
+// the value. TYPE=AUDIO and URI= can appear in any order.
+std::string hlsAttrValue(const std::string& attrs, const char* key) {
+    const size_t key_len = std::char_traits<char>::length(key);
+    bool in_quote = false;
+    for (size_t i = 0; i < attrs.size(); ++i) {
+        const char c = attrs[i];
+        if (c == '"') {
+            in_quote = !in_quote;
+            continue;
+        }
+        if (in_quote) {
+            continue;
+        }
+        const bool at_token = (i == 0) || attrs[i - 1] == ',' || attrs[i - 1] == ':' ||
+                              std::isspace(static_cast<unsigned char>(attrs[i - 1]));
+        if (!at_token || attrs.compare(i, key_len, key) != 0 || i + key_len >= attrs.size() ||
+            attrs[i + key_len] != '=') {
+            continue;
+        }
+        size_t v = i + key_len + 1;
+        while (v < attrs.size() && std::isspace(static_cast<unsigned char>(attrs[v]))) {
+            ++v;
+        }
+        if (v < attrs.size() && attrs[v] == '"') {
+            const size_t end = attrs.find('"', v + 1);
+            if (end == std::string::npos) {
+                return {};
+            }
+            return attrs.substr(v + 1, end - (v + 1));
+        }
+        size_t end = v;
+        while (end < attrs.size() && attrs[end] != ',') {
+            ++end;
+        }
+        return trimCopy(attrs.substr(v, end - v));
+    }
+    return {};
+}
+
+bool hlsMasterHasExternalAudio(const std::string& text) {
+    std::string line;
+    std::istringstream in(text);
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.compare(0, 13, "#EXT-X-MEDIA:") != 0) {
+            continue;
+        }
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        const std::string attrs = line.substr(colon);
+        if (hlsAttrValue(attrs, "TYPE") == "AUDIO" && !hlsAttrValue(attrs, "URI").empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string firstHlsStreamInfUri(const std::string& text) {
+    std::string line;
+    std::istringstream in(text);
+    bool want_uri = false;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const std::string trimmed = trimCopy(line);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (trimmed[0] == '#') {
+            want_uri = trimmed.compare(0, 18, "#EXT-X-STREAM-INF:") == 0;
+            continue;
+        }
+        if (want_uri) {
+            return trimmed;
+        }
+    }
+    return {};
+}
+
+bool urlHasScheme(const std::string& url) {
+    const auto colon = url.find(':');
+    if (colon == std::string::npos || colon == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < colon; ++i) {
+        const unsigned char c = static_cast<unsigned char>(url[i]);
+        if (!(std::isalnum(c) || c == '+' || c == '.' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Same join FFmpeg 6.1.1 ff_make_absolute_url uses for playlist refs:
+// scheme-bearing and // refs win, a leading / replaces the path, else
+// the ref is appended after the last slash of the base (query stripped).
+std::string resolvePlaylistUrl(const std::string& base, const std::string& ref) {
+    const std::string rel = trimCopy(ref);
+    if (rel.empty()) {
+        return {};
+    }
+    if (urlHasScheme(rel)) {
+        return rel;
+    }
+    if (rel.compare(0, 2, "//") == 0) {
+        const auto colon = base.find(':');
+        if (colon != std::string::npos) {
+            return base.substr(0, colon + 1) + rel;
+        }
+        return rel;
+    }
+    std::string root = stripUrlQuery(base);
+    if (!rel.empty() && rel[0] == '/') {
+        const auto scheme = root.find("://");
+        if (scheme == std::string::npos) {
+            return rel;
+        }
+        const auto path = root.find('/', scheme + 3);
+        if (path == std::string::npos) {
+            return root + rel;
+        }
+        return root.substr(0, path) + rel;
+    }
+    const auto slash = root.rfind('/');
+    if (slash == std::string::npos) {
+        return rel;
+    }
+    return root.substr(0, slash + 1) + rel;
+}
+
+std::string readHlsPlaylistPreview(const std::string& url, bool allow_local, AVIOInterruptCB* cb) {
+    AVDictionary* opts = nullptr;
+    setDecoderIoOptions(&opts, allow_local);
+    AVIOContext* pb = nullptr;
+    const int rc = avio_open2(&pb, url.c_str(), AVIO_FLAG_READ, cb, &opts);
+    av_dict_free(&opts);
+    if (rc < 0 || pb == nullptr) {
+        return {};
+    }
+    std::string out;
+    unsigned char buf[4096];
+    constexpr size_t kMax = 1024 * 1024;
+    while (out.size() < kMax) {
+        const int n = avio_read(pb, buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+        out.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
+    }
+    avio_closep(&pb);
+    return out;
+}
+
+// FFmpeg 6.1.1 hls_read_header calls avformat_find_stream_info(pls->ctx, NULL)
+// for an ID3-timestamped or TYPE=AUDIO rendition (AUDIT12 D4). There is no
+// format-wide codec option, so that nested probe keeps max_pixels == INT_MAX.
+// This player only presents video: open the first STREAM-INF playlist instead
+// of a master that names an external audio group. Packed-audio renditions
+// (the ADTS H1 case) stay unused, same as AVDISCARD_ALL after a full open.
+void preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AVIOInterruptCB* cb) {
+    if (url == nullptr || url->empty() || !urlLooksLikeHlsPlaylist(*url)) {
+        return;
+    }
+    std::string body = readHlsPlaylistPreview(*url, allow_local, cb);
+    if (body.size() >= 3 && static_cast<unsigned char>(body[0]) == 0xEF &&
+        static_cast<unsigned char>(body[1]) == 0xBB &&
+        static_cast<unsigned char>(body[2]) == 0xBF) {
+        body.erase(0, 3);
+    }
+    const auto nl = body.find('\n');
+    const std::string start = trimCopy(body.substr(0, nl == std::string::npos ? body.size() : nl));
+    if (start.compare(0, 7, "#EXTM3U") != 0 || !hlsMasterHasExternalAudio(body)) {
+        return;
+    }
+    const std::string rel = firstHlsStreamInfUri(body);
+    const std::string resolved = resolvePlaylistUrl(*url, rel);
+    if (!resolved.empty() && resolved != *url) {
+        *url = resolved;
+    }
 }
 
 void freeStreamOptions(AVDictionary** stream_opts, unsigned count) {
@@ -367,14 +606,9 @@ bool FfmpegDecoder::open(const std::string& url) {
     av_log_set_level(AV_LOG_ERROR);
 
     AVDictionary* opts = nullptr;
-    av_dict_set(&opts, "rw_timeout", kRwTimeoutUs, 0);
-    av_dict_set(&opts, "user_agent", "amlogic-multistream/0.1", 0);
     // file is only on the explicit --url local-file allowance. hls is the
     // protocol name libavformat registers; crypto covers AES-128 media.
-    av_dict_set(&opts, "protocol_whitelist",
-                allow_local_file_ ? "file,http,https,tls,tcp,crypto,hls"
-                                  : "http,https,tls,tcp,crypto,hls",
-                0);
+    setDecoderIoOptions(&opts, allow_local_file_);
     av_dict_set(&opts, "format_whitelist", kFormatWhitelist, 0);
     av_dict_set(&opts, "codec_whitelist", kCodecWhitelist, 0);
 
@@ -390,7 +624,12 @@ bool FfmpegDecoder::open(const std::string& url) {
     fmt_->interrupt_callback.callback = &FfmpegDecoder::interruptCallback;
     fmt_->interrupt_callback.opaque = this;
 
-    const int open_rc = avformat_open_input(&fmt_, url_.c_str(), nullptr, &opts);
+    // AUDIT12 D4: a master with TYPE=AUDIO URI= is probed inside
+    // avformat_open_input with find_stream_info(NULL). Open the first
+    // video playlist instead so that nested decode never runs uncapped.
+    std::string open_url = url_;
+    preferFirstHlsVariantIfExternalAudio(&open_url, allow_local_file_, &fmt_->interrupt_callback);
+    const int open_rc = avformat_open_input(&fmt_, open_url.c_str(), nullptr, &opts);
     av_dict_free(&opts);
     if (open_rc < 0) {
         fmt_ = nullptr;

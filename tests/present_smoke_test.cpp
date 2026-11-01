@@ -631,6 +631,61 @@ int main() {
                           << jumpOut << jumpErr;
                 return 1;
             }
+
+            // AUDIT12 D4: master whose AUDIO group is the 12000x12000 TS
+            // and whose video playlist is small.ts. FFmpeg 6.1.1 probes
+            // that audio rendition inside avformat_open_input with
+            // find_stream_info(NULL) / max_pixels == INT_MAX (~380 MB).
+            const std::filesystem::path audioHls = tmp.path() / "d4-audio.m3u8";
+            const std::filesystem::path videoHls = tmp.path() / "d4-video.m3u8";
+            const std::filesystem::path masterAudio = tmp.path() / "d4-master-audio.m3u8";
+            {
+                std::ofstream audio(audioHls);
+                audio << "#EXTM3U\n"
+                      << "#EXT-X-VERSION:3\n"
+                      << "#EXT-X-TARGETDURATION:1\n"
+                      << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                      << "#EXTINF:0.040,\n"
+                      << hugeTs.filename().string() << "\n"
+                      << "#EXT-X-ENDLIST\n";
+                std::ofstream video(videoHls);
+                video << "#EXTM3U\n"
+                      << "#EXT-X-VERSION:3\n"
+                      << "#EXT-X-TARGETDURATION:1\n"
+                      << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                      << "#EXTINF:0.400,\n"
+                      << smallTs.filename().string() << "\n"
+                      << "#EXT-X-ENDLIST\n";
+                std::ofstream master(masterAudio);
+                master << "#EXTM3U\n"
+                       << "#EXT-X-VERSION:4\n"
+                       << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\","
+                          "DEFAULT=YES,AUTOSELECT=YES,URI=\""
+                       << audioHls.filename().string() << "\"\n"
+                       << "#EXT-X-STREAM-INF:BANDWIDTH=400000,"
+                          "CODECS=\"avc1.42e01e,mp4a.40.2\",AUDIO=\"aud\"\n"
+                       << videoHls.filename().string() << "\n";
+            }
+            long d4RssKb = 0;
+            const int d4Rc =
+                run({player, "--url", masterAudio.string(), "--frames", "1"}, out, err, &d4RssKb);
+            const std::string d4Out = readFile(out);
+            const std::string d4Err = readFile(err);
+            constexpr long kD4RssKb = 100000;
+            if (d4RssKb >= kD4RssKb || d4Out.find("12000x12000") != std::string::npos ||
+                (d4Out.find("presented ") != std::string::npos &&
+                 d4Out.find("160x120") == std::string::npos)) {
+                std::cerr << "AUDIT12 D4 master-audio --url must stay under " << kD4RssKb
+                          << " KB (exit " << d4Rc << " rss_kb=" << d4RssKb << ")\n"
+                          << d4Out << d4Err;
+                return 1;
+            }
+            if (d4Rc == 0 && (d4Out.find("presented ") == std::string::npos ||
+                              d4Out.find("160x120") == std::string::npos)) {
+                std::cerr << "AUDIT12 D4 master-audio --url opened but did not present 160x120\n"
+                          << d4Out << d4Err;
+                return 1;
+            }
         }
 
         // AUDIT9 D1: a 12000x12000 MJPEG still must fail without the ~425 MB convert.

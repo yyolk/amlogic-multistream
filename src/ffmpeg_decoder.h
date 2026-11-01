@@ -58,8 +58,13 @@ public:
     // as find_stream_info so a normal HLS master is not drained. If that
     // window ends on a timestamp gap, the queued packets are kept and
     // the probe is clamped so a later PID cannot be born without the
-    // cap (AUDIT11 D3). readFrame() also refuses to convert a frame that
-    // fails those extent and stride caps (AUDIT9 D1).
+    // cap (AUDIT11 D3). Those clamps run after avformat_open_input.
+    // FFmpeg 6.1.1 HLS still probes a TYPE=AUDIO rendition inside
+    // read_header with find_stream_info(NULL), so that nested decoder
+    // would keep max_pixels == INT_MAX. open() therefore prefers the
+    // first STREAM-INF playlist when the URL is a master that names an
+    // external audio group (AUDIT12 D4). readFrame() also refuses to
+    // convert a frame that fails those extent and stride caps (AUDIT9 D1).
     void setAllowLocalFile(bool allow);
 
     bool open(const std::string& url) override;
