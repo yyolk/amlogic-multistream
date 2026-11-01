@@ -180,3 +180,53 @@ call; `finishProcess` always `_exit`s), **F4** (same-id replace waits out
 the old lookup), **F5** (attached picture through `mov` / HLS), **F6**
 (packed-audio fixtures still ADTS), **F7** (`scripts/ctest-require.sh` still
 does not require `mqtt_exit_test`).
+
+---
+
+## CROSSCHECK-A
+
+Peer: [AUDIT10-B](https://github.com/yyolk/amlogic-multistream/pull/58)
+on the same tip, `5c2c9d9`. They report no must-fix and no should-fix.
+This pass re-read that file and re-ran the D2 `--url` cases on
+`/workspace/build/amlogic-multistream`.
+
+**D2 stays should-fix.** It is not a must-fix, and it is not a nit.
+
+AUDIT10-B's D1 numbers match this tree. Their 12000×12000 MJPEG MP4 peaks
+around 32 MB; a re-run here is **34412 KB**, with `max_pixels` 67108864 and
+no `-> yuv420p`. Their 16384×4096 case (product equal to 8192², then rejected
+by extent at about 130 MB, flat across opens) is the in-cap cost already
+left out of section 3. Their HLS MP3+APIC case stays under 36 MB. None of
+those inputs are D2.
+
+D2 is a stream that does not exist when `avformat_find_stream_info` starts,
+so `src/ffmpeg_decoder.cpp:219-228` passes no `max_pixels` dictionary for it.
+FFmpeg 6.1.1 applies the per-stream dictionary only while
+`i < orig_nb_streams`. Re-measured on this binary:
+
+| Input | rc | `ru_maxrss` |
+| --- | --- | --- |
+| PSI-less 12000×12000 H.264 TS | 1 (`avcodec_open2`, no probe `get_buffer() failed`) | **379320 KB** |
+| HLS playlist of that TS | 1, same | **379744 KB** |
+| PMT 320×240 plus extra PID 0x101 at 12000×12000 | 0, presents 320×240 | **381300 KB** |
+| Normal-PMT 12000×12000 H.264 TS (control) | 1, probe `get_buffer() failed` | **89352 KB** |
+
+`hls.c` calls `avformat_find_stream_info(pls->ctx, NULL)` only for an
+ID3-timestamped playlist or an audio rendition. That is the path AUDIT10-B
+measured, and a JPEG attached picture can be rejected by the parent playback
+context without a 379 MB frame. A video HLS playlist does not take that
+nested call. The parent's probe decodes the H.264, and with `nb_streams == 0`
+that decode is uncapped. The stderr difference is the evidence: the normal
+PMT logs `get_buffer() failed` during the probe; the PSI-less file logs only
+the later playback `max_pixels` line, after the peak.
+
+Their "retries do not accumulate" holds here too, which is why D2 is not
+must-fix. Serial probes still return to ~33 MB VmRSS. Two overlapping opens
+of the PSI-less file, re-run for this cross-check, reached **VmHWM 726176
+KB**. AUDIT10-B's must-fix bar (hang, retained online, or growth past a
+claimed bound) is not met. The peak is still the allocation `#57` said the
+probe dictionary prevents, on a whitelisted `mpegts` / `hls` URL.
+
+Nothing else in AUDIT10-B moves. The torn `MQTT running` / `MQTT connected`
+line, the destructor join comment, and MJPEG even-size rounding stay as they
+rated them. No carried nit is elevated.
