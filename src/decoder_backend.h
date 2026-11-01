@@ -35,13 +35,26 @@ struct DecodedFrame {
 };
 
 // Demux/decode backend. close() must be safe to call more than once,
-// including after a failed open(). Not thread-safe.
+// including after a failed open().
+//
+// open(), close(), readFrame(), and isHardware() run on one thread and must
+// not be called concurrently with each other. abort() is the exception: a
+// different thread may call it while open() or readFrame() is blocked in
+// I/O. abort() latches for the life of the object. The in-flight open() or
+// readFrame() then returns, and a later open() or readFrame() fails without
+// blocking. close() still runs on the decode thread, after that call has
+// returned.
 class DecoderBackend {
 public:
     virtual ~DecoderBackend() = default;
     virtual bool open(const std::string& url) = 0;
     virtual void close() = 0;
     virtual bool isHardware() const = 0;
+
+    // Unblock an in-flight open() or readFrame() on this instance. Safe to
+    // call from another thread, and safe to call more than once. The default
+    // does nothing so a backend with no blocking I/O stays unchanged.
+    virtual void abort() {}
 
     // Pull one decoded video frame.
     // true  -> frame is filled; plane pointers stay valid until the next
