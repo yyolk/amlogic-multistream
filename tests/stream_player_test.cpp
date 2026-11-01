@@ -170,8 +170,12 @@ int pump(StreamPlayer& player, int minPresented, int timeoutMs = 2000) {
 struct StallGate {
     std::atomic<int> entered{0};
     std::atomic<int> aborts{0};
+    std::atomic<int> fastOpens{0};
     std::atomic<bool> release{false};
     std::chrono::milliseconds blockFor{1200};
+    // open() calls in progress for stall URLs, and the high-water mark.
+    std::atomic<int> inFlight{0};
+    std::atomic<int> maxInFlight{0};
 };
 
 class StallingDecoder : public DecoderBackend {
@@ -184,10 +188,19 @@ public:
 
     bool open(const std::string& url) override {
         if (url.find("stall") == std::string::npos) {
+            gate_->fastOpens.fetch_add(1);
             opened_ = true;
             return true;
         }
         gate_->entered.fetch_add(1);
+        const int now = gate_->inFlight.fetch_add(1) + 1;
+        int prevMax = gate_->maxInFlight.load();
+        while (prevMax < now && !gate_->maxInFlight.compare_exchange_weak(prevMax, now)) {
+        }
+        struct InFlightGuard {
+            StallGate* gate;
+            ~InFlightGuard() { gate->inFlight.fetch_sub(1); }
+        } guard{gate_.get()};
         const auto until = std::chrono::steady_clock::now() + gate_->blockFor;
         while (std::chrono::steady_clock::now() < until && !gate_->release.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -365,6 +378,8 @@ void testUninterruptibleOpen() {
     }));
     checkSample(samplePlaying(player, kWindowMs, kTickBoundMs), kTickBoundMs, "resume after stop");
 
+    CHECK(gate->maxInFlight.load() <= 1);
+    CHECK(gate->inFlight.load() <= 1);
     gate->release.store(true);
     const bool drained = player.drain(std::chrono::milliseconds(2000));
     CHECK(drained);
@@ -402,6 +417,115 @@ void testUninterruptibleOpen() {
             std::cerr << "stuck open did not _exit promptly status=" << status << "\n";
         }
     }
+}
+
+// AUDIT4 A3: restart, and stop+start, while open() ignores abort must not
+// stack another open for that id. One in-flight open per id. A different id
+// still starts, and the pending restart runs after the stuck open returns.
+void testRestartDoesNotStackUninterruptibleOpen() {
+    constexpr int kRestarts = 50;
+    constexpr int kStopStartCycles = 20;
+    auto gate = std::make_shared<StallGate>();
+    gate->blockFor = std::chrono::seconds(30);
+    StreamManager streams;
+    SoftwareRenderer renderer;
+    StreamPlayer player(
+        streams, renderer,
+        [gate]() -> std::unique_ptr<DecoderBackend> { return std::make_unique<StallingDecoder>(gate); },
+        32, 16);
+    struct ReleaseGate {
+        std::shared_ptr<StallGate> gate;
+        ~ReleaseGate() {
+            if (gate) {
+                gate->release.store(true);
+            }
+        }
+    } release{gate};
+
+    CHECK(player.init());
+    CHECK(streams.addStream("left", "http://example/left.ts"));
+    CHECK(streams.addStream("stall", "http://example/stall.ts"));
+    CHECK(until([&] {
+        player.tick(true);
+        return renderer.framesPresented() >= 1 && gate->entered.load() >= 1;
+    }));
+    const int enteredAtStall = gate->entered.load();
+    const int fastAtStall = gate->fastOpens.load();
+    CHECK(enteredAtStall == 1);
+    CHECK(gate->inFlight.load() == 1);
+    CHECK(fastAtStall >= 1);
+
+    int presentsDuring = 0;
+    int maxTickMs = 0;
+    for (int i = 0; i < kRestarts; ++i) {
+        CHECK(streams.restartStream("stall"));
+        const auto tickStart = std::chrono::steady_clock::now();
+        presentsDuring += player.tick(true);
+        const int tickMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 std::chrono::steady_clock::now() - tickStart)
+                                                 .count());
+        if (tickMs > maxTickMs) {
+            maxTickMs = tickMs;
+        }
+        // The player loop waits between ticks. A tight spin never lets the
+        // healthy decode thread publish, which is not the churn under test.
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(gate->entered.load() == enteredAtStall);
+    CHECK(gate->inFlight.load() == 1);
+    CHECK(gate->maxInFlight.load() <= 1);
+    CHECK(presentsDuring >= 5);
+    CHECK(maxTickMs < 250);
+    CHECK(gate->aborts.load() >= 1);
+    if (presentsDuring < 5 || maxTickMs >= 250) {
+        std::cerr << "restart churn presents=" << presentsDuring << " maxTickMs=" << maxTickMs << "\n";
+    }
+
+    // The stalled id is on the reaper. A new id must still open.
+    const int fastBeforeExtra = gate->fastOpens.load();
+    CHECK(streams.addStream("extra", "http://example/extra.ts"));
+    CHECK(until([&] {
+        player.tick(true);
+        return gate->fastOpens.load() > fastBeforeExtra;
+    }));
+    CHECK(gate->entered.load() == enteredAtStall);
+    CHECK(gate->inFlight.load() == 1);
+    CHECK(gate->maxInFlight.load() <= 1);
+
+    for (int i = 0; i < kStopStartCycles; ++i) {
+        CHECK(player.tick(false) == 0);
+        player.tick(true);
+    }
+    CHECK(gate->entered.load() == enteredAtStall);
+    CHECK(gate->inFlight.load() == 1);
+    CHECK(gate->maxInFlight.load() <= 1);
+
+    const int presentedAfterChurn = renderer.framesPresented();
+    CHECK(until([&] {
+        player.tick(true);
+        return renderer.framesPresented() > presentedAfterChurn;
+    }));
+    CHECK(gate->entered.load() == enteredAtStall);
+    CHECK(gate->inFlight.load() == 1);
+    CHECK(gate->maxInFlight.load() <= 1);
+
+    gate->release.store(true);
+    CHECK(until([&] {
+        player.tick(true);
+        return gate->entered.load() >= enteredAtStall + 1;
+    }));
+    for (int i = 0; i < 15; ++i) {
+        player.tick(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(gate->maxInFlight.load() <= 1);
+    CHECK(gate->inFlight.load() <= 1);
+    // N restarts collapse into the one open that was already in flight, plus
+    // one replacement after it returns. They do not become N opens.
+    CHECK(gate->entered.load() == enteredAtStall + 1);
+
+    player.closeAll();
+    CHECK(player.drain(std::chrono::milliseconds(2000)));
 }
 
 }  // namespace
@@ -639,6 +763,7 @@ int main() {
     }
 
     testUninterruptibleOpen();
+    testRestartDoesNotStackUninterruptibleOpen();
 
     if (g_failed != 0) {
         std::cerr << g_failed << " check(s) failed\n";

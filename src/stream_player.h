@@ -33,8 +33,11 @@
 //
 // Only http:// and https:// URLs are opened. A local file URL never reaches
 // the factory, and a backend that reports isHardware() is closed.
-// restartGeneration on a stream retires that decoder and opens another.
-// playing == false retires every decoder and clears the viewport.
+// restartGeneration retires that decoder. The replacement open waits until
+// the retired worker is done. A stuck getaddrinfo ignores abort and stays
+// on the reaper, so another open for the same id is not started while it
+// is there (AUDIT4 A3). playing == false retires every decoder and clears
+// the viewport; the following start waits the same way.
 class StreamPlayer {
 public:
     static constexpr int kDefaultViewportWidth = 1280;
@@ -159,6 +162,9 @@ private:
     void requestStop(Worker& worker);
     void retireWorker(Session& session);
     void reapFinished();
+    // True when this id still has a worker on the reaper whose loop has not
+    // returned. tick() must not start another open for that id.
+    bool reaperBusy(const std::string& id) const;
     void releaseDecoder(Worker& worker);
     void startWorker(const StreamInfo& info, Session& session);
     void sessionLoop(Worker* worker, const std::string& id, const std::string& url);
