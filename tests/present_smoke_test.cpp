@@ -277,6 +277,26 @@ struct LocalHttp {
             }
         }
         std::string body;
+        if (ok && rel == "seg.ts") {
+            const char* redir =
+                "HTTP/1.1 302 Found\r\nLocation: /d4-space.m3u8\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, redir, std::char_traits<char>::length(redir));
+            ::close(client);
+            continue;
+        }
+        if (ok && rel == "trunc.m3u8") {
+            static int trunc_hits = 0;
+            if (trunc_hits++ == 0) {
+                const char* stub =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n"
+                    "Content-Type: application/vnd.apple.mpegurl\r\n"
+                    "Connection: close\r\n\r\n#EXTM3U\n";
+                sendAll(client, stub, std::char_traits<char>::length(stub));
+                ::close(client);
+                continue;
+            }
+        }
         if (ok) {
             std::ifstream in(root / rel, std::ios::binary);
             if (!in) {
@@ -296,8 +316,7 @@ struct LocalHttp {
         }
         const char* type = "application/octet-stream";
         const std::string ext = rel.extension().string();
-        if (ext == ".m3u8" || ext == ".m3u" ||
-            (ext.empty() && body.compare(0, 7, "#EXTM3U") == 0)) {
+        if (ext == ".m3u8" || ext == ".m3u" || body.compare(0, 7, "#EXTM3U") == 0) {
             type = "application/vnd.apple.mpegurl";
         }
         std::ostringstream hdr;
@@ -872,6 +891,59 @@ int main() {
                 return 1;
             }
 
+            const std::filesystem::path spaceMaster = tmp.path() / "d4-space.m3u8";
+            const std::filesystem::path lastWins = tmp.path() / "d4-lastwins.m3u8";
+            const std::filesystem::path unclosed = tmp.path() / "d4-unclosed.m3u8";
+            const std::filesystem::path playlistTs = tmp.path() / "playlist.ts";
+            const std::filesystem::path truncMaster = tmp.path() / "trunc.m3u8";
+            {
+                std::ostringstream space;
+                space << "#EXTM3U\n"
+                      << "#EXT-X-VERSION:4\n"
+                      << "#EXT-X-MEDIA:TYPE=AUDIO GROUP-ID=\"aud\" NAME=\"en\" "
+                         "DEFAULT=YES URI=\""
+                      << audioHls.filename().string() << "\"\n"
+                      << "#EXT-X-STREAM-INF:BANDWIDTH=400000 AUDIO=\"aud\"\n"
+                      << videoHls.filename().string() << "\n";
+                std::ofstream(spaceMaster) << space.str();
+                std::ofstream(playlistTs) << space.str();
+                std::ofstream(truncMaster) << space.str();
+                std::ofstream(lastWins) << "#EXTM3U\n"
+                                        << "#EXT-X-VERSION:4\n"
+                                        << "#EXT-X-MEDIA:TYPE=VIDEO,TYPE=AUDIO,URI=\"\","
+                                           "URI=\""
+                                        << audioHls.filename().string() << "\"\n"
+                                        << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                                        << videoHls.filename().string() << "\n";
+                std::ofstream(unclosed) << "#EXTM3U\n"
+                                        << "#EXT-X-VERSION:4\n"
+                                        << "#EXT-X-MEDIA:TYPE=AUDIO,URI=\""
+                                        << audioHls.filename().string() << "\n"
+                                        << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                                        << videoHls.filename().string() << "\n";
+            }
+            long spaceRss = 0;
+            const int spaceRc =
+                run({player, "--url", spaceMaster.string(), "--frames", "1"}, out, err, &spaceRss);
+            if (!d4MustStayCapped("space-separated MEDIA", spaceRc, spaceRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+            long lastRss = 0;
+            const int lastRc =
+                run({player, "--url", lastWins.string(), "--frames", "1"}, out, err, &lastRss);
+            if (!d4MustStayCapped("last-wins TYPE/URI", lastRc, lastRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+            long unclosedRss = 0;
+            const int unclosedRc =
+                run({player, "--url", unclosed.string(), "--frames", "1"}, out, err, &unclosedRss);
+            if (!d4MustStayCapped("unclosed URI quote", unclosedRc, unclosedRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+
             // Extensionless HTTP URL, Content-Type mpegurl. The first peek
             // only ran for .m3u8 / hls+.
             const std::filesystem::path extless = tmp.path() / "playlist";
@@ -885,14 +957,42 @@ int main() {
                 std::cerr << "D4 extensionless playlist server failed to start\n";
                 return 1;
             }
-            const std::string extlessUrl =
-                "http://127.0.0.1:" + std::to_string(d4http.port) + "/playlist";
+            const std::string httpBase = "http://127.0.0.1:" + std::to_string(d4http.port);
+            const std::string extlessUrl = httpBase + "/playlist";
             long extlessRss = 0;
             const int extlessRc =
                 run({player, "--url", extlessUrl, "--frames", "1"}, out, err, &extlessRss);
-            d4http.stop();
             if (!d4MustStayCapped("extensionless HTTP", extlessRc, extlessRss, readFile(out),
                                   readFile(err), true)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long tsRss = 0;
+            const int tsRc =
+                run({player, "--url", httpBase + "/playlist.ts", "--frames", "1"}, out, err, &tsRss);
+            if (!d4MustStayCapped("playlist.ts mpegurl", tsRc, tsRss, readFile(out), readFile(err),
+                                  true)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long redirRss = 0;
+            const int redirRc =
+                run({player, "--url", httpBase + "/seg.ts", "--frames", "1"}, out, err, &redirRss);
+            if (!d4MustStayCapped("seg.ts redirect", redirRc, redirRss, readFile(out),
+                                  readFile(err), true)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long truncRss = 0;
+            const int truncRc =
+                run({player, "--url", httpBase + "/trunc.m3u8", "--frames", "1"}, out, err,
+                    &truncRss);
+            d4http.stop();
+            if (!d4MustStayCapped("truncated EXTM3U preview", truncRc, truncRss, readFile(out),
+                                  readFile(err), false)) {
                 return 1;
             }
         }

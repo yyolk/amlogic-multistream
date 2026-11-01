@@ -19,6 +19,7 @@ extern "C" {
 #include <libavutil/log.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/mem.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
@@ -128,8 +129,6 @@ bool endsWithIgnoreCase(const std::string& s, const char* suffix) {
     return true;
 }
 
-// Skip the extra preview on known media files so a .ts / .mp4 open does
-// not pay another read. Extensionless http(s) still peeks.
 bool urlLooksLikeMediaSegment(const std::string& url) {
     const std::string path = stripUrlQuery(url);
     static const char* const kExt[] = {".ts",  ".mp4", ".m4s",  ".m4v", ".mov",
@@ -142,8 +141,15 @@ bool urlLooksLikeMediaSegment(const std::string& url) {
     return false;
 }
 
+bool urlIsRemoteHttp(const std::string& url) {
+    return url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0 ||
+           url.compare(0, 11, "hls+http://") == 0 || url.compare(0, 12, "hls+https://") == 0;
+}
+
+// Local .ts / .mp4 skip the extra read (D2 still caps after open). http(s)
+// always peeks: a .ts path may be mpegurl or a redirect to a master.
 bool shouldPeekForHls(const std::string& url) {
-    return !urlLooksLikeMediaSegment(url);
+    return urlIsRemoteHttp(url) || !urlLooksLikeMediaSegment(url);
 }
 
 std::string trimCopy(const std::string& s) {
@@ -158,44 +164,72 @@ std::string trimCopy(const std::string& s) {
     return s.substr(b, e - b);
 }
 
-// HLS attribute list after the ':'. Commas inside quoted values stay inside
-// the value. TYPE=AUDIO and URI= can appear in any order.
-std::string hlsAttrValue(const std::string& attrs, const char* key) {
-    const size_t key_len = std::char_traits<char>::length(key);
-    bool in_quote = false;
-    for (size_t i = 0; i < attrs.size(); ++i) {
-        const char c = attrs[i];
-        if (c == '"') {
-            in_quote = !in_quote;
-            continue;
-        }
-        if (in_quote) {
-            continue;
-        }
-        const bool at_token = (i == 0) || attrs[i - 1] == ',' || attrs[i - 1] == ':' ||
-                              std::isspace(static_cast<unsigned char>(attrs[i - 1]));
-        if (!at_token || attrs.compare(i, key_len, key) != 0 || i + key_len >= attrs.size() ||
-            attrs[i + key_len] != '=') {
-            continue;
-        }
-        size_t v = i + key_len + 1;
-        while (v < attrs.size() && std::isspace(static_cast<unsigned char>(attrs[v]))) {
-            ++v;
-        }
-        if (v < attrs.size() && attrs[v] == '"') {
-            const size_t end = attrs.find('"', v + 1);
-            if (end == std::string::npos) {
-                return {};
-            }
-            return attrs.substr(v + 1, end - (v + 1));
-        }
-        size_t end = v;
-        while (end < attrs.size() && attrs[end] != ',') {
-            ++end;
-        }
-        return trimCopy(attrs.substr(v, end - v));
+// Same separators as FFmpeg 6.1.1 ff_parse_key_value: skip commas and
+// whitespace, quoted values may contain escapes, an unclosed quote takes
+// the rest of the string, duplicate keys last-win.
+struct HlsMediaAttrs {
+    std::string type;
+    std::string uri;
+    bool unclosed_quote = false;
+};
+
+HlsMediaAttrs parseHlsMediaAttrs(const std::string& attrs) {
+    HlsMediaAttrs out;
+    size_t i = 0;
+    if (i < attrs.size() && attrs[i] == ':') {
+        ++i;
     }
-    return {};
+    while (i < attrs.size()) {
+        while (i < attrs.size() &&
+               (attrs[i] == ',' || std::isspace(static_cast<unsigned char>(attrs[i])))) {
+            ++i;
+        }
+        if (i >= attrs.size()) {
+            break;
+        }
+        const size_t key_b = i;
+        while (i < attrs.size() && attrs[i] != '=' && attrs[i] != ',' &&
+               !std::isspace(static_cast<unsigned char>(attrs[i]))) {
+            ++i;
+        }
+        if (i >= attrs.size() || attrs[i] != '=') {
+            while (i < attrs.size() && attrs[i] != ',' &&
+                   !std::isspace(static_cast<unsigned char>(attrs[i]))) {
+                ++i;
+            }
+            continue;
+        }
+        const std::string key = attrs.substr(key_b, i - key_b);
+        ++i;
+        std::string value;
+        if (i < attrs.size() && attrs[i] == '"') {
+            ++i;
+            while (i < attrs.size() && attrs[i] != '"') {
+                if (attrs[i] == '\\' && i + 1 < attrs.size()) {
+                    ++i;
+                }
+                value.push_back(attrs[i]);
+                ++i;
+            }
+            if (i < attrs.size() && attrs[i] == '"') {
+                ++i;
+            } else {
+                out.unclosed_quote = true;
+            }
+        } else {
+            while (i < attrs.size() && attrs[i] != ',' &&
+                   !std::isspace(static_cast<unsigned char>(attrs[i]))) {
+                value.push_back(attrs[i]);
+                ++i;
+            }
+        }
+        if (key == "TYPE") {
+            out.type = value;
+        } else if (key == "URI") {
+            out.uri = value;
+        }
+    }
+    return out;
 }
 
 bool hlsMasterHasExternalAudio(const std::string& text) {
@@ -212,8 +246,22 @@ bool hlsMasterHasExternalAudio(const std::string& text) {
         if (colon == std::string::npos) {
             continue;
         }
-        const std::string attrs = line.substr(colon);
-        if (hlsAttrValue(attrs, "TYPE") == "AUDIO" && !hlsAttrValue(attrs, "URI").empty()) {
+        const HlsMediaAttrs attrs = parseHlsMediaAttrs(line.substr(colon));
+        if (attrs.type == "AUDIO" && (!attrs.uri.empty() || attrs.unclosed_quote)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hlsHasExtInf(const std::string& text) {
+    std::string line;
+    std::istringstream in(text);
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.compare(0, 8, "#EXTINF:") == 0) {
             return true;
         }
     }
@@ -326,44 +374,88 @@ bool urlAlreadyVisited(const std::vector<std::string>& seen, const std::string& 
     return false;
 }
 
-std::string readHlsPlaylistPreview(const std::string& url, bool allow_local, AVIOInterruptCB* cb) {
+std::string avioChildString(AVIOContext* pb, const char* name) {
+    if (pb == nullptr || name == nullptr) {
+        return {};
+    }
+    uint8_t* val = nullptr;
+    if (av_opt_get(pb, name, AV_OPT_SEARCH_CHILDREN, &val) < 0 || val == nullptr) {
+        return {};
+    }
+    std::string out(reinterpret_cast<char*>(val));
+    av_free(val);
+    return out;
+}
+
+bool mimeLooksMpegurl(const std::string& mime) {
+    return av_stristr(mime.c_str(), "mpegurl") != nullptr;
+}
+
+struct PlaylistPreview {
+    std::string body;
+    std::string final_url;
+    bool mpegurl = false;
+    bool read_error = false;
+    bool hit_max = false;
+};
+
+PlaylistPreview readHlsPlaylistPreview(const std::string& url, bool allow_local, AVIOInterruptCB* cb) {
+    PlaylistPreview out;
     AVDictionary* opts = nullptr;
     setDecoderIoOptions(&opts, allow_local);
     AVIOContext* pb = nullptr;
     const int rc = avio_open2(&pb, url.c_str(), AVIO_FLAG_READ, cb, &opts);
     av_dict_free(&opts);
     if (rc < 0 || pb == nullptr) {
-        return {};
+        return out;
     }
-    std::string out;
+    out.mpegurl = mimeLooksMpegurl(avioChildString(pb, "mime_type"));
+    out.final_url = avioChildString(pb, "location");
     unsigned char buf[4096];
     constexpr size_t kSniff = 256;
     constexpr size_t kMax = 1024 * 1024;
-    while (out.size() < kMax) {
+    while (out.body.size() < kMax) {
         const int n = avio_read(pb, buf, sizeof(buf));
-        if (n <= 0) {
+        if (n == 0 || n == AVERROR_EOF) {
             break;
         }
-        out.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
-        if (out.size() >= kSniff) {
-            std::string sniff = out;
+        if (n < 0) {
+            out.read_error = true;
+            break;
+        }
+        out.body.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
+        if (out.body.size() >= kSniff) {
+            std::string sniff = out.body;
             stripUtf8Bom(&sniff);
             if (!firstLineIsExtm3u(sniff)) {
                 break;
             }
         }
     }
+    if (out.body.size() >= kMax) {
+        out.hit_max = true;
+    }
     avio_closep(&pb);
+    stripUtf8Bom(&out.body);
     return out;
+}
+
+bool hlsPreviewIncomplete(const PlaylistPreview& prev) {
+    if (!firstLineIsExtm3u(prev.body)) {
+        return prev.mpegurl && prev.body.empty();
+    }
+    if (prev.read_error || prev.hit_max) {
+        return true;
+    }
+    return firstHlsStreamInfUri(prev.body).empty() && !hlsHasExtInf(prev.body);
 }
 
 // FFmpeg 6.1.1 hls_read_header calls avformat_find_stream_info(pls->ctx, NULL)
 // for an ID3-timestamped or TYPE=AUDIO rendition (AUDIT12 D4). There is no
 // format-wide codec option, so that nested probe keeps max_pixels == INT_MAX.
-// This player only presents video: follow STREAM-INF while the playlist names
-// an external audio group, and refuse when there is no safe video playlist
-// (no STREAM-INF, a self-loop, or rewrite depth exceeded). Packed-audio
-// renditions (the ADTS H1 case) stay unused, same as AVDISCARD_ALL.
+// Follow STREAM-INF while the playlist names an external audio group. If the
+// preview looks like a playlist but is truncated or has no safe variant,
+// refuse rather than falling through to an uncapped open.
 //
 // Returns false if avformat_open_input must not run on the current URL.
 bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AVIOInterruptCB* cb) {
@@ -378,18 +470,22 @@ bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AV
         if (!shouldPeekForHls(*url)) {
             return true;
         }
-        std::string body = readHlsPlaylistPreview(*url, allow_local, cb);
-        stripUtf8Bom(&body);
-        if (!firstLineIsExtm3u(body) || !hlsMasterHasExternalAudio(body)) {
-            return true;
+        const PlaylistPreview prev = readHlsPlaylistPreview(*url, allow_local, cb);
+        if (hlsMasterHasExternalAudio(prev.body)) {
+            const std::string rel = firstHlsStreamInfUri(prev.body);
+            const std::string base = !prev.final_url.empty() ? prev.final_url : *url;
+            const std::string resolved = resolvePlaylistUrl(base, rel);
+            if (rel.empty() || resolved.empty() || urlAlreadyVisited(seen, resolved)) {
+                return false;
+            }
+            *url = resolved;
+            seen.push_back(resolved);
+            continue;
         }
-        const std::string rel = firstHlsStreamInfUri(body);
-        const std::string resolved = resolvePlaylistUrl(*url, rel);
-        if (rel.empty() || resolved.empty() || urlAlreadyVisited(seen, resolved)) {
-            return false;
+        if (firstLineIsExtm3u(prev.body) || prev.mpegurl) {
+            return !hlsPreviewIncomplete(prev);
         }
-        *url = resolved;
-        seen.push_back(resolved);
+        return true;
     }
     return false;
 }

@@ -362,6 +362,14 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
         std::filesystem::path rel;
         std::string body;
         bool ok = !url.empty() && safeRelative(url, rel);
+        if (ok && rel == "seg.ts") {
+            const char* redir =
+                "HTTP/1.1 302 Found\r\nLocation: /d4-space.m3u8\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, redir, std::char_traits<char>::length(redir));
+            ::close(client);
+            continue;
+        }
         if (ok) {
             const std::filesystem::path full = root / rel;
             std::ifstream in(full, std::ios::binary);
@@ -373,11 +381,19 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
                 body = ss.str();
             }
         }
+        if (ok && rel == "trunc.m3u8") {
+            static int trunc_hits = 0;
+            if (trunc_hits++ == 0) {
+                sendResponse(client, 200, "#EXTM3U\n", "application/vnd.apple.mpegurl");
+                ::close(client);
+                continue;
+            }
+        }
         if (!ok) {
             sendResponse(client, 404, "missing\n", "text/plain");
         } else {
             const char* type = "application/octet-stream";
-            if (rel.extension() == ".m3u8") {
+            if (rel.extension() == ".m3u8" || body.compare(0, 7, "#EXTM3U") == 0) {
                 type = "application/vnd.apple.mpegurl";
             }
             sendResponse(client, 200, body, type);
@@ -1042,6 +1058,47 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
     }
     testDecode(d4outer.string());
 
+    g_case = "hls space-separated MEDIA presents small stream";
+    const std::filesystem::path d4space = dir / "d4-space.m3u8";
+    {
+        std::ostringstream space;
+        space << "#EXTM3U\n"
+              << "#EXT-X-VERSION:4\n"
+              << "#EXT-X-MEDIA:TYPE=AUDIO GROUP-ID=\"aud\" NAME=\"en\" DEFAULT=YES URI=\""
+              << d4audio.filename().string() << "\"\n"
+              << "#EXT-X-STREAM-INF:BANDWIDTH=400000 AUDIO=\"aud\"\n"
+              << d4video.filename().string() << "\n";
+        std::ofstream(d4space) << space.str();
+        std::ofstream(dir / "playlist.ts") << space.str();
+        std::ofstream(dir / "trunc.m3u8") << space.str();
+    }
+    testDecode(d4space.string());
+
+    g_case = "hls last-wins TYPE/URI presents small stream";
+    const std::filesystem::path d4last = dir / "d4-lastwins.m3u8";
+    {
+        std::ofstream playlist(d4last);
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=VIDEO,TYPE=AUDIO,URI=\"\",URI=\""
+                 << d4audio.filename().string() << "\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode(d4last.string());
+
+    g_case = "hls unclosed URI quote presents small stream";
+    const std::filesystem::path d4unclosed = dir / "d4-unclosed.m3u8";
+    {
+        std::ofstream playlist(d4unclosed);
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"" << d4audio.filename().string() << "\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode(d4unclosed.string());
+
     g_case = "hls extensionless http master audio";
     {
         std::ifstream src(d4master);
@@ -1053,17 +1110,27 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
     CHECK(server.pid > 0);
     CHECK(server.port > 0);
     if (server.pid > 0 && server.port > 0) {
-        FfmpegDecoder decoder;
-        const std::string url =
-            "http://127.0.0.1:" + std::to_string(server.port) + "/playlist";
-        const bool opened = decoder.open(url);
-        CHECK(opened);
-        if (opened) {
-            DecodedFrame frame;
-            CHECK(decoder.readFrame(frame));
-            expectYuv420(frame);
-        }
-        decoder.close();
+        const std::string httpBase = "http://127.0.0.1:" + std::to_string(server.port);
+        auto openHttpSmall = [&](const std::string& url) {
+            FfmpegDecoder decoder;
+            const bool opened = decoder.open(url);
+            CHECK(opened);
+            if (opened) {
+                DecodedFrame frame;
+                CHECK(decoder.readFrame(frame));
+                expectYuv420(frame);
+            }
+            decoder.close();
+        };
+        openHttpSmall(httpBase + "/playlist");
+        g_case = "hls playlist.ts mpegurl http master audio";
+        openHttpSmall(httpBase + "/playlist.ts");
+        g_case = "hls seg.ts redirect http master audio";
+        openHttpSmall(httpBase + "/seg.ts");
+        g_case = "hls truncated EXTM3U preview refuses";
+        FfmpegDecoder trunc;
+        CHECK(!trunc.open(httpBase + "/trunc.m3u8"));
+        trunc.close();
     }
     server.stop();
 }
