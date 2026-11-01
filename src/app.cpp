@@ -171,6 +171,13 @@ bool frameLooksComplete(const DecodedFrame& frame) {
            frame.linesize[2] >= chroma_w;
 }
 
+// Same prefix check as MQTT add / StreamPlayer: only lowercase http(s).
+// An HTTP(S) --url must not inherit the file protocol, or a playlist
+// segment of file:///… would decode a local file (AUDIT7 B2).
+bool urlIsRemoteHttp(const std::string& url) {
+    return url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0;
+}
+
 // Single-stream software decode, then one Renderer::present() per frame.
 // The default presenter is SoftwareRenderer, which does not open /dev/dri.
 // DrmRenderer is selected only with --renderer drm and requires GS-King X /
@@ -178,9 +185,12 @@ bool frameLooksComplete(const DecodedFrame& frame) {
 int decodeUrl(const std::string& url, int frames, PresenterKind presenter, const std::string& renderDir) {
     std::cout << "Software decode isHardware=0 url=" << url << "\n";
     FfmpegDecoder decoder;
-    // CLI --url is the local-file allowance (fixture tests, a path on disk).
-    // MQTT add never reaches this call with a file URL.
-    decoder.setAllowLocalFile(true);
+    // CLI --url is the local-file allowance only for a path or file:// URL
+    // (fixture tests, a path on disk). http:// and https:// leave the flag
+    // off so a playlist file:// segment stays rejected, same as MQTT add.
+    if (!urlIsRemoteHttp(url)) {
+        decoder.setAllowLocalFile(true);
+    }
     if (!decoder.open(url)) {
         return 1;
     }
