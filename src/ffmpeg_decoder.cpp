@@ -21,10 +21,13 @@ namespace {
 // the connection just alive; DecoderBackend::abort() does.
 constexpr const char* kRwTimeoutUs = "15000000";
 
-// HLS and the segment demuxers it opens (mpegts, fMP4/mov). mpegts is also
-// a direct HTTP MPEG-TS URL. gif, image2, and the other image demuxers are
-// not listed. hls.c copies this whitelist onto each segment demuxer.
-constexpr const char* kFormatWhitelist = "hls,mpegts,mov,mp4,mpeg";
+// HLS and the segment demuxers it opens: mpegts, fMP4/mov, and packed-audio
+// renditions (aac, ac3, eac3, mp3). mpegts is also a direct HTTP MPEG-TS
+// URL. gif, image2, and the other image demuxers are not listed. hls.c
+// copies this whitelist onto each rendition inside avformat_open_input,
+// before AVDISCARD_ALL can drop a separate audio playlist (SURVIVING4 H1).
+constexpr const char* kFormatWhitelist =
+    "hls,mpegts,mov,mp4,mpeg,aac,ac3,eac3,mp3";
 
 // Video codecs this player decodes, plus audio codecs
 // avformat_find_stream_info may open while probing HLS or MPEG-TS. gif is
