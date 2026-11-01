@@ -1,7 +1,10 @@
 #pragma once
+#include "decoder_backend.h"
 #include "stream_manager.h"
 
 #include <atomic>
+#include <functional>
+#include <memory>
 #include <string>
 
 struct mosquitto;
@@ -13,11 +16,16 @@ struct mosquitto_message;
 // thread, so a stalled read does not block the other tiles or the signal
 // wait. A broker that is down at startup is retried with backoff instead of
 // exiting. A CONNACK that refuses the username or password exits non-zero
-// after a few attempts so scripts/launch-coreelec.sh can start Kodi.
+// after a few attempts so scripts/launch-coreelec.sh can start Kodi. That
+// give-up uses the same bounded worker drain as a signal and exits 1.
 // Hardware decode and DRM/KMS are not started.
 class MqttController {
 public:
-    explicit MqttController(StreamManager& manager);
+    using DecoderFactory = std::function<std::unique_ptr<DecoderBackend>()>;
+
+    // An empty factory selects FfmpegDecoder. Tests pass a backend whose
+    // open() ignores abort(), the stand-in for a stuck getaddrinfo.
+    explicit MqttController(StreamManager& manager, DecoderFactory decoderFactory = {});
     ~MqttController();
 
     MqttController(const MqttController&) = delete;
@@ -26,7 +34,8 @@ public:
     // Read env and CLI, then connect, subscribe, and tick until SIGINT,
     // SIGTERM, or SIGHUP. Returns 0 after a clean shutdown or --help, and 1
     // if the client cannot start or the broker refuses authentication. An
-    // unreachable broker is retried.
+    // unreachable broker is retried. A worker still blocked at exit does not
+    // change that code: signals _exit 0 and authentication give-up _exit 1.
     int start(int argc, char* argv[]);
 
 private:
@@ -50,7 +59,9 @@ private:
     void handleConnect(struct mosquitto* mosq, int rc);
     void handleMessage(const std::string& topic, const std::string& payload);
     void publishStatus();
-    void publishRaw(const std::string& topic, const std::string& payload, bool retain);
+    // True when libmosquitto queued the message on a live connection.
+    // False when there is no client or the broker is not connected.
+    bool publishRaw(const std::string& topic, const std::string& payload, bool retain);
     // Offline snapshot of the current table. libmosquitto sends it on the
     // next CONNECT, so a reconnect after a drop picks up streams added since
     // the previous session. A SIGKILL before that reconnect still publishes
@@ -63,6 +74,7 @@ private:
     static void onDisconnect(struct mosquitto* mosq, void* obj, int rc);
 
     StreamManager& manager_;
+    DecoderFactory decoderFactory_;
     Config config_;
     struct mosquitto* mosq_ = nullptr;
     bool libInitialized_ = false;

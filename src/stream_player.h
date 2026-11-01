@@ -28,8 +28,9 @@
 // in-flight open or read. FFmpeg's getaddrinfo ignores AVIOInterruptCB, so
 // abort() does not unblock a stuck lookup; that worker stays on the reaper
 // until the libc call returns. Process exit publishes offline status first,
-// waits kExitJoinDeadline, then flushes and _exit(0) if a worker is still
-// inside that call.
+// waits kExitJoinDeadline, then flushes and _exit if a worker is still
+// inside that call. The status is 0 for a signal and 1 for authentication
+// give-up or a failed sigtimedwait. The destructor does not join that worker.
 //
 // Only http:// and https:// URLs are opened. A local file URL never reaches
 // the factory, and a backend that reports isHardware() is closed.
@@ -74,9 +75,11 @@ public:
     // Sessions still in the map are left alone; call closeAll() first.
     bool drain(std::chrono::milliseconds deadline);
 
-    // drain(). If a worker is still blocked, flush stdio and _exit(0).
+    // drain(). If a worker is still blocked, flush stdio and _exit(exitCode).
     // Call this on process exit after the offline status has been published.
-    void exitIfBusy(std::chrono::milliseconds deadline);
+    // exitCode is 0 for a signal and 1 for authentication give-up or a failed
+    // sigtimedwait. The default keeps existing signal-shaped callers at 0.
+    void exitIfBusy(std::chrono::milliseconds deadline, int exitCode = 0);
 
     // Shorter than scripts/launch-coreelec.sh's 10s SIGTERM poll. A glibc
     // resolver stall is about 10s per nameserver, so waiting that poll out
