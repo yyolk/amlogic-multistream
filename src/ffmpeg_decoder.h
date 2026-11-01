@@ -40,11 +40,14 @@ public:
     // `--url` passes true so local fixture files open. The default is false:
     // avformat_open_input then allows only http, https, tls, tcp, crypto, and
     // hls. MQTT must not set this; `add` already rejects non-HTTP URLs.
-    // open() also sets a demuxer whitelist (hls, mpegts, mov, mp4, mpeg, and
-    // aac, ac3, eac3, mp3 for packed-audio HLS renditions) and a codec
-    // whitelist (h264, hevc, mpeg4, mpeg2video, mpeg1video, mjpeg, and aac,
-    // mp3, ac3, eac3 for container probe). gif and image demuxers are
-    // rejected on every path, including `--url`.
+    // open() sets format_whitelist to hls, mpegts, mov, mp4, mpeg, plus aac,
+    // ac3, eac3, and mp3 so a packed-audio HLS rendition can open. The
+    // demuxer accepted for this URL is only hls, mpegts, mov, mp4, or mpeg,
+    // so a standalone mp3 or aac is rejected (AUDIT4 A4). The codec
+    // whitelist is h264, hevc, mpeg4, mpeg2video, mpeg1video, mjpeg, aac,
+    // mp3, mp3float, ac3, and eac3. On FFmpeg 6.1 the MP3 decoder is named
+    // mp3float; mp3 stays for a build that registers that name (AUDIT4 A5).
+    // gif and image demuxers are rejected on every path, including `--url`.
     void setAllowLocalFile(bool allow);
 
     bool open(const std::string& url) override;

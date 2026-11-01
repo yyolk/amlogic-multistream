@@ -21,19 +21,26 @@ namespace {
 // the connection just alive; DecoderBackend::abort() does.
 constexpr const char* kRwTimeoutUs = "15000000";
 
-// HLS and the segment demuxers it opens: mpegts, fMP4/mov, and packed-audio
-// renditions (aac, ac3, eac3, mp3). mpegts is also a direct HTTP MPEG-TS
-// URL. gif, image2, and the other image demuxers are not listed. hls.c
-// copies this whitelist onto each rendition inside avformat_open_input,
-// before AVDISCARD_ALL can drop a separate audio playlist (SURVIVING4 H1).
+// format_whitelist passed to avformat_open_input. hls.c copies it onto each
+// rendition before AVDISCARD_ALL can drop a separate audio playlist, so the
+// packed-audio demuxers (aac, ac3, eac3, mp3) have to be listed here
+// (SURVIVING4 H1). gif, image2, and the other image demuxers are not listed.
 constexpr const char* kFormatWhitelist =
     "hls,mpegts,mov,mp4,mpeg,aac,ac3,eac3,mp3";
 
+// Post-open check of the caller's own demuxer. Packed-audio names stay off
+// this list: a standalone song.mp3 with an ID3 APIC cover otherwise opens
+// as mjpeg video and the cover is presented (AUDIT4 A4).
+constexpr const char* kTopLevelFormatWhitelist = "hls,mpegts,mov,mp4,mpeg";
+
 // Video codecs this player decodes, plus audio codecs
 // avformat_find_stream_info may open while probing HLS or MPEG-TS. gif is
-// not listed. This is not a TLS or privilege boundary.
+// not listed. On FFmpeg 6.1 the default MP3 decoder is named mp3float, so
+// that name has to be listed or each probe logs that it is off the
+// whitelist. mp3 stays for a build that registers that decoder name
+// (AUDIT4 A5). This is not a TLS or privilege boundary.
 constexpr const char* kCodecWhitelist =
-    "h264,hevc,mpeg4,mpeg2video,mpeg1video,mjpeg,aac,mp3,ac3,eac3";
+    "h264,hevc,mpeg4,mpeg2video,mpeg1video,mjpeg,aac,mp3,mp3float,ac3,eac3";
 
 void logAvError(const char* prefix, const std::string& url, const char* what, int err) {
     std::cerr << prefix << " for '" << url << "': " << what;
@@ -160,7 +167,7 @@ bool FfmpegDecoder::open(const std::string& url) {
 
     fmt_->flags |= AVFMT_FLAG_GENPTS;
     if (fmt_->iformat == nullptr || fmt_->iformat->name == nullptr ||
-        av_match_list(fmt_->iformat->name, kFormatWhitelist, ',') <= 0) {
+        av_match_list(fmt_->iformat->name, kTopLevelFormatWhitelist, ',') <= 0) {
         const char* name = fmt_->iformat != nullptr ? fmt_->iformat->name : nullptr;
         std::cerr << "FfmpegDecoder::open failed for '" << url_
                   << "': demuxer is not allowed: " << (name != nullptr ? name : "unknown") << "\n";

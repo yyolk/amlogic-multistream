@@ -31,6 +31,9 @@
 // SURVIVING4 H1: an HLS master with a separate ADTS audio rendition. hls.c
 // copies the format whitelist onto that rendition during open, before audio
 // can be discarded. open() must succeed and a video frame must be presented.
+//
+// AUDIT4 A4: a standalone song.mp3 with an ID3 APIC cover must not open.
+// Packed-audio names stay on the format_whitelist option only.
 
 #ifndef FFMPEG_CLI
 #define FFMPEG_CLI ""
@@ -567,6 +570,66 @@ void testRejectGif(const std::string& ffmpeg, const std::filesystem::path& dir) 
     server.stop();
 }
 
+// ID3v2.3 MP3 with a JPEG APIC cover. The mp3 demuxer is on format_whitelist
+// so an HLS packed-audio rendition can open, and it is not accepted as the
+// top-level format. Before that split, open() selected the cover as mjpeg.
+void testRejectCoverMp3(const std::string& ffmpeg, const std::filesystem::path& dir) {
+    g_case = "generate song.mp3";
+    const std::filesystem::path mp3 = dir / "song.mp3";
+    const std::filesystem::path log = dir / "song-mp3-ffmpeg.log";
+    const int mp3_rc = run(
+        {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "sine=frequency=440:sample_rate=44100:duration=0.4",
+         "-f", "lavfi", "-i", "color=c=red:s=16x16:d=0.04,format=rgb24",
+         "-map", "0:a", "-map", "1:v",
+         "-c:a", "libmp3lame", "-b:a", "64k", "-c:v", "mjpeg",
+         "-id3v2_version", "3",
+         "-metadata:s:v", "title=Album cover",
+         "-metadata:s:v", "comment=Cover (front)",
+         "-disposition:v:0", "attached_pic",
+         mp3.string()},
+        log);
+    if (mp3_rc != 0) {
+        std::cerr << "failed to generate song.mp3 fixture (exit " << mp3_rc << ")\n"
+                  << readFile(log);
+        ++g_failures;
+        return;
+    }
+
+    {
+        std::ifstream in(mp3, std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const bool id3 = bytes.size() >= 3 && bytes[0] == 'I' && bytes[1] == 'D' && bytes[2] == '3';
+        const bool apic = bytes.find("APIC") != std::string::npos;
+        const bool jpeg = bytes.find(std::string("\xFF\xD8", 2)) != std::string::npos;
+        if (!in || !id3 || !apic || !jpeg) {
+            std::cerr << "song.mp3 fixture is missing an ID3 APIC JPEG cover\n";
+            ++g_failures;
+            return;
+        }
+    }
+
+    g_case = "song.mp3 local";
+    FfmpegDecoder local;
+    local.setAllowLocalFile(true);
+    CHECK(!local.open(mp3.string()));
+    local.close();
+
+    g_case = "song.mp3 http";
+    const std::filesystem::path get_log = dir / "song-mp3-gets.log";
+    LocalHttp server = startLocalHttp(dir, get_log);
+    CHECK(server.pid > 0);
+    CHECK(server.port > 0);
+    if (server.pid <= 0 || server.port <= 0) {
+        return;
+    }
+    const std::string url = "http://127.0.0.1:" + std::to_string(server.port) + "/song.mp3";
+    FfmpegDecoder http;
+    CHECK(!http.open(url));
+    http.close();
+    server.stop();
+}
+
 // Master playlist plus a raw-ADTS audio rendition. The video playlist is
 // MPEG-TS. The audio playlist's segment probes as format "aac", which hls.c
 // opens under the copied format whitelist.
@@ -698,6 +761,7 @@ int main() {
         testDecode(mp4.string());
         testMissingFile(tmp.path());
         testRejectGif(ffmpeg, tmp.path());
+        testRejectCoverMp3(ffmpeg, tmp.path());
 
         g_case = "generate hls";
         const std::filesystem::path hls_dir = tmp.path() / "hls";
