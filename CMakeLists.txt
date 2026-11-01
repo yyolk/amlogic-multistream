@@ -4,12 +4,13 @@ project(amlogic-multistream VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Layout math, the in-memory stream table, MQTT command parsing, and the
-# software renderer have no FFmpeg, libmosquitto, or DRM dependency, so CI
-# can build and run them on a normal Linux host. ffmpeg_decoder_tests is
-# added only when the libav* packages are present. The player target below
-# stays optional. A test that links libmosquitto should be added only when
-# MOSQUITTO_FOUND is true.
+# Layout math, the in-memory stream table, MQTT command parsing, the
+# software renderer, and StreamPlayer's fake-decoder test have no FFmpeg,
+# libmosquitto, or DRM dependency, so CI can build and run them on a normal
+# Linux host. ffmpeg_decoder_tests and the localhost HTTP player smoke test
+# are added only when the libav* packages are present. The player target
+# below stays optional. A test that links libmosquitto should be added only
+# when MOSQUITTO_FOUND is true.
 #
 # AMLOGIC_DRM_KMS defaults off. Turning it on compiles the /dev/dri hook in
 # DrmRenderer. That hook requires GS-King X / CoreELEC and is not used by
@@ -47,11 +48,24 @@ add_executable(software_renderer_tests
 target_include_directories(software_renderer_tests PRIVATE src)
 target_compile_options(software_renderer_tests PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(stream_player_test
+    tests/stream_player_test.cpp
+    src/stream_player.cpp
+    src/stream_manager.cpp
+    src/layout_engine.cpp
+    src/software_renderer.cpp
+    src/mqtt_commands.cpp
+    src/mqtt_json.cpp
+)
+target_include_directories(stream_player_test PRIVATE src)
+target_compile_options(stream_player_test PRIVATE -Wall -Wextra -Wpedantic)
+
 enable_testing()
 add_test(NAME layout_engine COMMAND layout_engine_tests)
 add_test(NAME stream_manager_test COMMAND stream_manager_test)
 add_test(NAME mqtt_smoke_test COMMAND mqtt_smoke_test)
 add_test(NAME software_renderer COMMAND software_renderer_tests)
+add_test(NAME stream_player_test COMMAND stream_player_test)
 
 # Stand-in for scripts/launch-coreelec.sh (that script requires GS-King X /
 # CoreELEC). Checks SIGTERM against a type-2 runtime that does not forward
@@ -95,6 +109,31 @@ if(FFMPEG_FOUND)
     endif()
     add_test(NAME ffmpeg_decoder COMMAND ffmpeg_decoder_tests)
     set_tests_properties(ffmpeg_decoder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+
+    # MQTT add → software decode → SoftwareRenderer, without a broker.
+    # Serves one MPEG-TS file on 127.0.0.1. Skips when the ffmpeg CLI is missing.
+    add_executable(stream_player_http_test
+        tests/stream_player_http_test.cpp
+        src/stream_player.cpp
+        src/stream_manager.cpp
+        src/layout_engine.cpp
+        src/software_renderer.cpp
+        src/ffmpeg_decoder.cpp
+    )
+    target_include_directories(stream_player_http_test SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
+    target_include_directories(stream_player_http_test PRIVATE src)
+    if(FFMPEG_LIBRARY_DIRS)
+        target_link_directories(stream_player_http_test PRIVATE ${FFMPEG_LIBRARY_DIRS})
+    endif()
+    target_link_libraries(stream_player_http_test PRIVATE ${FFMPEG_LIBRARIES})
+    target_compile_options(stream_player_http_test PRIVATE -Wall -Wextra -Wpedantic ${FFMPEG_CFLAGS_OTHER})
+    if(FFMPEG_CLI)
+        target_compile_definitions(stream_player_http_test PRIVATE FFMPEG_CLI="${FFMPEG_CLI}")
+    else()
+        target_compile_definitions(stream_player_http_test PRIVATE FFMPEG_CLI="")
+    endif()
+    add_test(NAME stream_player_http COMMAND stream_player_http_test)
+    set_tests_properties(stream_player_http PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 else()
     message(STATUS
         "Skipping ffmpeg_decoder test: need libavformat, libavcodec, libavutil, and libswscale")
@@ -116,6 +155,7 @@ if(AMLOGIC_PLAYER_DEPS_FOUND)
         src/ffmpeg_decoder.cpp
         src/software_renderer.cpp
         src/drm_renderer.cpp
+        src/stream_player.cpp
     )
     if(AMLOGIC_DRM_KMS)
         target_compile_definitions(amlogic-multistream PRIVATE AMLOGIC_DRM_KMS=1)

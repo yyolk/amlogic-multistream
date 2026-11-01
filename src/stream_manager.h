@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -7,10 +8,14 @@ struct StreamInfo {
     std::string id;
     std::string url;
     bool muted = false;
+    // Incremented by restartStream and restartAll. A player loop reopens the
+    // decoder when this changes. An unknown id does not change any entry.
+    uint64_t restartGeneration = 0;
 };
 
 // In-memory stream table for MQTT control.
-// These methods do not open decoders or DRM/KMS planes.
+// add, remove, mute, and layout do not open decoders or DRM/KMS planes.
+// restartStream and restartAll only bump restartGeneration.
 class StreamManager {
 public:
     // Empty id or url is rejected. Repeating the same id and url succeeds.
@@ -20,7 +25,8 @@ public:
     std::vector<StreamInfo> list() const;
 
     bool muteStream(const std::string& id, bool muted);
-    // Keep the entry (including mute) and record a reconnect request.
+    // Keep the entry (including mute and url) and bump restartGeneration.
+    // Unknown id returns false and does not change any other stream.
     bool restartStream(const std::string& id);
     int restartAll();
 

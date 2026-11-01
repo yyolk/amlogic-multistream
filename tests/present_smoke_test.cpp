@@ -188,16 +188,35 @@ int main() {
             return 1;
         }
 
-        const int noUrl = run({player, "--render-dir", frames.string()}, out, err);
-        if (noUrl != 2) {
-            std::cerr << "--render-dir without --url should exit 2, got " << noUrl << "\n"
+        const int rendererOnly = run({player, "--renderer", "software"}, out, err);
+        if (rendererOnly != 2) {
+            std::cerr << "--renderer without --url should exit 2, got " << rendererOnly << "\n"
+                      << readFile(out) << readFile(err);
+            return 1;
+        }
+
+        const int badViewport = run({player, "--viewport", "nope"}, out, err);
+        const std::string viewportText = readFile(out) + readFile(err);
+        if (badViewport != 1 || viewportText.find("Invalid --viewport") == std::string::npos ||
+            viewportText.find("MQTT connected") != std::string::npos) {
+            std::cerr << "--viewport nope should fail before connect (exit " << badViewport << ")\n"
+                      << viewportText;
+            return 1;
+        }
+
+        const int urlViewport =
+            run({player, "--url", mp4.string(), "--viewport", "160x120", "--frames", "1"}, out, err);
+        if (urlViewport != 2) {
+            std::cerr << "--viewport is not a --url flag (exit " << urlViewport << ")\n"
                       << readFile(out) << readFile(err);
             return 1;
         }
 
         const int mqttHelp = run({player, "--help"}, out, err);
         const std::string mqttText = readFile(out) + readFile(err);
-        if (mqttHelp != 0 || mqttText.find("MQTT") == std::string::npos) {
+        if (mqttHelp != 0 || mqttText.find("MQTT") == std::string::npos ||
+            mqttText.find("--viewport") == std::string::npos ||
+            mqttText.find("--render-dir") == std::string::npos) {
             std::cerr << "default --help should stay on the MQTT path (exit " << mqttHelp << ")\n" << mqttText;
             return 1;
         }

@@ -1,13 +1,17 @@
 #pragma once
 #include "stream_manager.h"
 
+#include <atomic>
 #include <string>
 
 struct mosquitto;
 struct mosquitto_message;
 
 // Connects to an MQTT broker and applies command topics to StreamManager.
-// Hardware decode and DRM/KMS are out of scope for this controller.
+// Broker I/O runs on the mosquitto thread. start() ticks software decode and
+// present on the calling thread until SIGINT/SIGTERM, so the process is not
+// blocked in sigwait with no decode loop. Hardware decode and DRM/KMS are
+// not started.
 class MqttController {
 public:
     explicit MqttController(StreamManager& manager);
@@ -16,7 +20,7 @@ public:
     MqttController(const MqttController&) = delete;
     MqttController& operator=(const MqttController&) = delete;
 
-    // Read env and CLI, then connect, subscribe, and block until SIGINT/SIGTERM.
+    // Read env and CLI, then connect, subscribe, and tick until SIGINT/SIGTERM.
     // Returns 0 after a clean shutdown or --help, and 1 if the client cannot start.
     int start(int argc, char* argv[]);
 
@@ -29,6 +33,11 @@ private:
         std::string password;
         std::string clientId = "amlogic-multistream";
         int keepalive = 60;
+        // Software viewport for MQTT mode. --url keeps its own frame-sized path.
+        int viewportWidth = 1280;
+        int viewportHeight = 720;
+        // Empty means SoftwareRenderer writes no PPM files.
+        std::string renderDir;
     };
 
     void loadConfig(int argc, char* argv[]);
@@ -50,6 +59,6 @@ private:
     bool loopStarted_ = false;
     bool helpRequested_ = false;
     bool configError_ = false;
-    // Player-loop flag. Touched only on the mosquitto network thread.
-    bool playing_ = false;
+    // Player-loop flag. The mosquitto thread stores it; the main thread loads it.
+    std::atomic<bool> playing_{false};
 };

@@ -45,6 +45,11 @@ public:
     bool present(const DecodedFrame& frame, const LayoutEngine::Rect& dest) override;
     void shutdown() override;
 
+    // Zero the RGB buffer without resetting the frame counter or writing a PPM.
+    // No-op before a successful init(). Used when the set of cells changes or
+    // playback stops, so a removed stream does not leave a stale cell.
+    void clearViewport();
+
     bool ready() const { return ready_; }
     int viewportWidth() const { return width_; }
     int viewportHeight() const { return height_; }

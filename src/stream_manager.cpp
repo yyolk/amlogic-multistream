@@ -19,9 +19,8 @@ std::string effectiveLayout(const std::string& setting, int streamCount) {
 }
 
 void logRestart(const StreamInfo& stream) {
-    // Decoder open/close lands in a later milestone. Callers still get a stable id/url/mute entry.
     std::cout << "Restart stream: " << stream.id << " -> " << stream.url
-              << " (reconnect requested; decoder not started in this build)\n";
+              << " (reconnect requested, generation " << stream.restartGeneration << ")\n";
 }
 
 }  // namespace
@@ -84,13 +83,15 @@ bool StreamManager::restartStream(const std::string& id) {
         std::cerr << "Stream not found: " << id << "\n";
         return false;
     }
+    ++it->restartGeneration;
     logRestart(*it);
     return true;
 }
 
 int StreamManager::restartAll() {
     std::lock_guard<std::mutex> lock(mu_);
-    for (const auto& stream : streams_) {
+    for (auto& stream : streams_) {
+        ++stream.restartGeneration;
         logRestart(stream);
     }
     return static_cast<int>(streams_.size());
