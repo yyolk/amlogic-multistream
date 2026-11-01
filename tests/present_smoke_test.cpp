@@ -9,10 +9,12 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -289,6 +291,99 @@ LocalHttp startPlaylistServer(const std::string& body) {
     return server;
 }
 
+int64_t decodePesPts(const unsigned char* b) {
+    return (static_cast<int64_t>((b[0] >> 1) & 0x7) << 30) | (static_cast<int64_t>(b[1]) << 22) |
+           (static_cast<int64_t>((b[2] >> 1) & 0x7F) << 15) | (static_cast<int64_t>(b[3]) << 7) |
+           (static_cast<int64_t>((b[4] >> 1) & 0x7F));
+}
+
+void encodePesPts(unsigned char* b, int prefix, int64_t pts) {
+    b[0] = static_cast<unsigned char>((prefix << 4) | (((pts >> 30) & 7) << 1) | 1);
+    b[1] = static_cast<unsigned char>((pts >> 22) & 0xFF);
+    b[2] = static_cast<unsigned char>((((pts >> 15) & 0x7F) << 1) | 1);
+    b[3] = static_cast<unsigned char>((pts >> 7) & 0xFF);
+    b[4] = static_cast<unsigned char>(((pts & 0x7F) << 1) | 1);
+}
+
+int mpegTsPid(const unsigned char* pkt) {
+    return ((pkt[1] & 0x1f) << 8) | pkt[2];
+}
+
+int mpegTsPayloadOffset(const unsigned char* pkt) {
+    const int adapt = (pkt[3] >> 4) & 0x3;
+    if (adapt == 1) {
+        return 4;
+    }
+    if (adapt == 2 || adapt == 3) {
+        return 5 + static_cast<int>(pkt[4]);
+    }
+    return 188;
+}
+
+// AUDIT11 D3: bump the second video PES timestamp by 10 s (90 kHz) so the
+// D2 pre-pass stops on FFmpeg's 7 s mpegts analyze gap, then append an
+// undeclared 0x101 PID. find_stream_info does not stop on that gap.
+bool writeJumpThenExtraTs(const std::filesystem::path& pmt,
+                          const std::filesystem::path& extra,
+                          const std::filesystem::path& dst) {
+    std::ifstream in(pmt, std::ios::binary);
+    std::vector<char> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (data.size() < 188 || data.size() % 188 != 0) {
+        return false;
+    }
+    int pes = 0;
+    bool rewritten = false;
+    for (size_t i = 0; i + 188 <= data.size(); i += 188) {
+        auto* pkt = reinterpret_cast<unsigned char*>(&data[i]);
+        if (pkt[0] != 0x47) {
+            return false;
+        }
+        if ((pkt[1] & 0x40) == 0 || mpegTsPid(pkt) != 0x100) {
+            continue;
+        }
+        const int off = mpegTsPayloadOffset(pkt);
+        if (off + 14 > 188 || pkt[off] != 0 || pkt[off + 1] != 0 || pkt[off + 2] != 1 ||
+            pkt[off + 3] != 0xE0) {
+            continue;
+        }
+        ++pes;
+        const int pts_dts = (pkt[off + 7] >> 6) & 0x3;
+        if (pes != 2 || (pts_dts != 2 && pts_dts != 3)) {
+            continue;
+        }
+        unsigned char* ptsb = pkt + off + 9;
+        const int prefix = pts_dts == 2 ? 2 : 3;
+        encodePesPts(ptsb, prefix, decodePesPts(ptsb) + 900000);
+        if (pts_dts == 3 && off + 19 <= 188) {
+            encodePesPts(pkt + off + 14, 1, decodePesPts(pkt + off + 14) + 900000);
+        }
+        rewritten = true;
+        break;
+    }
+    if (!rewritten) {
+        return false;
+    }
+
+    std::ofstream out(dst, std::ios::binary);
+    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+    std::ifstream more(extra, std::ios::binary);
+    char pkt[188];
+    bool kept = false;
+    while (more.read(pkt, 188) && more.gcount() == 188) {
+        if (static_cast<unsigned char>(pkt[0]) != 0x47) {
+            return false;
+        }
+        const int pid = mpegTsPid(reinterpret_cast<unsigned char*>(pkt));
+        if (pid == 0x100) {
+            pkt[1] = static_cast<char>((pkt[1] & 0xE0) | 0x01);
+            pkt[2] = 0x01;
+            out.write(pkt, 188);
+            kept = true;
+        }
+    }
+    return kept && out.good();
+}
+
 }  // namespace
 
 int main() {
@@ -511,6 +606,29 @@ int main() {
                 std::cerr << "extra-PID HLS --url must present the small stream (exit " << extraRc
                           << " rss_kb=" << extraRssKb << ")\n"
                           << extraOut << extraErr;
+                return 1;
+            }
+
+            // AUDIT11 D3: 10 s PTS jump on the PMT program, then the same
+            // undeclared 12000x12000 PID. The pre-pass stops on the gap;
+            // find_stream_info must not decode the late picture uncapped.
+            const std::filesystem::path jumpExtra = tmp.path() / "jump-then-extra.ts";
+            if (!writeJumpThenExtraTs(smallTs, hugeTs, jumpExtra)) {
+                std::cerr << "failed to build jump-then-extra mpegts fixture\n";
+                return 1;
+            }
+            long jumpRssKb = 0;
+            const int jumpRc =
+                run({player, "--url", jumpExtra.string(), "--frames", "1"}, out, err, &jumpRssKb);
+            const std::string jumpOut = readFile(out);
+            const std::string jumpErr = readFile(err);
+            // Uncapped D3 was ~381 MB. D2 in-window controls stay under ~90 MB.
+            constexpr long kJumpRssKb = 100000;
+            if (jumpRc != 0 || jumpOut.find("presented ") == std::string::npos ||
+                jumpOut.find("160x120") == std::string::npos || jumpRssKb >= kJumpRssKb) {
+                std::cerr << "jump-then-extra --url must present the small stream (exit " << jumpRc
+                          << " rss_kb=" << jumpRssKb << ")\n"
+                          << jumpOut << jumpErr;
                 return 1;
             }
         }
