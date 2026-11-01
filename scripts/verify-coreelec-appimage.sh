@@ -208,8 +208,10 @@ if command -v ffmpeg >/dev/null 2>&1; then
     cat "$WORK/decode.txt" >&2
     die "AppRun --url failed to decode a local fixture with CoreELEC's FFmpeg"
   fi
-  grep -q 'isHardware=0' "$WORK/decode.txt" && grep -q '^presented 2 ' "$WORK/decode.txt" ||
-    { cat "$WORK/decode.txt" >&2; die "AppRun --url did not present 3 frames"; }
+  if ! grep -q 'isHardware=0' "$WORK/decode.txt" || ! grep -q '^presented 2 ' "$WORK/decode.txt"; then
+    cat "$WORK/decode.txt" >&2
+    die "AppRun --url did not present 3 frames"
+  fi
   pass "AppRun --url software-decoded 3 frames with CoreELEC FFmpeg ($(sed -n 's/.* codec=\([^ ]*\).*/\1/p' "$WORK/decode.txt" | head -n 1))"
 else
   skip "AppRun --url decode (no host ffmpeg CLI to write a fixture)"

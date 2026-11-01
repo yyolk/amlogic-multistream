@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2034  # read by the scripts that source this file
 # Sourced by the CoreELEC device scripts. Not executable on its own.
 #
 # One entry per CoreELEC line the player is packaged for. Each entry pins

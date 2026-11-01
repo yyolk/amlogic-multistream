@@ -197,7 +197,9 @@ fi
 
 q() { printf '%q' "$1"; }
 
-# CoreELEC 21 sets COREELEC_ARCH, CoreELEC 22 sets DISTRO_ARCH.
+# CoreELEC 21 sets COREELEC_ARCH, CoreELEC 22 sets DISTRO_ARCH. Expanded
+# on the box.
+# shellcheck disable=SC2016
 remote_arch='. /etc/os-release && echo "${COREELEC_ARCH:-$DISTRO_ARCH}"'
 # Tar over ssh: CoreELEC has tar and sh but the add-on tree must not depend
 # on unzip or scp being present.
