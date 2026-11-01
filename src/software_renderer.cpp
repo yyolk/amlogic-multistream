@@ -163,8 +163,7 @@ bool SoftwareRenderer::frameAcceptable(const DecodedFrame& frame) {
     if (frame.format != FramePixelFormat::Yuv420p) {
         return false;
     }
-    if (frame.width <= 0 || frame.height <= 0 || frame.width > kMaxExtent ||
-        frame.height > kMaxExtent) {
+    if (!sizeAcceptable(frame.width, frame.height)) {
         return false;
     }
     const int chromaW = (frame.width + 1) / 2;
@@ -176,8 +175,7 @@ bool SoftwareRenderer::frameAcceptable(const DecodedFrame& frame) {
 
 bool SoftwareRenderer::init(int viewportWidth, int viewportHeight) {
     shutdown();
-    if (viewportWidth <= 0 || viewportHeight <= 0 || viewportWidth > kMaxExtent ||
-        viewportHeight > kMaxExtent) {
+    if (!sizeAcceptable(viewportWidth, viewportHeight)) {
         std::cerr << "SoftwareRenderer::init: viewport must be 1.." << kMaxExtent << " on each side\n";
         return false;
     }
@@ -207,8 +205,7 @@ bool SoftwareRenderer::present(const DecodedFrame& frame, const LayoutEngine::Re
     if (!frameAcceptable(frame)) {
         if (frame.format != FramePixelFormat::Yuv420p) {
             std::cerr << "SoftwareRenderer::present: only yuv420p is supported\n";
-        } else if (frame.width <= 0 || frame.height <= 0 || frame.width > kMaxExtent ||
-                   frame.height > kMaxExtent) {
+        } else if (!sizeAcceptable(frame.width, frame.height)) {
             std::cerr << "SoftwareRenderer::present: frame size must be 1.." << kMaxExtent << "\n";
         } else {
             std::cerr << "SoftwareRenderer::present: yuv420p planes are missing or have a bad stride\n";

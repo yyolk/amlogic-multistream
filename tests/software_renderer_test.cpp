@@ -320,6 +320,12 @@ void testRejectsOversizeFrame() {
     tall.fill(235, 128, 128);
     CHECK(!SoftwareRenderer::frameAcceptable(tall.frame()));
 
+    CHECK(!SoftwareRenderer::sizeAcceptable(8224, 32));
+    CHECK(!SoftwareRenderer::sizeAcceptable(32, 8224));
+    CHECK(SoftwareRenderer::sizeAcceptable(SoftwareRenderer::kMaxExtent, 32));
+    CHECK(SoftwareRenderer::sizeAcceptable(SoftwareRenderer::kMaxExtent,
+                                           SoftwareRenderer::kMaxExtent));
+
     YuvImage ok(SoftwareRenderer::kMaxExtent, 32, SoftwareRenderer::kMaxExtent,
                 SoftwareRenderer::kMaxExtent / 2);
     ok.fill(235, 128, 128);

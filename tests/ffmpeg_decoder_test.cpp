@@ -721,6 +721,100 @@ void testAdtsAudioMaster(const std::string& ffmpeg, const std::filesystem::path&
     decoder.close();
 }
 
+void testExtentCap(const std::string& ffmpeg, const std::filesystem::path& dir) {
+    const std::filesystem::path log = dir / "extent-ffmpeg.log";
+
+    g_case = "generate 8224x32";
+    const std::filesystem::path wide = dir / "wide-8224.mp4";
+    const int wide_rc = run(
+        {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "testsrc=size=8224x32:rate=10:duration=0.4",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", wide.string()},
+        log);
+    if (wide_rc != 0) {
+        if (encoderMissing(readFile(log))) {
+            std::cout << "extent cap fixture skipped: libx264 encoder not available\n";
+            return;
+        }
+        std::cerr << "failed to generate 8224x32 fixture (exit " << wide_rc << ")\n"
+                  << readFile(log);
+        ++g_failures;
+        return;
+    }
+
+    g_case = "8224x32 reject before convert";
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        const bool opened = decoder.open(wide.string());
+        CHECK(opened);
+        if (opened) {
+            DecodedFrame frame;
+            CHECK(!decoder.readFrame(frame));
+            CHECK(frame.width == 0);
+            CHECK(frame.height == 0);
+        }
+        decoder.close();
+    }
+
+    g_case = "generate 8192x32";
+    const std::filesystem::path edge = dir / "edge-8192.mp4";
+    const int edge_rc = run(
+        {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "testsrc=size=8192x32:rate=10:duration=0.4",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", edge.string()},
+        log);
+    if (edge_rc != 0) {
+        std::cerr << "failed to generate 8192x32 fixture (exit " << edge_rc << ")\n"
+                  << readFile(log);
+        ++g_failures;
+        return;
+    }
+
+    g_case = "8192x32 presentable";
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        const bool opened = decoder.open(edge.string());
+        CHECK(opened);
+        if (opened) {
+            DecodedFrame frame;
+            CHECK(decoder.readFrame(frame));
+            CHECK(frame.format == FramePixelFormat::Yuv420p);
+            CHECK(frame.width == 8192);
+            CHECK(frame.height == 32);
+        }
+        decoder.close();
+    }
+
+    g_case = "generate 12000x12000 mjpeg";
+    const std::filesystem::path huge = dir / "huge-12000.mp4";
+    const int huge_rc = run(
+        {ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+         "-i", "color=c=red:s=12000x12000:d=0.04", "-frames:v", "1",
+         "-c:v", "mjpeg", "-q:v", "31", huge.string()},
+        log);
+    if (huge_rc != 0) {
+        std::cerr << "failed to generate 12000x12000 fixture (exit " << huge_rc << ")\n"
+                  << readFile(log);
+        ++g_failures;
+        return;
+    }
+
+    g_case = "12000x12000 reject";
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        DecodedFrame frame;
+        const bool opened = decoder.open(huge.string());
+        const bool got = opened && decoder.readFrame(frame);
+        CHECK(!got);
+        CHECK(frame.width == 0);
+        CHECK(frame.height == 0);
+        decoder.close();
+    }
+}
+
 void testMissingFile(const std::filesystem::path& dir) {
     g_case = "missing file";
     FfmpegDecoder decoder;
@@ -815,6 +909,7 @@ int main() {
         testRejectGif(ffmpeg, tmp.path());
         testRejectCoverMp3(ffmpeg, tmp.path());
         testHttpPlaylistFileSegment(mp4, tmp.path());
+        testExtentCap(ffmpeg, tmp.path());
 
         g_case = "generate hls";
         const std::filesystem::path hls_dir = tmp.path() / "hls";
