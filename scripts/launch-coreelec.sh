@@ -2,9 +2,11 @@
 # requires GS-King X / CoreELEC
 # RetroArch-style launch: stop Kodi, run the player, start Kodi.
 #
-# On-device only. CoreELEC Amlogic-ng for the GS-King X is a 32-bit ARM
-# userspace (CoreELEC-Amlogic-ng.arm, g12b_s922x_beelink_gs_king_x). The CI
-# aarch64 AppImage is not that binary. The base image has no fusermount.
+# On-device only. The GS-King X (g12b_s922x_beelink_gs_king_x) runs either
+# CoreELEC 21 Amlogic-ng, a 32-bit ARM userspace (coreelec21-ng-armv7hf
+# AppImage), or CoreELEC 22 Amlogic-no, a 64-bit ARM userspace
+# (coreelec22-no-aarch64 AppImage). The Ubuntu aarch64 CI smoke AppImage is
+# neither. The base image has no fusermount.
 #
 # A type-2 AppImage is unpacked once and AppRun is executed directly. The
 # type-2 runtime forks the player and does not forward SIGTERM, so waiting

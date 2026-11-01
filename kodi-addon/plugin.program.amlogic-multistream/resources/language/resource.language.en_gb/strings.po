@@ -35,7 +35,7 @@ msgid "Player binary or AppImage"
 msgstr ""
 
 msgctxt "#30102"
-msgid "PLAYER_BIN for the launch script. Must be a 32-bit ARM build on CoreELEC Amlogic-ng (GS-King X). The aarch64 CI AppImage does not run there."
+msgid "PLAYER_BIN for the launch script. Use the device AppImage for this box's CoreELEC line: coreelec21-ng-armv7hf on CoreELEC 21 Amlogic-ng, coreelec22-no-aarch64 on CoreELEC 22 Amlogic-no. The x86_64 and Ubuntu aarch64 CI AppImages are host smoke builds and do not run here."
 msgstr ""
 
 msgctxt "#30103"
