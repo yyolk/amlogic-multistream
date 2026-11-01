@@ -233,3 +233,89 @@ status.
   - `song.mp3` (libmp3lame plus a JPEG `attached_pic`, ID3v2.3), `plain.aac` (ADTS), and `song.m4a` (AAC plus a JPEG `attached_pic`).
   - Run as `--url http://127.0.0.1:…/X --frames 3 --render-dir DIR` on both builds.
 - **TSan:** `-fsanitize=thread -O1 -g` in a separate build dir. `stream_player_test` and `stream_player_stall_test` run with `TSAN_OPTIONS=die_after_fork=0`. `mqtt_exit_test` also passed under TSan, but its forked players log to temp files that are deleted on a pass, so those children are not counted as checked.
+
+---
+
+## CROSSCHECK vs AUDIT5-GEMINI
+
+Checked: `AUDIT5-GEMINI.md` on `cursor/audit5-gemini-1f6b` (draft
+[#31](https://github.com/yyolk/amlogic-multistream/pull/31)), against this file
+and `main` @ `bf00f31`. Same harness as section 7, plus two scenarios:
+
+- `nocam_brokerdrop_dns`: only the healthy `ok` stream, so `drain()` returns true. The broker is given as `brokerhost`. It is stopped and its name removed, then SIGTERM follows 3.5 s later.
+- `nocam_brokerdrop_blackhole`: the same, but `brokerhost` is remapped to `10.255.255.1`, which drops packets (a TCP connect to it hangs on this VM).
+
+Gemini raised two findings. I refer to them as G1 and G2 below.
+
+### Bottom line
+
+- **G1 is real, but it is not a #30 regression, and it is broader than Gemini says.** The no-stuck-worker exit joins libmosquitto's reconnect thread. On `58a2f9c` and `bf00f31` the numbers are identical: 7.53 s with one silent nameserver, 17.56 s with two. With a blackholed broker address the exit took **more than 60 s** on both (the harness killed it), and that case needs no DNS stall. The AUDIT4 cross-check measured this path (8.5 s) and called it pre-existing. My AUDIT5 should have carried it forward and did not.
+- **G1, G2, and my F2 are one bug:** every exit path can reach `mosquitto_loop_stop` while the network thread sits in a blocking reconnect. I merge them into one must-fix survivor (X1) below. That upgrades F2 from should-fix.
+- **Gemini missed F1** (must-fix, `"online":true` retained after exit) and the A3/A4 residuals (F3, F5).
+- **Gemini's fix for G1 is incomplete.** "`_exit` when `!sent`" does not cover F2, where `sent` is true and the broker drops during the drain. One exit shape covers all three cases (X1 below).
+
+### Gemini's findings
+
+| Gemini item | Gemini severity | Verdict | Evidence |
+| --- | --- | --- | --- |
+| G1: SIGTERM hangs if the broker is down and `drain()` returns true | must-fix | **Agree it is real and must-fix. Partially disagree with the framing.** | `[repro]` `nocam_brokerdrop_dns`: 7.53 s / 17.56 s on both builds. Blackholed broker: more than 60 s on both. The mechanism is the unconditional `shutdown()` after `finishProcess(0)` (`src/mqtt_controller.cpp:309-310`), which runs `mosquitto_loop_stop` (`:524-538`). It is a must-fix not because #30 caused it (it is older than #25), but because #30's `README.md:65` now promises the bound ("keeps the exit inside the launch script's poll even if the broker name does not resolve"), and this is T1's original symptom: a SIGKILL from the launch script's 10 s poll. Same bug as F2 via a different path, merged as X1. |
+| G2: `exitIfBusy(0)` returning falls through to the same hang | nit | **Agree.** | `[code]` If the stuck worker finishes between `drain(kExitJoinDeadline)` and `drain(0)` (`src/stream_player.cpp:296-299`), `finishProcess` returns, and `start()` calls `shutdown()` with `sent == false`. That is a microsecond window on top of G1's conditions. It is a sub-case of X1 and needs no separate fix. |
+| Line citations `src/mqtt_controller.cpp:177` and `:182` | — | **Wrong** | `:174-180` is the `mosquitto_new` failure branch. The code Gemini quotes is at `:274-279` (drain/gate) and `:309-310` (`finishProcess(0); shutdown();`). |
+| G1 recommendation: "if `sent` is false, `_exit(exitCode)`" | — | **Partially agree** | `[repro]` It fixes G1 and G2. It leaves F2: `sent` is true, then the broker drops during the drain, and `shutdown()` takes 11.04 s / 21.07 s. |
+
+### Gemini's A1–A5 verification
+
+| Item | Gemini | Verdict | Evidence |
+| --- | --- | --- | --- |
+| A1 | "Incomplete" | **Partially agree** | The stale-will defect A1 named is closed `[repro]` (table retained, one status message). What is incomplete is the exit bound (X1), plus a new retained-status defect Gemini did not find (F1). |
+| A2 | Verified | **Agree** | rc 1 at 1991 ms with a stuck worker. The startup refusal exits rc 1 in 0 ms. |
+| A3 | Verified | **Partially agree** | Restart and `stop`/`start` are gated. Rotating ids still stack 94 threads (F3), and a same-id URL fix waits 8.6 s (F4). |
+| A4 | Verified | **Partially agree** | `song.mp3` and `plain.aac` are refused. `song.m4a` with a cover still presents via `mov` (F5, older than #23). |
+| A5 | Verified | **Agree** | The MP3 rendition gives 0 whitelist warnings on `bf00f31`, against 5 on `58a2f9c`. |
+
+### My findings, against Gemini
+
+| Mine | My severity | Gemini | After cross-check |
+| --- | --- | --- | --- |
+| F1: command during the drain leaves `"online":true` retained | must-fix | **Missed** | Must-fix stands `[repro]`: retained `"online":true` on `bf00f31`, `online:false` on `58a2f9c`. Gemini's G1 fix does not touch it, because `handleMessage` still runs during the drain. |
+| F2: broker drop during the drain, `sent` stale | should-fix | Overlaps G1 (same `loop_stop` join, different trigger) | **Upgraded to must-fix as part of X1.** One fix covers both, and G1's trigger is much wider. |
+| F3: rotating-id stacking | should-fix | Missed (A3 "verified") | Stands. |
+| F4: same-id URL latency | nit | Missed | Stands as a nit. |
+| F5: `.m4a` cover art via `mov` | nit | Missed (A4 "verified") | Stands as a nit. |
+| F6: tests do not pin the gate, F1, or F2 | nit | — | Stands. The test seam it proposes (an interposed `getaddrinfo`) would also cover G1. |
+| F7: skippable MQTT tests | nit | — | Stands. |
+| F8: destructor comment | nit | — | Stands. |
+
+### X1 fix shape (scratch-tested, not in this PR)
+
+Every exit path behaves the same way after the final offline publish:
+
+1. Run the bounded `drain()`.
+2. If the publish was queued (`sent`), call `mosquitto_disconnect()` and wait up to 500 ms for `onDisconnect`.
+3. Flush stdio and `_exit(exitCode)`.
+4. Never call `mosquitto_loop_stop` or `mosquitto_destroy` on exit.
+
+Together with the F1 latch, that is 39 insertions and 8 deletions in `mqtt_controller.{h,cpp}`. Results on that tree `[repro]`:
+
+| Scenario | `bf00f31` | Scratch X1 + F1 |
+| --- | --- | --- |
+| No stuck worker, broker down, 2 silent nameservers (G1) | 17.56 s | 0.01 s |
+| No stuck worker, broker blackholed (G1) | more than 60 s | 0.52 s |
+| Stuck worker, broker drops during the drain, 2 nameservers (F2) | 21.07 s | 1.82 s |
+| Stuck worker, broker up (A1) | 2.02 s, table kept | 2.02 s, table kept |
+| `list` during the drain (F1) | `"online":true` retained | `online:false`, table kept |
+
+`AMS_REQUIRE_DECODER_TESTS=1 ./scripts/run-tests.sh` on that tree passes 14/14, including `mqtt_reconnect`'s SIGHUP retained-status check and `mqtt_exit_test`.
+
+### Agreed survivors
+
+**Must-fix**
+
+1. **F1:** stop handling commands once shutdown starts, so a command during the exit drain cannot republish `"online":true` that then survives the DISCONNECT. (Gemini missed it.)
+2. **X1 = G1 + G2 + F2:** the exit must never join libmosquitto's network thread. Use a bounded DISCONNECT only when the final publish was queued, then `_exit`. This makes `README.md:65` and `docs/mqtt.md:54` true. Add the interposed-`getaddrinfo` test from F6 so that the gate and G1 stay covered.
+
+**Should-fix**
+
+3. **F3:** cap the not-done reaper workers globally (about `2 × kMaxStreams`), so `add`/`remove` with fresh ids cannot stack threads on the 32-bit CE21 build.
+
+Nits (F4–F8) stay off this list. None of them blocks hardware work.
