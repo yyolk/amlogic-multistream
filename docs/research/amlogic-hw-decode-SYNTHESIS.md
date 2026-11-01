@@ -168,10 +168,12 @@ class**, not a `StreamPlayer` rewrite, and only if V1 is unexpectedly
 yes. Per-tile HLS variant pick belongs in the shared open path (today’s
 “first playlist variant” can pick 1080p for a 360p tile).
 
-CE21 stage-2 is software + at most two amvideo layers. A nine-tile
-hardware wall on CE21 needs a custom kernel (revert patch 003) **and**
-a compose engine onto fbdev. Out of scope. Do not treat 2×2 as a CE21
-promise (instance cap 2).
+CE21 stage-2 is software + at most two amvideo layers
+([#69](https://github.com/yyolk/amlogic-multistream/issues/69) /
+[milestone #5](https://github.com/yyolk/amlogic-multistream/milestone/5)).
+A nine-tile hardware wall on CE21 needs a custom kernel (revert patch
+003) **and** a compose engine onto fbdev. Out of scope. Do not treat
+2×2 as a CE21 promise (instance cap 2).
 
 ---
 
