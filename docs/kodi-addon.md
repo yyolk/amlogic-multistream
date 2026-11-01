@@ -27,9 +27,13 @@ They come from the `amlogic-multistream-appimage-coreelec21-ng-armv7hf` and `aml
    systemd-run --unit=amlogic-multistream-launch --collect --quiet \
      --property=KillMode=mixed \
      --setenv=HOME=/storage --setenv=PLAYER_BIN=/storage/amlogic-multistream \
-     [--setenv=MQTT_HOST=… --setenv=MQTT_PORT=… --setenv=MQTT_TOPIC_PREFIX=…] \
+     [--setenv=MQTT_HOST=… --setenv=MQTT_PORT=… --setenv=MQTT_TOPIC_PREFIX=… \
+      --setenv=MQTT_USERNAME=…] \
+     [--property=EnvironmentFile=/storage/.kodi/userdata/addon_data/plugin.program.amlogic-multistream/mqtt.env] \
      /bin/sh /storage/.kodi/addons/plugin.program.amlogic-multistream/resources/bin/launch-coreelec.sh
    ```
+
+   `EnvironmentFile=` is added only when a broker password is set. That file is `mqtt.env` in the add-on profile, mode 0600, and holds `MQTT_PASSWORD`. The password is not a `--setenv` value, so `systemctl show` does not list it. Clearing the password and launching again removes the file.
 
 3. The launch script stops Kodi, runs the player, waits for it to exit, and starts Kodi again.
 
@@ -53,6 +57,8 @@ The player's output is in the journal:
 journalctl -u amlogic-multistream-launch
 ```
 
+If the broker answers and then refuses the login (CONNACK "not authorised" or "bad user name or password"), the player exits non-zero after three attempts. The launch script then starts Kodi. A broker that is down is still retried, and Kodi stays stopped until the unit is stopped or the player exits.
+
 ## Settings
 
 | Setting | Environment variable | Default |
@@ -62,8 +68,10 @@ journalctl -u amlogic-multistream-launch
 | Broker host | `MQTT_HOST` | `localhost` (empty: not passed) |
 | Broker port | `MQTT_PORT` | `1883` (0: not passed) |
 | Topic prefix | `MQTT_TOPIC_PREFIX` | `amlogic-multistream` (empty: not passed) |
+| Broker username | `MQTT_USERNAME` | empty (anonymous; not passed) |
+| Broker password | `MQTT_PASSWORD` | empty (not passed). When set, written to `mqtt.env` in the add-on profile (mode 0600) and passed with `EnvironmentFile=`, not `--setenv` |
 
-`PLAYER_EXTRACT_DIR` is not exposed. The launch script unpacks an AppImage to `$PLAYER_BIN.AppDir`.
+`PLAYER_EXTRACT_DIR` is not exposed. The launch script unpacks an AppImage to `$PLAYER_BIN.AppDir`. Kodi also stores these settings in the add-on profile. On CoreELEC that profile is `/storage/.kodi/userdata/addon_data/plugin.program.amlogic-multistream/`.
 
 ## Build the zip
 
@@ -130,7 +138,7 @@ Open **Add-ons → Program add-ons** (or **Game add-ons**), choose **amlogic-mul
 - `addon.xml`: the id matches the directory, the `xbmc.python` 3.x import, the `pluginsource` entry for `default.py` that provides `executable`, and the metadata.
 - `settings.xml` and `strings.po`: every label resolves to a string, and every setting and string id that `default.py` uses exists.
 - The packaged zip: one top-level `plugin.program.amlogic-multistream/` directory, no bytecode, and a byte-identical executable copy of `scripts/launch-coreelec.sh`.
-- `default.py` from the extracted zip, with mode bits dropped as a zip install may do, run against stub `xbmc*` modules and stand-ins for `systemd-run` and `systemctl`. **Launch** runs the bundled launch script through `/bin/sh` with `PLAYER_BIN` and the MQTT settings. The stand-in log reads `stop kodi` and then `start kodi`, and a stub player sees that environment. A missing player and an already-active unit both leave Kodi alone.
+- `default.py` from the extracted zip, with mode bits dropped as a zip install may do, run against stub `xbmc*` modules and stand-ins for `systemd-run` and `systemctl`. **Launch** runs the bundled launch script through `/bin/sh` with `PLAYER_BIN` and the MQTT settings. A username is a `--setenv`. A password is a mode 0600 `EnvironmentFile` under the add-on profile and is not on the `systemd-run` command line. The stand-in log reads `stop kodi` and then `start kodi`, and a stub player sees that environment. A missing player and an already-active unit both leave Kodi alone.
 - `install-kodi-addon.sh`: a local `--storage` install; for the default CoreELEC 21 target, rejection of aarch64 and x86-64 ELF headers; for `--target coreelec22-no-aarch64`, acceptance of aarch64 and rejection of 32-bit ARM and x86-64; synthetic type-2 AppImages with and without the device target marker (the unmarked aarch64 one stands in for the Ubuntu smoke AppImage and is refused); and `--host --dry-run`, including the `/etc/os-release` check.
 
 The **CoreELEC device AppImages** workflow also installs each device AppImage with `--target` into a local `--storage` tree.

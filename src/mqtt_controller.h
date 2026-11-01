@@ -12,7 +12,9 @@ struct mosquitto_message;
 // thread until SIGINT, SIGTERM, or SIGHUP. Each stream is decoded on its own
 // thread, so a stalled read does not block the other tiles or the signal
 // wait. A broker that is down at startup is retried with backoff instead of
-// exiting. Hardware decode and DRM/KMS are not started.
+// exiting. A CONNACK that refuses the username or password exits non-zero
+// after a few attempts so scripts/launch-coreelec.sh can start Kodi.
+// Hardware decode and DRM/KMS are not started.
 class MqttController {
 public:
     explicit MqttController(StreamManager& manager);
@@ -23,7 +25,8 @@ public:
 
     // Read env and CLI, then connect, subscribe, and tick until SIGINT,
     // SIGTERM, or SIGHUP. Returns 0 after a clean shutdown or --help, and 1
-    // if the client cannot start. An unreachable broker is retried.
+    // if the client cannot start or the broker refuses authentication. An
+    // unreachable broker is retried.
     int start(int argc, char* argv[]);
 
 private:
@@ -68,4 +71,8 @@ private:
     bool configError_ = false;
     // Player-loop flag. The mosquitto thread stores it; the main thread loads it.
     std::atomic<bool> playing_{false};
+    // CONNACK "not authorised" / "bad user name or password" count. The
+    // mosquitto thread stores these; the main thread loads authGiveUp_.
+    std::atomic<int> authRejects_{0};
+    std::atomic<bool> authGiveUp_{false};
 };

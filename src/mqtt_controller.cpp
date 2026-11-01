@@ -8,6 +8,7 @@
 
 #include <mosquitto.h>
 
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -17,10 +18,37 @@
 #include <iostream>
 #include <memory>
 #include <pthread.h>
+#include <string>
 
 namespace {
 
 constexpr int kMaxPayloadBytes = 65536;
+
+// A refused login does not start working on retry the way a down broker can.
+// Three CONNACKs is enough to tell a bad password from one lost reply, and
+// short enough that launch-coreelec.sh starts Kodi instead of waiting on SSH.
+constexpr int kAuthRejectLimit = 3;
+
+bool authenticationRejected(int rc) {
+    // MQTT 3.1.1 CONNACK 4 and 5, and the MQTT 5 reason codes for the same
+    // refusals (0x86 bad username or password, 0x87 not authorized).
+    // Server unavailable (3) and a failed TCP connect keep retrying.
+    if (rc == 4 || rc == 5 || rc == 0x86 || rc == 0x87) {
+        return true;
+    }
+    const char* text = mosquitto_connack_string(rc);
+    if (text == nullptr) {
+        return false;
+    }
+    std::string lower(text);
+    for (char& ch : lower) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return lower.find("not authorised") != std::string::npos ||
+           lower.find("not authorized") != std::string::npos ||
+           lower.find("bad user name or password") != std::string::npos ||
+           lower.find("bad username or password") != std::string::npos;
+}
 
 int parsePort(const char* text, int fallback, const char* source) {
     if (!text || !*text) {
@@ -227,6 +255,14 @@ int MqttController::start(int argc, char* argv[]) {
     std::cout << "This build does not start DRM/KMS or Amlogic hardware decode.\n";
 
     while (true) {
+        if (authGiveUp_.load()) {
+            std::cerr << "MQTT authentication failed after " << authRejects_.load()
+                      << " attempts; exiting\n";
+            player.closeAll();
+            shutdown();
+            return 1;
+        }
+
         player.tick(playing_.load());
 
         timespec timeout{};
@@ -362,8 +398,9 @@ void MqttController::printUsage() const {
         << "The process connects, subscribes to <prefix>/cmd/#, and software-decodes\n"
         << "added http:// and https:// streams into a SoftwareRenderer viewport until\n"
         << "SIGINT, SIGTERM, or SIGHUP. If the broker is down it retries with backoff\n"
-        << "from 1s to 30s. Broker I/O runs on a background thread. start/play\n"
-        << "opens decoders and presents; stop closes them. restart with an id\n"
+        << "from 1s to 30s. A CONNACK of not authorised or bad user name or password\n"
+        << "exits non-zero after three attempts. Broker I/O runs on a background thread.\n"
+        << "start/play opens decoders and presents; stop closes them. restart with an id\n"
         << "reopens that decoder. An unknown id does not restart other streams.\n"
         << "Software mode does not drive a display. DRM/KMS and Amlogic hardware\n"
         << "decode are not started, so nothing is shown until a DRM backend exists.\n"
@@ -373,8 +410,15 @@ void MqttController::printUsage() const {
 void MqttController::handleConnect(struct mosquitto* mosq, int rc) {
     if (rc != 0) {
         std::cerr << "MQTT connect rejected: " << mosquitto_connack_string(rc) << "\n";
+        if (authenticationRejected(rc)) {
+            const int attempts = authRejects_.fetch_add(1) + 1;
+            if (attempts >= kAuthRejectLimit) {
+                authGiveUp_.store(true);
+            }
+        }
         return;
     }
+    authRejects_.store(0);
     const std::string filter = config_.prefix + "/cmd/#";
     const int sub = mosquitto_subscribe(mosq, nullptr, filter.c_str(), 1);
     if (sub != MOSQ_ERR_SUCCESS) {
@@ -497,10 +541,16 @@ void MqttController::onMessage(struct mosquitto*, void* obj, const struct mosqui
     self->handleMessage(msg->topic, payload);
 }
 
-void MqttController::onDisconnect(struct mosquitto*, void*, int rc) {
+void MqttController::onDisconnect(struct mosquitto*, void* obj, int rc) {
     if (rc == 0) {
         std::cout << "MQTT disconnected\n";
+        return;
+    }
+    const bool giveUp = obj != nullptr && static_cast<MqttController*>(obj)->authGiveUp_.load();
+    std::cerr << "MQTT connection lost: " << mosquitto_strerror(rc);
+    if (giveUp) {
+        std::cerr << "\n";
     } else {
-        std::cerr << "MQTT connection lost: " << mosquitto_strerror(rc) << " (will retry)\n";
+        std::cerr << " (will retry)\n";
     }
 }

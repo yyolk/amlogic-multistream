@@ -106,7 +106,11 @@ class Addon:
     def __init__(self, id=None):
         self._settings = json.loads(os.environ["KODI_STUB_SETTINGS"])
     def getAddonInfo(self, key):
-        return {"id": "plugin.program.amlogic-multistream", "name": "amlogic-multistream"}[key]
+        return {
+            "id": "plugin.program.amlogic-multistream",
+            "name": "amlogic-multistream",
+            "profile": os.environ["KODI_STUB_PROFILE"],
+        }[key]
     def getLocalizedString(self, string_id):
         _event("string", id=string_id)
         return "#%d" % string_id
@@ -141,22 +145,31 @@ def endOfDirectory(handle, succeeded=True):
 }
 
 # Executes the unit command in the foreground with only the --setenv
-# variables, like a transient unit that does not inherit the caller's env.
+# variables and an EnvironmentFile=, like a transient unit that does not
+# inherit the caller's env. The password file uses systemd's double-quoted
+# EnvironmentFile syntax, which this shell can source.
 FAKE_SYSTEMD_RUN = '''#!/bin/sh
 for a in "$@"; do printf '%s\\n' "$a"; done > "{work}/systemd-run.argv"
-envs=""
+envfile="{work}/unit.env"
+: > "$envfile"
 while [ $# -gt 0 ]; do
     case "$1" in
-        --setenv=*) envs="$envs
-${{1#--setenv=}}" ;;
+        --setenv=*)
+            printf '%s\\n' "${{1#--setenv=}}" >> "$envfile"
+            ;;
+        --property=EnvironmentFile=*)
+            file="${{1#--property=EnvironmentFile=}}"
+            file="${{file#-}}"
+            if [ -f "$file" ]; then
+                cat "$file" >> "$envfile"
+            fi
+            ;;
         --*) ;;
         *) break ;;
     esac
     shift
 done
-IFS='
-'
-exec env -i PATH="$PATH" $envs "$@"
+exec env -i PATH="$PATH" /bin/sh -c 'set -a; . "$1"; shift; exec "$@"' sh "$envfile" "$@"
 '''
 
 FAKE_SYSTEMCTL = '''#!/bin/sh
@@ -174,6 +187,8 @@ FAKE_PLAYER = '''#!/bin/sh
     echo "MQTT_HOST=$MQTT_HOST"
     echo "MQTT_PORT=$MQTT_PORT"
     echo "MQTT_TOPIC_PREFIX=$MQTT_TOPIC_PREFIX"
+    echo "MQTT_USERNAME=$MQTT_USERNAME"
+    echo "MQTT_PASSWORD=$MQTT_PASSWORD"
     echo "HOME=$HOME"
 }} > "{work}/player.env"
 '''
@@ -183,6 +198,141 @@ def write_exec(path, text):
     with open(path, "w") as fh:
         fh.write(text)
     os.chmod(path, 0o755)
+
+
+def parse_systemd_env_file(text):
+    """Parse a systemd EnvironmentFile the way load_env_file does.
+
+    Mirrors the v255 env-file.c state machine, including double-quote
+    escapes for \" \\\\ ` and $. No variable expansion: EnvironmentFile=
+    does not expand $VAR.
+    """
+    whitespace = set(" \t\n\r")
+    newline = set("\n\r")
+    comments = set("#;")
+    shell_need_escape = set('"\\`$')
+    state = "PRE_KEY"
+    key = []
+    value = []
+    have_value = False
+    last_value_ws = None
+    last_key_ws = None
+    out = {}
+
+    def push(chomp_value):
+        parsed_key = "".join(key)
+        if last_key_ws is not None:
+            parsed_key = parsed_key[:last_key_ws]
+        if not have_value:
+            parsed_value = ""
+        else:
+            parsed_value = "".join(value)
+            if chomp_value and last_value_ws is not None:
+                parsed_value = parsed_value[:last_value_ws]
+        if parsed_key:
+            out[parsed_key] = parsed_value
+
+    for ch in text:
+        if state == "PRE_KEY":
+            if ch in comments:
+                state = "COMMENT"
+            elif ch not in whitespace:
+                state = "KEY"
+                last_key_ws = None
+                key.append(ch)
+        elif state == "KEY":
+            if ch in newline:
+                state = "PRE_KEY"
+                key = []
+                last_key_ws = None
+            elif ch == "=":
+                state = "PRE_VALUE"
+                last_value_ws = None
+            else:
+                if ch not in whitespace:
+                    last_key_ws = None
+                elif last_key_ws is None:
+                    last_key_ws = len(key)
+                key.append(ch)
+        elif state == "PRE_VALUE":
+            if ch in newline:
+                state = "PRE_KEY"
+                push(False)
+                key = []
+                value = []
+                have_value = False
+                last_key_ws = None
+                last_value_ws = None
+            elif ch == "'":
+                state = "SINGLE"
+                have_value = True
+            elif ch == '"':
+                state = "DOUBLE"
+                have_value = True
+            elif ch == "\\":
+                state = "VALUE_ESCAPE"
+                have_value = True
+            elif ch not in whitespace:
+                state = "VALUE"
+                have_value = True
+                value.append(ch)
+        elif state == "VALUE":
+            if ch in newline:
+                state = "PRE_KEY"
+                push(True)
+                key = []
+                value = []
+                have_value = False
+                last_key_ws = None
+                last_value_ws = None
+            elif ch == "\\":
+                state = "VALUE_ESCAPE"
+                last_value_ws = None
+            else:
+                if ch not in whitespace:
+                    last_value_ws = None
+                elif last_value_ws is None:
+                    last_value_ws = len(value)
+                value.append(ch)
+        elif state == "VALUE_ESCAPE":
+            state = "VALUE"
+            if ch not in newline:
+                value.append(ch)
+                have_value = True
+        elif state == "SINGLE":
+            if ch == "'":
+                state = "PRE_VALUE"
+            else:
+                value.append(ch)
+                have_value = True
+        elif state == "DOUBLE":
+            if ch == '"':
+                state = "PRE_VALUE"
+            elif ch == "\\":
+                state = "DOUBLE_ESCAPE"
+            else:
+                value.append(ch)
+                have_value = True
+        elif state == "DOUBLE_ESCAPE":
+            state = "DOUBLE"
+            if ch in shell_need_escape:
+                value.append(ch)
+                have_value = True
+            elif ch not in newline:
+                value.append("\\")
+                value.append(ch)
+                have_value = True
+        elif state == "COMMENT":
+            if ch == "\\":
+                state = "COMMENT_ESCAPE"
+            elif ch in newline:
+                state = "PRE_KEY"
+        elif state == "COMMENT_ESCAPE":
+            state = "PRE_KEY" if ch in newline else "COMMENT"
+
+    if state in ("PRE_VALUE", "VALUE", "VALUE_ESCAPE", "SINGLE", "DOUBLE", "DOUBLE_ESCAPE"):
+        push(state == "VALUE")
+    return out
 
 
 def package(out_dir):
@@ -263,6 +413,45 @@ class LauncherModuleTest(unittest.TestCase):
         for env in ("MQTT_HOST=broker", "MQTT_PORT=1884", "MQTT_TOPIC_PREFIX=pfx"):
             self.assertIn("--setenv=" + env, argv)
         self.assertEqual(argv[-2:], ["/bin/sh", "/a/launch.sh"])
+        self.assertFalse([a for a in argv if "EnvironmentFile" in a or "MQTT_PASSWORD" in a])
+
+    def test_build_command_credentials(self):
+        password = 'pa$ss "q" `t`\\x'
+        with tempfile.TemporaryDirectory() as profile:
+            argv = amlogic_launcher.build_command(
+                "/a/launch.sh", "/p", "broker", "1884", "pfx",
+                "ha-user", password, profile)
+            self.assertIn("--setenv=MQTT_USERNAME=ha-user", argv)
+            env_path = os.path.join(profile, "mqtt.env")
+            self.assertIn("--property=EnvironmentFile=" + env_path, argv)
+            self.assertEqual(argv[-2:], ["/bin/sh", "/a/launch.sh"])
+            joined = "\n".join(argv)
+            self.assertNotIn("MQTT_PASSWORD", joined)
+            self.assertNotIn(password, joined)
+            self.assertEqual(os.stat(env_path).st_mode & 0o777, 0o600)
+            self.assertEqual(
+                read(env_path),
+                'MQTT_PASSWORD="pa\\$ss \\"q\\" \\`t\\`\\\\x"\n')
+            self.assertEqual(parse_systemd_env_file(read(env_path))["MQTT_PASSWORD"],
+                             password)
+
+            newline = "line1\nline2"
+            argv = amlogic_launcher.build_command(
+                "/a/launch.sh", "/p", mqtt_password=newline, profile_dir=profile)
+            self.assertEqual(read(env_path), 'MQTT_PASSWORD="line1\nline2"\n')
+            self.assertEqual(parse_systemd_env_file(read(env_path))["MQTT_PASSWORD"],
+                             newline)
+            self.assertNotIn(newline, "\n".join(argv))
+
+            argv = amlogic_launcher.build_command(
+                "/a/launch.sh", "/p", mqtt_username="only-user", profile_dir=profile)
+            self.assertIn("--setenv=MQTT_USERNAME=only-user", argv)
+            self.assertFalse(os.path.exists(env_path))
+            self.assertFalse([a for a in argv if "EnvironmentFile" in a])
+
+        with self.assertRaises(amlogic_launcher.LaunchError):
+            amlogic_launcher.build_command(
+                "/a/launch.sh", "/p", mqtt_password="secret", profile_dir="")
 
     def test_resolve_launch_script(self):
         self.assertEqual(amlogic_launcher.resolve_launch_script("/x"),
@@ -331,6 +520,7 @@ class DefaultPyTest(unittest.TestCase):
         write_exec(self.player, FAKE_PLAYER.format(work=self.work))
         self.settings = settings_defaults()
         self.settings["player_bin"] = self.player
+        self.profile = os.path.join(self.work, "profile")
 
     def run_default(self, query):
         env = dict(os.environ)
@@ -340,8 +530,10 @@ class DefaultPyTest(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1",
             "KODI_STUB_LOG": os.path.join(self.work, "events.jsonl"),
             "KODI_STUB_SETTINGS": json.dumps(self.settings),
+            "KODI_STUB_PROFILE": self.profile,
         })
-        for key in ("PLAYER_BIN", "MQTT_HOST", "MQTT_PORT", "MQTT_TOPIC_PREFIX"):
+        for key in ("PLAYER_BIN", "MQTT_HOST", "MQTT_PORT", "MQTT_TOPIC_PREFIX",
+                    "MQTT_USERNAME", "MQTT_PASSWORD"):
             env.pop(key, None)
         # Kodi runs the library as __main__ with argv [url, handle, query].
         # runpy would overwrite argv[0] with the file path.
@@ -409,9 +601,44 @@ class DefaultPyTest(unittest.TestCase):
             "MQTT_HOST=broker.lan",
             "MQTT_PORT=1884",
             "MQTT_TOPIC_PREFIX=living-room",
+            "MQTT_USERNAME=",
+            "MQTT_PASSWORD=",
             "HOME=/storage",
         ])
+        self.assertFalse(os.path.exists(os.path.join(self.profile, "mqtt.env")))
         self.assertIn("notification", [e["kind"] for e in events])
+        self.assertNotIn("dialog_ok", [e["kind"] for e in events])
+
+    def test_launch_passes_mqtt_credentials(self):
+        password = 's3cret $x "q"'
+        self.settings.update(mqtt_host="broker.lan", mqtt_port=1884,
+                             mqtt_topic_prefix="living-room",
+                             mqtt_username="ha-user", mqtt_password=password)
+        events = self.run_default("?action=launch")
+
+        argv = self.systemd_run_argv()
+        self.assertIsNotNone(argv)
+        env_path = os.path.join(self.profile, "mqtt.env")
+        self.assertIn("--setenv=MQTT_USERNAME=ha-user", argv)
+        self.assertIn("--setenv=MQTT_HOST=broker.lan", argv)
+        self.assertIn("--property=EnvironmentFile=" + env_path, argv)
+        joined = "\n".join(argv)
+        self.assertNotIn("MQTT_PASSWORD", joined)
+        self.assertNotIn(password, joined)
+        self.assertEqual(os.stat(env_path).st_mode & 0o777, 0o600)
+        self.assertEqual(parse_systemd_env_file(read(env_path))["MQTT_PASSWORD"], password)
+        player_env = read(os.path.join(self.work, "player.env")).splitlines()
+        self.assertEqual(player_env, [
+            "PLAYER_BIN=" + self.player,
+            "MQTT_HOST=broker.lan",
+            "MQTT_PORT=1884",
+            "MQTT_TOPIC_PREFIX=living-room",
+            "MQTT_USERNAME=ha-user",
+            "MQTT_PASSWORD=" + password,
+            "HOME=/storage",
+        ])
+        logged = json.dumps(events)
+        self.assertNotIn(password, logged)
         self.assertNotIn("dialog_ok", [e["kind"] for e in events])
 
     def test_launch_script_override(self):

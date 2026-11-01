@@ -25,8 +25,10 @@
 # ignores SIGINT and Ctrl+C belongs to the player.
 #
 # Broker defaults: localhost:1883, topic prefix amlogic-multistream
-# (MQTT_HOST, MQTT_PORT, MQTT_TOPIC_PREFIX). This binary does not program
-# DRM/KMS planes or Amlogic hardware decode.
+# (MQTT_HOST, MQTT_PORT, MQTT_TOPIC_PREFIX). MQTT_USERNAME and
+# MQTT_PASSWORD are optional. The Kodi add-on passes the password in a
+# systemd EnvironmentFile, which this script inherits. This binary does
+# not program DRM/KMS planes or Amlogic hardware decode.
 
 player_bin="${PLAYER_BIN:-/storage/amlogic-multistream}"
 player_pid=

@@ -73,3 +73,19 @@ msgstr ""
 msgctxt "#30206"
 msgid "MQTT_TOPIC_PREFIX. Empty leaves the player default (amlogic-multistream)."
 msgstr ""
+
+msgctxt "#30207"
+msgid "Broker username"
+msgstr ""
+
+msgctxt "#30208"
+msgid "MQTT_USERNAME. Empty connects anonymously. Home Assistant Mosquitto refuses anonymous clients."
+msgstr ""
+
+msgctxt "#30209"
+msgid "Broker password"
+msgstr ""
+
+msgctxt "#30210"
+msgid "MQTT_PASSWORD. Empty sends no password. When set, Launch writes it to mqtt.env (mode 0600) in this add-on's profile and passes that file as EnvironmentFile=, so systemctl show does not list the password."
+msgstr ""
