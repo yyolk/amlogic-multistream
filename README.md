@@ -238,3 +238,8 @@ Put the device AppImage for the box's CoreELEC line at `/storage/amlogic-multist
 Or install the zip from Kodi (Add-ons → Install from zip file) and copy the device AppImage to `/storage/amlogic-multistream` yourself. The add-on does not contain the player; **Player binary** (`PLAYER_BIN`) in the add-on settings points at it.
 
 `install-kodi-addon.sh` checks the player against `--target` (default `coreelec21-ng-armv7hf`). For CoreELEC 21 it refuses anything that is not 32-bit ARM, which includes both host smoke AppImages. For CoreELEC 22 it refuses anything that is not aarch64. An AppImage must also carry the device marker for that target, so the Ubuntu aarch64 smoke AppImage is refused for CoreELEC 22 even though its architecture matches (reading the marker needs `unsquashfs`). With `--host`, the box's `/etc/os-release` architecture must match `--target` before anything is copied. `--allow-target-mismatch` (or the older `--allow-non-arm32`) overrides these checks. CI uploads the zip as the `plugin.program.amlogic-multistream` artifact. Install steps, settings, and the list of host-only checks are in [docs/kodi-addon.md](docs/kodi-addon.md). Loading the add-on in Kodi and the display handover have not been verified on a device.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
