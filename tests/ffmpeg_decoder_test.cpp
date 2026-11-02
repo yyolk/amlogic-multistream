@@ -471,6 +471,27 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
                 continue;
             }
         }
+        if (ok && (rel == "fin-sync" || rel == "fin-ftyp" || rel == "fin-small")) {
+            static int fin_sync_hits = 0;
+            static int fin_ftyp_hits = 0;
+            static int fin_small_hits = 0;
+            int* hits = rel == "fin-sync" ? &fin_sync_hits : rel == "fin-ftyp" ? &fin_ftyp_hits
+                                                                              : &fin_small_hits;
+            if ((*hits)++ == 0) {
+                if (rel == "fin-sync") {
+                    sendResponse(client, 200, mpegTsSyncPrefix(), "video/mp2t");
+                } else if (rel == "fin-ftyp") {
+                    sendResponse(client, 200, ftypPrefix(), "video/mp4");
+                } else {
+                    std::ifstream in(root / "small-pmt.ts", std::ios::binary);
+                    std::ostringstream ss;
+                    ss << in.rdbuf();
+                    sendResponse(client, 200, ss.str(), "video/mp2t");
+                }
+                ::close(client);
+                continue;
+            }
+        }
         if (ok && (rel == "hop-ts.m3u8" || rel == "hop-ftyp.m3u8" || rel == "hop-fin.m3u8")) {
             static int hop_ts_hits = 0;
             static int hop_ftyp_hits = 0;
@@ -1013,41 +1034,71 @@ void writeMediaPlaylist(const std::filesystem::path& playlist, const std::string
 
 // ID3v2.3 PRIV com.apple.streaming.transportStreamTimestamp. FFmpeg 6.1.1
 // hls.c sets is_id3_timestamped from this tag and runs find_stream_info(NULL).
-std::string id3v23HlsTimestampTag() {
-    const char owner[] = "com.apple.streaming.transportStreamTimestamp";
-    const uint32_t owner_len = 44;
-    const uint32_t payload = owner_len + 1 + 8;
-    const uint32_t tag_size = 10 + payload;
-    std::string tag(10 + tag_size, '\0');
-    tag[0] = 'I';
-    tag[1] = 'D';
-    tag[2] = '3';
-    tag[3] = 3;
-    tag[6] = static_cast<char>((tag_size >> 21) & 0x7f);
-    tag[7] = static_cast<char>((tag_size >> 14) & 0x7f);
-    tag[8] = static_cast<char>((tag_size >> 7) & 0x7f);
-    tag[9] = static_cast<char>(tag_size & 0x7f);
-    tag[10] = 'P';
-    tag[11] = 'R';
-    tag[12] = 'I';
-    tag[13] = 'V';
-    tag[14] = static_cast<char>((payload >> 24) & 0xff);
-    tag[15] = static_cast<char>((payload >> 16) & 0xff);
-    tag[16] = static_cast<char>((payload >> 8) & 0xff);
-    tag[17] = static_cast<char>(payload & 0xff);
-    std::memcpy(&tag[20], owner, owner_len);
-    return tag;
+std::string id3Synchsafe(uint32_t n) {
+    std::string s(4, '\0');
+    s[0] = static_cast<char>((n >> 21) & 0x7f);
+    s[1] = static_cast<char>((n >> 14) & 0x7f);
+    s[2] = static_cast<char>((n >> 7) & 0x7f);
+    s[3] = static_cast<char>(n & 0x7f);
+    return s;
 }
 
-bool writeId3Prefixed(const std::filesystem::path& src, const std::filesystem::path& dst) {
+std::string id3v23Frame(const char id[4], const std::string& payload, unsigned char flags2 = 0) {
+    std::string f(10, '\0');
+    std::memcpy(&f[0], id, 4);
+    const uint32_t n = static_cast<uint32_t>(payload.size());
+    f[4] = static_cast<char>((n >> 24) & 0xff);
+    f[5] = static_cast<char>((n >> 16) & 0xff);
+    f[6] = static_cast<char>((n >> 8) & 0xff);
+    f[7] = static_cast<char>(n & 0xff);
+    f[9] = static_cast<char>(flags2);
+    return f + payload;
+}
+
+std::string id3v23Tag(const std::string& frames) {
+    std::string tag = "ID3";
+    tag.push_back(3);
+    tag.push_back(0);
+    tag.push_back(0);
+    tag += id3Synchsafe(static_cast<uint32_t>(frames.size()));
+    return tag + frames;
+}
+
+std::string id3PrivPayload(const char* owner) {
+    std::string p(owner);
+    p.push_back('\0');
+    p.append(5, '\0');
+    p.push_back(0x01);
+    p.push_back(static_cast<char>(0x5F));
+    p.push_back(static_cast<char>(0x90));
+    return p;
+}
+
+std::string id3v23HlsTimestampTag(const char* owner = "com.apple.streaming.transportStreamTimestamp",
+                                  size_t pad_before_priv = 0, unsigned char priv_flags2 = 0) {
+    std::string frames(pad_before_priv, '\0');
+    frames += id3v23Frame("PRIV", id3PrivPayload(owner), priv_flags2);
+    return id3v23Tag(frames);
+}
+
+std::string id3v23Tit2Tag() {
+    return id3v23Tag(id3v23Frame("TIT2", std::string("\x00en", 3) + "decoy"));
+}
+
+bool writePrefixed(const std::filesystem::path& src, const std::filesystem::path& dst,
+                   const std::string& prefix) {
     std::ifstream in(src, std::ios::binary);
     if (!in) {
         return false;
     }
     std::ofstream out(dst, std::ios::binary);
-    out << id3v23HlsTimestampTag();
+    out << prefix;
     out << in.rdbuf();
     return static_cast<bool>(out);
+}
+
+bool writeId3Prefixed(const std::filesystem::path& src, const std::filesystem::path& dst) {
+    return writePrefixed(src, dst, id3v23HlsTimestampTag());
 }
 
 void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::path& dir) {
@@ -1470,6 +1521,117 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         decoder.close();
     }
 
+    auto refuseOpen = [&](const std::filesystem::path& path) {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open(path.string()));
+        decoder.close();
+    };
+
+    g_case = "hls ID3 uppercase owner refuses";
+    {
+        const auto ts = dir / "d4-id3-upper.ts";
+        CHECK(writePrefixed(hugePmt, ts,
+                            id3v23HlsTimestampTag("COM.APPLE.STREAMING.TRANSPORTSTREAMTIMESTAMP")));
+        writeMediaPlaylist(dir / "d4-id3-upper.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-upper.m3u8");
+    }
+
+    g_case = "hls second ID3 tag PRIV refuses";
+    {
+        const auto ts = dir / "d4-id3-second.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23Tit2Tag() + id3v23HlsTimestampTag()));
+        writeMediaPlaylist(dir / "d4-id3-second.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-second.m3u8");
+    }
+
+    g_case = "hls zlib-compressed PRIV refuses";
+    {
+        const auto ts = dir / "d4-id3-zlib.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23HlsTimestampTag(
+                                            "com.apple.streaming.transportStreamTimestamp", 0, 0x80)));
+        writeMediaPlaylist(dir / "d4-id3-zlib.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-zlib.m3u8");
+    }
+
+    g_case = "hls ID3 PRIV past 4096 peek window refuses";
+    {
+        const auto ts = dir / "d4-id3-late.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23HlsTimestampTag(
+                                            "com.apple.streaming.transportStreamTimestamp", 5000)));
+        writeMediaPlaylist(dir / "d4-id3-late.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-late.m3u8");
+    }
+
+    g_case = "hls BYTERANGE ID3 segment refuses";
+    {
+        const auto ranged = dir / "d4-id3-range.ts";
+        {
+            std::ofstream out(ranged, std::ios::binary);
+            out << std::string(1000, 'X');
+            out << id3v23HlsTimestampTag();
+            std::ifstream in(hugePmt, std::ios::binary);
+            out << in.rdbuf();
+        }
+        const auto prefix = id3v23HlsTimestampTag();
+        const uint64_t slice = prefix.size() + std::filesystem::file_size(hugePmt);
+        std::ofstream playlist(dir / "d4-id3-range.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                 << "#EXT-X-BYTERANGE:" << slice << "@1000\n"
+                 << ranged.filename().string() << "\n#EXT-X-ENDLIST\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-range.m3u8");
+    }
+
+    g_case = "hls AES-128 first segment refuses";
+    {
+        std::ofstream(dir / "d4-id3-key.bin", std::ios::binary) << std::string(16, 'K');
+        std::ofstream playlist(dir / "d4-id3-aes.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-KEY:METHOD=AES-128,URI=\"" << (dir / "d4-id3-key.bin").filename().string()
+                 << "\"\n#EXTINF:0.040,\n"
+                 << hugePmt.filename().string() << "\n#EXT-X-ENDLIST\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-aes.m3u8");
+    }
+
+    g_case = "hls live playlist ID3 on second segment refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-live.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.400,\n"
+                 << smallPmt.filename().string() << "\n#EXTINF:0.040,\n"
+                 << d4id3ts.filename().string() << "\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-live.m3u8");
+    }
+
+    g_case = "hls second STREAM-INF ID3 media refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-second-var.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=500000\n"
+                 << d4id3media.filename().string() << "\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-second-var.m3u8");
+    }
+
+    g_case = "hls nested master ID3 media refuses";
+    {
+        std::ofstream inner(dir / "d4-id3-nested-inner.m3u8");
+        inner << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+              << d4id3media.filename().string() << "\n";
+        inner.close();
+        std::ofstream outer(dir / "d4-id3-nested-outer.m3u8");
+        outer << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+              << (dir / "d4-id3-nested-inner.m3u8").filename().string() << "\n";
+        outer.close();
+        refuseOpen(dir / "d4-id3-nested-outer.m3u8");
+    }
+
     {
         std::ifstream src(d4master);
         std::ofstream(dir / "failpeek.m3u8") << src.rdbuf();
@@ -1579,6 +1741,26 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         FfmpegDecoder hopfin;
         CHECK(!hopfin.open(httpBase + "/hop-fin.m3u8"));
         hopfin.close();
+        {
+            std::ifstream src(d4master);
+            std::ofstream(dir / "fin-sync") << src.rdbuf();
+            std::ifstream src2(d4master);
+            std::ofstream(dir / "fin-ftyp") << src2.rdbuf();
+            std::ifstream src3(d4master);
+            std::ofstream(dir / "fin-small") << src3.rdbuf();
+        }
+        g_case = "hls finished sync exact-CL then master refuses";
+        FfmpegDecoder finsync;
+        CHECK(!finsync.open(httpBase + "/fin-sync"));
+        finsync.close();
+        g_case = "hls finished ftyp exact-CL then master refuses";
+        FfmpegDecoder finftyp;
+        CHECK(!finftyp.open(httpBase + "/fin-ftyp"));
+        finftyp.close();
+        g_case = "hls finished small TS exact-CL then master refuses";
+        FfmpegDecoder finsmall;
+        CHECK(!finsmall.open(httpBase + "/fin-small"));
+        finsmall.close();
     }
     server.stop();
 }

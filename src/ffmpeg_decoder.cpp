@@ -2,9 +2,12 @@
 
 #include "software_renderer.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -180,6 +183,7 @@ std::string trimCopy(const std::string& s) {
 struct HlsMediaAttrs {
     std::string type;
     std::string uri;
+    std::string method;
     bool unclosed_quote = false;
 };
 
@@ -232,6 +236,8 @@ HlsMediaAttrs parseHlsMediaAttrs(const std::string& attrs) {
             out.type = value;
         } else if (key == "URI") {
             out.uri = value;
+        } else if (key == "METHOD") {
+            out.method = value;
         }
     }
     return out;
@@ -332,8 +338,109 @@ std::string firstHlsStreamInfUri(const std::string& text) {
     return firstHlsUriAfterTag(text, "#EXT-X-STREAM-INF:", 18);
 }
 
-std::string firstHlsExtInfUri(const std::string& text) {
-    return firstHlsUriAfterTag(text, "#EXTINF:", 8);
+std::vector<std::string> allHlsStreamInfUris(const std::string& text) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    std::string line;
+    bool want_uri = false;
+    while (hlsNextLine(text, &pos, &line)) {
+        const std::string trimmed = trimCopy(line);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (trimmed[0] == '#') {
+            if (trimmed.compare(0, 18, "#EXT-X-STREAM-INF:") == 0) {
+                want_uri = true;
+            }
+            continue;
+        }
+        if (want_uri) {
+            out.push_back(trimmed);
+            want_uri = false;
+        }
+    }
+    return out;
+}
+
+struct HlsSegmentRef {
+    std::string uri;
+    int64_t byte_offset = 0;
+    int64_t byte_length = -1;
+    bool encrypted = false;
+};
+
+bool parseHlsByteRange(const std::string& spec, int64_t* length, bool* has_offset, int64_t* offset) {
+    if (length == nullptr || has_offset == nullptr || offset == nullptr) {
+        return false;
+    }
+    const std::string s = trimCopy(spec);
+    char* end = nullptr;
+    const int64_t n = std::strtoll(s.c_str(), &end, 10);
+    if (end == s.c_str() || n < 0) {
+        return false;
+    }
+    *length = n;
+    *has_offset = false;
+    *offset = 0;
+    if (end != nullptr && *end == '@') {
+        char* off_end = nullptr;
+        const int64_t o = std::strtoll(end + 1, &off_end, 10);
+        if (off_end == end + 1 || o < 0) {
+            return false;
+        }
+        *has_offset = true;
+        *offset = o;
+    }
+    return true;
+}
+
+std::vector<HlsSegmentRef> hlsMediaSegments(const std::string& text) {
+    std::vector<HlsSegmentRef> out;
+    size_t pos = 0;
+    std::string line;
+    bool encrypted = false;
+    bool want_uri = false;
+    bool have_range = false;
+    bool range_has_off = false;
+    int64_t range_len = -1;
+    int64_t range_off = 0;
+    int64_t implicit_off = 0;
+    while (hlsNextLine(text, &pos, &line)) {
+        const std::string trimmed = trimCopy(line);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (trimmed.compare(0, 11, "#EXT-X-KEY:") == 0) {
+            const HlsMediaAttrs attrs = parseHlsMediaAttrs(trimmed.substr(10));
+            encrypted = !attrs.method.empty() && attrs.method != "NONE";
+            continue;
+        }
+        if (trimmed.compare(0, 17, "#EXT-X-BYTERANGE:") == 0) {
+            have_range = parseHlsByteRange(trimmed.substr(17), &range_len, &range_has_off, &range_off);
+            continue;
+        }
+        if (trimmed[0] == '#') {
+            if (trimmed.compare(0, 8, "#EXTINF:") == 0) {
+                want_uri = true;
+            }
+            continue;
+        }
+        if (!want_uri) {
+            continue;
+        }
+        HlsSegmentRef ref;
+        ref.uri = trimmed;
+        ref.encrypted = encrypted;
+        if (have_range) {
+            ref.byte_length = range_len;
+            ref.byte_offset = range_has_off ? range_off : implicit_off;
+            implicit_off = ref.byte_offset + range_len;
+            have_range = false;
+        }
+        out.push_back(ref);
+        want_uri = false;
+    }
+    return out;
 }
 
 bool urlHasScheme(const std::string& url) {
@@ -448,60 +555,100 @@ bool bodyLooksLikeMediaSegment(const std::string& body) {
     return body.size() >= 8 && body.compare(4, 4, "ftyp") == 0;
 }
 
-bool bodyStartsWithId3(const std::string& body) {
-    return body.size() >= 3 && body[0] == 'I' && body[1] == 'D' && body[2] == '3';
+bool bodyStartsWithId3At(const std::string& body, size_t off) {
+    return off + 3 <= body.size() && body[off] == 'I' && body[off + 1] == 'D' && body[off + 2] == '3';
 }
 
 // FFmpeg 6.1.1 intercept_id3 / parse_id3 sets is_id3_timestamped when an
-// ID3v2 PRIV owner is com.apple.streaming.transportStreamTimestamp and the
-// 8-byte payload is a 33-bit MPEG timestamp. hls_read_header then calls
-// find_stream_info(NULL) on that playlist (same uncapped class as TYPE=AUDIO).
+// ID3v2 PRIV owner is com.apple.streaming.transportStreamTimestamp (case
+// insensitive) and the 8-byte payload is a 33-bit MPEG timestamp. Multiple
+// leading ID3 tags are gathered; a compressed frame is inflated. If we
+// cannot fully prove a segment is not timestamped, treat it as hostile.
 constexpr const char kHlsId3TimestampOwner[] = "com.apple.streaming.transportStreamTimestamp";
+constexpr size_t kHlsId3TimestampOwnerLen = 44;
 
 uint32_t id3Synchsafe32(const unsigned char* p) {
     return (static_cast<uint32_t>(p[0] & 0x7f) << 21) | (static_cast<uint32_t>(p[1] & 0x7f) << 14) |
            (static_cast<uint32_t>(p[2] & 0x7f) << 7) | static_cast<uint32_t>(p[3] & 0x7f);
 }
 
-bool bodyHasHlsId3Timestamp(const std::string& body) {
-    if (!bodyStartsWithId3(body) || body.size() < 10) {
+bool containsIgnoreCase(const char* hay, size_t hay_n, const char* needle, size_t needle_n) {
+    if (hay == nullptr || needle == nullptr || hay_n < needle_n) {
+        return false;
+    }
+    for (size_t i = 0; i + needle_n <= hay_n; ++i) {
+        if (av_strncasecmp(hay + i, needle, needle_n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool id3FrameCompressedOrEncrypted(int ver, unsigned char flags2) {
+    if (ver == 3) {
+        return (flags2 & 0x80) != 0 || (flags2 & 0x40) != 0;
+    }
+    if (ver == 4) {
+        return (flags2 & 0x08) != 0 || (flags2 & 0x04) != 0;
+    }
+    return true;
+}
+
+// True if FFmpeg might set is_id3_timestamped, or we cannot prove it will not.
+bool bodyMayBeId3Timestamped(const std::string& body) {
+    if (body.size() < 3) {
+        return true;
+    }
+    if (!bodyStartsWithId3At(body, 0)) {
         return false;
     }
     const auto* p = reinterpret_cast<const unsigned char*>(body.data());
-    const int ver = p[3];
-    const uint32_t tag_size = id3Synchsafe32(p + 6);
-    const size_t tag_end = std::min(body.size(), static_cast<size_t>(10) + tag_size);
-    const std::string tag = body.substr(0, tag_end);
-    if (tag.find(kHlsId3TimestampOwner) != std::string::npos) {
-        return true;
-    }
-    if (ver < 3 || ver > 4) {
-        return false;
-    }
-    size_t i = 10;
-    while (i + 10 <= tag_end) {
-        if (body[i] == '\0') {
-            break;
+    size_t off = 0;
+    while (bodyStartsWithId3At(body, off)) {
+        if (off + 10 > body.size()) {
+            return true;
         }
-        const std::string frame_id = body.substr(i, 4);
-        uint32_t frame_size = 0;
-        if (ver == 4) {
-            frame_size = id3Synchsafe32(p + i + 4);
-        } else {
-            frame_size = (static_cast<uint32_t>(p[i + 4]) << 24) | (static_cast<uint32_t>(p[i + 5]) << 16) |
-                         (static_cast<uint32_t>(p[i + 6]) << 8) | static_cast<uint32_t>(p[i + 7]);
+        const int ver = p[off + 3];
+        const uint32_t tag_size = id3Synchsafe32(p + off + 6);
+        const size_t tag_end = off + 10 + static_cast<size_t>(tag_size);
+        if (tag_end > body.size()) {
+            return true;
         }
-        i += 10;
-        if (frame_size > tag_end - i) {
-            break;
+        if (containsIgnoreCase(body.data() + off, tag_end - off, kHlsId3TimestampOwner,
+                               kHlsId3TimestampOwnerLen)) {
+            return true;
         }
-        if (frame_id == "PRIV") {
-            const std::string payload = body.substr(i, frame_size);
-            if (payload.compare(0, sizeof(kHlsId3TimestampOwner) - 1, kHlsId3TimestampOwner) == 0) {
+        if (ver < 2 || ver > 4) {
+            return true;
+        }
+        const size_t frame_hdr = ver == 2 ? 6 : 10;
+        size_t i = off + 10;
+        while (i + frame_hdr <= tag_end) {
+            if (body[i] == '\0') {
+                break;
+            }
+            uint32_t frame_size = 0;
+            unsigned char flags2 = 0;
+            if (ver == 2) {
+                frame_size = (static_cast<uint32_t>(p[i + 3]) << 16) |
+                             (static_cast<uint32_t>(p[i + 4]) << 8) | static_cast<uint32_t>(p[i + 5]);
+            } else if (ver == 4) {
+                frame_size = id3Synchsafe32(p + i + 4);
+                flags2 = p[i + 9];
+            } else {
+                frame_size = (static_cast<uint32_t>(p[i + 4]) << 24) | (static_cast<uint32_t>(p[i + 5]) << 16) |
+                             (static_cast<uint32_t>(p[i + 6]) << 8) | static_cast<uint32_t>(p[i + 7]);
+                flags2 = p[i + 9];
+            }
+            if (id3FrameCompressedOrEncrypted(ver, flags2)) {
                 return true;
             }
+            if (frame_size > tag_end - (i + frame_hdr)) {
+                return true;
+            }
+            i += frame_hdr + frame_size;
         }
-        i += frame_size;
+        off = tag_end;
     }
     return false;
 }
@@ -549,10 +696,11 @@ PlaylistPreview readHlsPlaylistPreview(const std::string& url, bool allow_local,
             if (firstLineIsExtm3u(sniff)) {
                 continue;
             }
-            // Local non-playlist can stop. Remote: never stop on a TS/ftyp
-            // sniff — a sync/`ftyp` prefix plus RST, or a finished stub
-            // then master on the next GET, must record the later error.
-            if (!remote) {
+            // Local non-playlist can stop. A remote .ts/.mp4 can stop on a
+            // real segment sniff (stall.ts drips). Extensionless remote
+            // URLs keep reading: a finished stub then master must not
+            // look like a successful peek.
+            if (!remote || (urlLooksLikeMediaSegment(url) && bodyLooksLikeMediaSegment(sniff))) {
                 break;
             }
         }
@@ -575,43 +723,109 @@ bool hlsPreviewIncomplete(const PlaylistPreview& prev) {
     return firstHlsStreamInfUri(prev.body).empty() && !hlsHasExtInf(prev.body);
 }
 
-bool firstSegmentHasHlsId3Timestamp(const std::string& playlist, const std::string& base,
-                                    bool allow_local, AVIOInterruptCB* cb) {
-    const std::string rel = firstHlsExtInfUri(playlist);
-    if (rel.empty()) {
-        return false;
+PlaylistPreview readUrlRange(const std::string& url, bool allow_local, AVIOInterruptCB* cb,
+                             int64_t offset, int64_t length) {
+    PlaylistPreview out;
+    AVDictionary* opts = nullptr;
+    setDecoderIoOptions(&opts, allow_local);
+    AVIOContext* pb = nullptr;
+    const std::string peek_url = avioPeekUrl(url);
+    const int rc = avio_open2(&pb, peek_url.c_str(), AVIO_FLAG_READ, cb, &opts);
+    av_dict_free(&opts);
+    if (rc < 0 || pb == nullptr) {
+        out.open_error = true;
+        return out;
     }
-    const std::string resolved = resolvePlaylistUrl(base, rel);
-    if (resolved.empty()) {
-        return false;
+    if (offset > 0 && avio_seek(pb, offset, SEEK_SET) < 0) {
+        out.open_error = true;
+        avio_closep(&pb);
+        return out;
     }
-    const PlaylistPreview seg = readHlsPlaylistPreview(resolved, allow_local, cb);
-    if (bodyHasHlsId3Timestamp(seg.body)) {
+    unsigned char buf[4096];
+    constexpr size_t kMax = 1024 * 1024;
+    const size_t want = length > 0 ? static_cast<size_t>(std::min(length, static_cast<int64_t>(kMax))) : kMax;
+    while (out.body.size() < want) {
+        const int n = avio_read(pb, buf, sizeof(buf));
+        if (n == 0 || n == AVERROR_EOF) {
+            break;
+        }
+        if (n < 0) {
+            out.read_error = true;
+            break;
+        }
+        const size_t take = std::min(static_cast<size_t>(n), want - out.body.size());
+        out.body.append(reinterpret_cast<const char*>(buf), take);
+    }
+    if (out.body.size() >= kMax) {
+        out.hit_max = true;
+    }
+    avio_closep(&pb);
+    return out;
+}
+
+bool segmentMayBeId3Timestamped(const HlsSegmentRef& seg, const std::string& base, bool allow_local,
+                                AVIOInterruptCB* cb) {
+    if (seg.encrypted || seg.uri.empty()) {
         return true;
     }
-    // Truncated ID3 at the start of a segment can still become a timestamp
-    // tag once FFmpeg reads the rest. Fail closed.
-    return bodyStartsWithId3(seg.body) && (seg.read_error || seg.body.size() < 10);
+    const std::string resolved = resolvePlaylistUrl(base, seg.uri);
+    if (resolved.empty()) {
+        return true;
+    }
+    const int64_t length = seg.byte_length > 0 ? seg.byte_length : static_cast<int64_t>(1024 * 1024);
+    const PlaylistPreview peek = readUrlRange(resolved, allow_local, cb, seg.byte_offset, length);
+    if (peek.open_error) {
+        return true;
+    }
+    return bodyMayBeId3Timestamped(peek.body);
+}
+
+bool playlistWouldNestedId3Probe(const PlaylistPreview& prev, const std::string& url, bool allow_local,
+                                 AVIOInterruptCB* cb, int depth, std::vector<std::string>* seen) {
+    if (depth > 8) {
+        return true;
+    }
+    if (seen != nullptr && urlAlreadyVisited(*seen, url)) {
+        return false;
+    }
+    if (seen != nullptr) {
+        seen->push_back(url);
+    }
+    const std::string base = !prev.final_url.empty() ? prev.final_url : url;
+    const std::vector<HlsSegmentRef> segs = hlsMediaSegments(prev.body);
+    // Depth 0 is the URL we would open: check every EXTINF (live ID3 can
+    // sit on a later segment). STREAM-INF variants only need the first
+    // segment — FFmpeg already probes those early, and fetching a later
+    // segment of the unused variant breaks dual-variant selection.
+    const size_t ncheck = segs.empty() ? 0 : (depth == 0 ? segs.size() : 1);
+    for (size_t i = 0; i < ncheck; ++i) {
+        if (segmentMayBeId3Timestamped(segs[i], base, allow_local, cb)) {
+            return true;
+        }
+    }
+    const std::vector<std::string> variants = allHlsStreamInfUris(prev.body);
+    for (const std::string& rel : variants) {
+        const std::string resolved = resolvePlaylistUrl(base, rel);
+        if (resolved.empty() || samePlaylistUrl(resolved, url) ||
+            (seen != nullptr && urlAlreadyVisited(*seen, resolved))) {
+            continue;
+        }
+        const PlaylistPreview inner = readHlsPlaylistPreview(resolved, allow_local, cb);
+        if (inner.open_error || inner.body.empty()) {
+            return true;
+        }
+        if (playlistWouldNestedId3Probe(inner, resolved, allow_local, cb, depth + 1, seen)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool playlistWouldNestedId3Probe(const PlaylistPreview& prev, const std::string& url, bool allow_local,
                                  AVIOInterruptCB* cb) {
-    const std::string base = !prev.final_url.empty() ? prev.final_url : url;
-    if (hlsHasExtInf(prev.body) && firstSegmentHasHlsId3Timestamp(prev.body, base, allow_local, cb)) {
-        return true;
-    }
-    const std::string variant = firstHlsStreamInfUri(prev.body);
-    if (variant.empty()) {
-        return false;
-    }
-    const std::string resolved = resolvePlaylistUrl(base, variant);
-    if (resolved.empty() || samePlaylistUrl(resolved, url)) {
-        return false;
-    }
-    const PlaylistPreview inner = readHlsPlaylistPreview(resolved, allow_local, cb);
-    const std::string inner_base = !inner.final_url.empty() ? inner.final_url : resolved;
-    return hlsHasExtInf(inner.body) &&
-           firstSegmentHasHlsId3Timestamp(inner.body, inner_base, allow_local, cb);
+    std::vector<std::string> seen;
+    seen.reserve(9);
+    return playlistWouldNestedId3Probe(prev, url, allow_local, cb, 0, &seen);
 }
 
 // FFmpeg 6.1.1 hls_read_header calls avformat_find_stream_info(pls->ctx, NULL)
@@ -658,17 +872,13 @@ bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AV
             }
             return !playlistWouldNestedId3Probe(prev, *url, allow_local, cb);
         }
-        // Remote non-#EXTM3U: a TS/`ftyp` sniff is not a successful peek.
-        // Only a clean complete media body at this same URL can proceed;
-        // a redirect to a decoy would 302 to a master on the next GET.
+        // Remote non-#EXTM3U: a finished TS/`ftyp` body on an
+        // extensionless / playlist URL must not clear a later GET of
+        // the same URL (that GET can be an audio-group master). A
+        // path that already looks like a media segment can proceed.
         if (urlIsRemoteHttp(*url)) {
-            if (!bodyLooksLikeMediaSegment(prev.body)) {
-                return false;
-            }
-            if (!prev.final_url.empty() && !samePlaylistUrl(*url, prev.final_url)) {
-                return false;
-            }
-            return true;
+            return urlLooksLikeMediaSegment(*url) && !prev.read_error &&
+                   bodyLooksLikeMediaSegment(prev.body);
         }
         return true;
     }

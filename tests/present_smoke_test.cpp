@@ -161,30 +161,55 @@ std::string ftypPrefix() {
     return body;
 }
 
-std::string id3v23HlsTimestampTag() {
-    const char owner[] = "com.apple.streaming.transportStreamTimestamp";
-    const uint32_t owner_len = 44;
-    const uint32_t payload = owner_len + 1 + 8;
-    const uint32_t tag_size = 10 + payload;
-    std::string tag(10 + tag_size, '\0');
-    tag[0] = 'I';
-    tag[1] = 'D';
-    tag[2] = '3';
-    tag[3] = 3;
-    tag[6] = static_cast<char>((tag_size >> 21) & 0x7f);
-    tag[7] = static_cast<char>((tag_size >> 14) & 0x7f);
-    tag[8] = static_cast<char>((tag_size >> 7) & 0x7f);
-    tag[9] = static_cast<char>(tag_size & 0x7f);
-    tag[10] = 'P';
-    tag[11] = 'R';
-    tag[12] = 'I';
-    tag[13] = 'V';
-    tag[14] = static_cast<char>((payload >> 24) & 0xff);
-    tag[15] = static_cast<char>((payload >> 16) & 0xff);
-    tag[16] = static_cast<char>((payload >> 8) & 0xff);
-    tag[17] = static_cast<char>(payload & 0xff);
-    std::memcpy(&tag[20], owner, owner_len);
-    return tag;
+std::string id3Synchsafe(uint32_t n) {
+    std::string s(4, '\0');
+    s[0] = static_cast<char>((n >> 21) & 0x7f);
+    s[1] = static_cast<char>((n >> 14) & 0x7f);
+    s[2] = static_cast<char>((n >> 7) & 0x7f);
+    s[3] = static_cast<char>(n & 0x7f);
+    return s;
+}
+
+std::string id3v23Frame(const char id[4], const std::string& payload, unsigned char flags2 = 0) {
+    std::string f(10, '\0');
+    std::memcpy(&f[0], id, 4);
+    const uint32_t n = static_cast<uint32_t>(payload.size());
+    f[4] = static_cast<char>((n >> 24) & 0xff);
+    f[5] = static_cast<char>((n >> 16) & 0xff);
+    f[6] = static_cast<char>((n >> 8) & 0xff);
+    f[7] = static_cast<char>(n & 0xff);
+    f[9] = static_cast<char>(flags2);
+    return f + payload;
+}
+
+std::string id3v23Tag(const std::string& frames) {
+    std::string tag = "ID3";
+    tag.push_back(3);
+    tag.push_back(0);
+    tag.push_back(0);
+    tag += id3Synchsafe(static_cast<uint32_t>(frames.size()));
+    return tag + frames;
+}
+
+std::string id3PrivPayload(const char* owner) {
+    std::string p(owner);
+    p.push_back('\0');
+    p.append(5, '\0');
+    p.push_back(0x01);
+    p.push_back(static_cast<char>(0x5F));
+    p.push_back(static_cast<char>(0x90));
+    return p;
+}
+
+std::string id3v23HlsTimestampTag(const char* owner = "com.apple.streaming.transportStreamTimestamp",
+                                  size_t pad_before_priv = 0, unsigned char priv_flags2 = 0) {
+    std::string frames(pad_before_priv, '\0');
+    frames += id3v23Frame("PRIV", id3PrivPayload(owner), priv_flags2);
+    return id3v23Tag(frames);
+}
+
+std::string id3v23Tit2Tag() {
+    return id3v23Tag(id3v23Frame("TIT2", std::string("\x00en", 3) + "decoy"));
 }
 
 void sendAll(int fd, const char* data, size_t len) {
@@ -412,6 +437,36 @@ struct LocalHttp {
                 std::ostringstream ss;
                 ss << in.rdbuf();
                 sendDecoyRst(ss.str(), "video/mp2t", 128);
+                continue;
+            }
+        }
+        if (ok && (rel == "fin-sync" || rel == "fin-ftyp" || rel == "fin-small")) {
+            static int fin_sync_hits = 0;
+            static int fin_ftyp_hits = 0;
+            static int fin_small_hits = 0;
+            int* hits = rel == "fin-sync" ? &fin_sync_hits : rel == "fin-ftyp" ? &fin_ftyp_hits
+                                                                              : &fin_small_hits;
+            if ((*hits)++ == 0) {
+                std::string body;
+                const char* type = "video/mp2t";
+                if (rel == "fin-sync") {
+                    body = mpegTsSyncPrefix();
+                } else if (rel == "fin-ftyp") {
+                    body = ftypPrefix();
+                    type = "video/mp4";
+                } else {
+                    std::ifstream in(root / "small.ts", std::ios::binary);
+                    std::ostringstream ss;
+                    ss << in.rdbuf();
+                    body = ss.str();
+                }
+                std::ostringstream hdr;
+                hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << body.size()
+                    << "\r\nContent-Type: " << type << "\r\nConnection: close\r\n\r\n";
+                const std::string header = hdr.str();
+                sendAll(client, header.data(), header.size());
+                sendAll(client, body.data(), body.size());
+                ::close(client);
                 continue;
             }
         }
@@ -1302,6 +1357,87 @@ int main() {
                     << "#EXTM3U\n#EXT-X-VERSION:4\n"
                     << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
                     << id3Media.filename().string() << "\n";
+                {
+                    std::ifstream in(hugeTs, std::ios::binary);
+                    std::ofstream out(tmp.path() / "d4-id3-upper.ts", std::ios::binary);
+                    out << id3v23HlsTimestampTag("COM.APPLE.STREAMING.TRANSPORTSTREAMTIMESTAMP");
+                    out << in.rdbuf();
+                }
+                std::ofstream(tmp.path() / "d4-id3-upper.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                    << "d4-id3-upper.ts\n#EXT-X-ENDLIST\n";
+                {
+                    std::ifstream in(hugeTs, std::ios::binary);
+                    std::ofstream out(tmp.path() / "d4-id3-second.ts", std::ios::binary);
+                    out << id3v23Tit2Tag() << id3v23HlsTimestampTag();
+                    out << in.rdbuf();
+                }
+                std::ofstream(tmp.path() / "d4-id3-second.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                    << "d4-id3-second.ts\n#EXT-X-ENDLIST\n";
+                {
+                    std::ifstream in(hugeTs, std::ios::binary);
+                    std::ofstream out(tmp.path() / "d4-id3-zlib.ts", std::ios::binary);
+                    out << id3v23HlsTimestampTag("com.apple.streaming.transportStreamTimestamp", 0,
+                                                0x80);
+                    out << in.rdbuf();
+                }
+                std::ofstream(tmp.path() / "d4-id3-zlib.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                    << "d4-id3-zlib.ts\n#EXT-X-ENDLIST\n";
+                {
+                    std::ifstream in(hugeTs, std::ios::binary);
+                    std::ofstream out(tmp.path() / "d4-id3-late.ts", std::ios::binary);
+                    out << id3v23HlsTimestampTag("com.apple.streaming.transportStreamTimestamp",
+                                                5000);
+                    out << in.rdbuf();
+                }
+                std::ofstream(tmp.path() / "d4-id3-late.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                    << "d4-id3-late.ts\n#EXT-X-ENDLIST\n";
+                {
+                    std::ofstream out(tmp.path() / "d4-id3-range.ts", std::ios::binary);
+                    out << std::string(1000, 'X');
+                    out << id3v23HlsTimestampTag();
+                    std::ifstream in(hugeTs, std::ios::binary);
+                    out << in.rdbuf();
+                }
+                {
+                    const uint64_t slice = id3v23HlsTimestampTag().size() +
+                                           std::filesystem::file_size(hugeTs);
+                    std::ofstream(tmp.path() / "d4-id3-range.m3u8")
+                        << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:1\n"
+                        << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                        << "#EXT-X-BYTERANGE:" << slice << "@1000\n"
+                        << "d4-id3-range.ts\n#EXT-X-ENDLIST\n";
+                }
+                std::ofstream(tmp.path() / "d4-id3-key.bin", std::ios::binary) << std::string(16, 'K');
+                std::ofstream(tmp.path() / "d4-id3-aes.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-KEY:METHOD=AES-128,URI=\"d4-id3-key.bin\"\n"
+                    << "#EXTINF:0.040,\n"
+                    << hugeTs.filename().string() << "\n#EXT-X-ENDLIST\n";
+                std::ofstream(tmp.path() / "d4-id3-live.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n#EXTINF:0.040,\n"
+                    << id3HugeTs.filename().string() << "\n";
+                std::ofstream(tmp.path() / "d4-id3-second-var.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << videoHls.filename().string() << "\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=500000\n"
+                    << id3Media.filename().string() << "\n";
+                std::ofstream(tmp.path() / "d4-id3-nested-inner.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << id3Media.filename().string() << "\n";
+                std::ofstream(tmp.path() / "d4-id3-nested-outer.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << "d4-id3-nested-inner.m3u8\n";
             }
             long chompRss = 0;
             const int chompRc =
@@ -1359,6 +1495,27 @@ int main() {
             if (!d4MustStayCapped("STREAM-INF ID3-timestamped variant", id3VarRc, id3VarRss,
                                   readFile(out), readFile(err), false)) {
                 return 1;
+            }
+            const char* id3Extra[][2] = {
+                {"d4-id3-upper.m3u8", "ID3 uppercase owner"},
+                {"d4-id3-second.m3u8", "second ID3 tag PRIV"},
+                {"d4-id3-zlib.m3u8", "zlib-compressed PRIV"},
+                {"d4-id3-late.m3u8", "ID3 PRIV past 4096"},
+                {"d4-id3-range.m3u8", "BYTERANGE ID3 segment"},
+                {"d4-id3-aes.m3u8", "AES-128 first segment"},
+                {"d4-id3-live.m3u8", "live playlist ID3 segment 1"},
+                {"d4-id3-second-var.m3u8", "second STREAM-INF ID3"},
+                {"d4-id3-nested-outer.m3u8", "nested master ID3"},
+            };
+            for (const auto& extra : id3Extra) {
+                long extraRss = 0;
+                const int extraRc = run({player, "--url", (tmp.path() / extra[0]).string(),
+                                         "--frames", "1"},
+                                        out, err, &extraRss);
+                if (!d4MustStayCapped(extra[1], extraRc, extraRss, readFile(out), readFile(err),
+                                      false)) {
+                    return 1;
+                }
             }
 
             // Extensionless HTTP URL, Content-Type mpegurl. The first peek
@@ -1539,8 +1696,44 @@ int main() {
             const int hopFinRc =
                 run({player, "--url", httpBase + "/hop-fin.m3u8", "--frames", "1"}, out, err,
                     &hopFinRss);
-            d4http.stop();
             if (!d4MustStayCapped("302 finished-TS decoy then master", hopFinRc, hopFinRss,
+                                  readFile(out), readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+
+            {
+                std::ifstream src(masterAudio);
+                std::ofstream(tmp.path() / "fin-sync") << src.rdbuf();
+                std::ifstream src2(masterAudio);
+                std::ofstream(tmp.path() / "fin-ftyp") << src2.rdbuf();
+                std::ifstream src3(masterAudio);
+                std::ofstream(tmp.path() / "fin-small") << src3.rdbuf();
+            }
+            long finSyncRss = 0;
+            const int finSyncRc =
+                run({player, "--url", httpBase + "/fin-sync", "--frames", "1"}, out, err,
+                    &finSyncRss);
+            if (!d4MustStayCapped("finished sync exact-CL then master", finSyncRc, finSyncRss,
+                                  readFile(out), readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long finFtypRss = 0;
+            const int finFtypRc =
+                run({player, "--url", httpBase + "/fin-ftyp", "--frames", "1"}, out, err,
+                    &finFtypRss);
+            if (!d4MustStayCapped("finished ftyp exact-CL then master", finFtypRc, finFtypRss,
+                                  readFile(out), readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long finSmallRss = 0;
+            const int finSmallRc =
+                run({player, "--url", httpBase + "/fin-small", "--frames", "1"}, out, err,
+                    &finSmallRss);
+            d4http.stop();
+            if (!d4MustStayCapped("finished small TS exact-CL then master", finSmallRc, finSmallRss,
                                   readFile(out), readFile(err), false)) {
                 return 1;
             }
