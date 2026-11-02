@@ -323,6 +323,24 @@ struct LocalHttp {
                 continue;
             }
         }
+        if (ok && rel == "decoy256") {
+            std::string stub =
+                "HTTP/1.1 200 OK\r\nContent-Length: 400\r\n"
+                "Content-Type: video/mp2t\r\nConnection: close\r\n\r\n";
+            stub.append(256, 'X');
+            sendAll(client, stub.data(), stub.size());
+            rstClose(client);
+            continue;
+        }
+        if (ok && rel == "hop.m3u8") {
+            static int hop_hits = 0;
+            const char* loc = hop_hits++ == 0 ? "/decoy256" : "/playlist";
+            std::string redir = std::string("HTTP/1.1 302 Found\r\nLocation: ") + loc +
+                                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, redir.data(), redir.size());
+            ::close(client);
+            continue;
+        }
         if (ok && rel == "trunc.m3u8") {
             static int trunc_hits = 0;
             if (trunc_hits++ == 0) {
@@ -1127,6 +1145,83 @@ int main() {
                 return 1;
             }
 
+            const std::filesystem::path chompSpace = tmp.path() / "d4-chomp-space.m3u8";
+            const std::filesystem::path chompBs = tmp.path() / "d4-chomp-bs.m3u8";
+            const std::filesystem::path chompLong = tmp.path() / "d4-chomp-overlong.m3u8";
+            const std::filesystem::path inbandSmall = tmp.path() / "d4-inband-small.m3u8";
+            const std::filesystem::path inbandHuge = tmp.path() / "d4-inband-huge.m3u8";
+            {
+                std::ofstream(chompSpace, std::ios::binary)
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-MEDIA:TYPE=\"AUDIO \n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << videoHls.filename().string() << "\n";
+                std::ofstream(chompBs, std::ios::binary)
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-MEDIA:TYPE=\"AUDIO\\\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << videoHls.filename().string() << "\n";
+                std::string media =
+                    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"";
+                media += audioHls.filename().string();
+                media += '"';
+                if (media.size() < 4095) {
+                    media.append(4095 - media.size(), ' ');
+                }
+                media += ",TYPE=VIDEO,URI=\"\"";
+                std::string longBody = "#EXTM3U\n#EXT-X-VERSION:4\n";
+                longBody += media;
+                longBody += "\n#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n";
+                longBody += videoHls.filename().string();
+                longBody += '\n';
+                std::ofstream(chompLong, std::ios::binary) << longBody;
+                std::ofstream(inbandSmall)
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                    << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                    << videoHls.filename().string() << "\n";
+                std::ofstream(inbandHuge)
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                    << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"\"\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                    << audioHls.filename().string() << "\n";
+                std::ifstream src(chompSpace);
+                std::ofstream(tmp.path() / "chomp-http.m3u8") << src.rdbuf();
+            }
+            long chompRss = 0;
+            const int chompRc =
+                run({player, "--url", chompSpace.string(), "--frames", "1"}, out, err, &chompRss);
+            if (!d4MustStayCapped("chomp TYPE=AUDIO space", chompRc, chompRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+            long chompBsRss = 0;
+            const int chompBsRc =
+                run({player, "--url", chompBs.string(), "--frames", "1"}, out, err, &chompBsRss);
+            if (!d4MustStayCapped("chomp TYPE=AUDIO backslash", chompBsRc, chompBsRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+            long chompLongRss = 0;
+            const int chompLongRc =
+                run({player, "--url", chompLong.string(), "--frames", "1"}, out, err, &chompLongRss);
+            if (!d4MustStayCapped("chomp spaces to 4095", chompLongRc, chompLongRss, readFile(out),
+                                  readFile(err), true)) {
+                return 1;
+            }
+            long inSmallRss = 0;
+            const int inSmallRc =
+                run({player, "--url", inbandSmall.string(), "--frames", "1"}, out, err, &inSmallRss);
+            if (!d4MustStayCapped("in-band AUDIO small variant", inSmallRc, inSmallRss,
+                                  readFile(out), readFile(err), true)) {
+                return 1;
+            }
+            long inHugeRss = 0;
+            const int inHugeRc =
+                run({player, "--url", inbandHuge.string(), "--frames", "1"}, out, err, &inHugeRss);
+            if (!d4MustStayCapped("in-band AUDIO huge variant", inHugeRc, inHugeRss, readFile(out),
+                                  readFile(err), false)) {
+                return 1;
+            }
+
             // Extensionless HTTP URL, Content-Type mpegurl. The first peek
             // only ran for .m3u8 / hls+.
             const std::filesystem::path extless = tmp.path() / "playlist";
@@ -1213,8 +1308,36 @@ int main() {
             const int partialRc =
                 run({player, "--url", httpBase + "/partial.m3u8", "--frames", "1"}, out, err,
                     &partialRss);
-            d4http.stop();
             if (!d4MustStayCapped("partial peek reset", partialRc, partialRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long chompHttpRss = 0;
+            const int chompHttpRc =
+                run({player, "--url", httpBase + "/chomp-http.m3u8", "--frames", "1"}, out, err,
+                    &chompHttpRss);
+            if (!d4MustStayCapped("chomp TYPE=AUDIO space HTTP", chompHttpRc, chompHttpRss,
+                                  readFile(out), readFile(err), true)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long decoyRss = 0;
+            const int decoyRc =
+                run({player, "--url", httpBase + "/decoy256", "--frames", "1"}, out, err, &decoyRss);
+            if (!d4MustStayCapped("256-byte video/mp2t reset", decoyRc, decoyRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+
+            long hopRss = 0;
+            const int hopRc =
+                run({player, "--url", httpBase + "/hop.m3u8", "--frames", "1"}, out, err, &hopRss);
+            d4http.stop();
+            if (!d4MustStayCapped("302 decoy then master", hopRc, hopRss, readFile(out),
                                   readFile(err), false)) {
                 return 1;
             }

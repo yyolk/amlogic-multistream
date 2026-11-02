@@ -207,7 +207,10 @@ HlsMediaAttrs parseHlsMediaAttrs(const std::string& attrs) {
         if (i < attrs.size() && attrs[i] == '"') {
             ++i;
             while (i < attrs.size() && attrs[i] != '"') {
-                if (attrs[i] == '\\' && i + 1 < attrs.size()) {
+                if (attrs[i] == '\\') {
+                    if (i + 1 >= attrs.size()) {
+                        break;
+                    }
                     ++i;
                 }
                 value.push_back(attrs[i]);
@@ -255,6 +258,10 @@ bool hlsNextLine(const std::string& text, size_t* pos, std::string* line) {
     }
     const size_t raw = i - start;
     *line = text.substr(start, raw > kFfGetLineMax ? kFfGetLineMax : raw);
+    // ff_get_chomp_line strips trailing whitespace after the 4095 cap.
+    while (!line->empty() && std::isspace(static_cast<unsigned char>(line->back()))) {
+        line->pop_back();
+    }
     if (i < text.size()) {
         const char c = text[i];
         ++i;
@@ -278,7 +285,10 @@ bool hlsMasterHasExternalAudio(const std::string& text) {
             continue;
         }
         const HlsMediaAttrs attrs = parseHlsMediaAttrs(line.substr(colon));
-        if (attrs.type == "AUDIO" && (!attrs.uri.empty() || attrs.unclosed_quote)) {
+        // In-band TYPE=AUDIO (empty / missing URI) still makes hls.c run
+        // find_stream_info(NULL) on the variant. Treat any AUDIO tag as
+        // the same risk class as an external URI=.
+        if (attrs.type == "AUDIO") {
             return true;
         }
     }
@@ -421,6 +431,15 @@ bool mimeLooksMpegurl(const std::string& mime) {
     return av_stristr(mime.c_str(), "mpegurl") != nullptr;
 }
 
+bool bodyLooksLikeMediaSegment(const std::string& body) {
+    if (body.size() >= 376 && static_cast<unsigned char>(body[0]) == 0x47 &&
+        static_cast<unsigned char>(body[188]) == 0x47 &&
+        static_cast<unsigned char>(body[376]) == 0x47) {
+        return true;
+    }
+    return body.size() >= 8 && body.compare(4, 4, "ftyp") == 0;
+}
+
 struct PlaylistPreview {
     std::string body;
     std::string final_url;
@@ -444,6 +463,7 @@ PlaylistPreview readHlsPlaylistPreview(const std::string& url, bool allow_local,
     }
     out.mpegurl = mimeLooksMpegurl(avioChildString(pb, "mime_type"));
     out.final_url = avioChildString(pb, "location");
+    const bool remote = urlIsRemoteHttp(url);
     unsigned char buf[4096];
     constexpr size_t kSniff = 256;
     constexpr size_t kMax = 1024 * 1024;
@@ -460,7 +480,13 @@ PlaylistPreview readHlsPlaylistPreview(const std::string& url, bool allow_local,
         if (out.body.size() >= kSniff) {
             std::string sniff = out.body;
             stripUtf8Bom(&sniff);
-            if (!firstLineIsExtm3u(sniff)) {
+            if (firstLineIsExtm3u(sniff)) {
+                continue;
+            }
+            // Local non-playlist can stop. Remote decoys send 256 garbage
+            // bytes then RST / a later master; keep reading so that error
+            // is recorded, unless this already looks like a real segment.
+            if (!remote || bodyLooksLikeMediaSegment(sniff)) {
                 break;
             }
         }
@@ -523,6 +549,11 @@ bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AV
         }
         if (firstLineIsExtm3u(prev.body) || prev.mpegurl) {
             return !hlsPreviewIncomplete(prev);
+        }
+        // Non-#EXTM3U http(s) that is not a clean TS/MP4 sniff: a 302
+        // decoy or video/mp2t garbage can become a master on the next GET.
+        if (urlIsRemoteHttp(*url) && !bodyLooksLikeMediaSegment(prev.body)) {
+            return false;
         }
         return true;
     }

@@ -404,6 +404,24 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
                 continue;
             }
         }
+        if (ok && rel == "decoy256") {
+            std::string stub =
+                "HTTP/1.1 200 OK\r\nContent-Length: 400\r\n"
+                "Content-Type: video/mp2t\r\nConnection: close\r\n\r\n";
+            stub.append(256, 'X');
+            sendAll(client, stub.data(), stub.size());
+            rstClose(client);
+            continue;
+        }
+        if (ok && rel == "hop.m3u8") {
+            static int hop_hits = 0;
+            const char* loc = hop_hits++ == 0 ? "/decoy256" : "/playlist";
+            std::string redir = std::string("HTTP/1.1 302 Found\r\nLocation: ") + loc +
+                                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, redir.data(), redir.size());
+            ::close(client);
+            continue;
+        }
         if (ok) {
             const std::filesystem::path full = root / rel;
             std::ifstream in(full, std::ios::binary);
@@ -1235,6 +1253,71 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
     }
     testDecode((dir / "d4-overlong.m3u8").string());
 
+    g_case = "hls chomp TYPE=AUDIO space presents small stream";
+    {
+        std::ofstream playlist(dir / "d4-chomp-space.m3u8", std::ios::binary);
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-MEDIA:TYPE=\"AUDIO \n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-chomp-space.m3u8").string());
+
+    g_case = "hls chomp TYPE=AUDIO backslash presents small stream";
+    {
+        std::ofstream playlist(dir / "d4-chomp-bs.m3u8", std::ios::binary);
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-MEDIA:TYPE=\"AUDIO\\\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-chomp-bs.m3u8").string());
+
+    g_case = "hls chomp spaces to 4095 presents small stream";
+    {
+        std::string media = "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"";
+        media += d4audio.filename().string();
+        media += '"';
+        if (media.size() < 4095) {
+            media.append(4095 - media.size(), ' ');
+        }
+        media += ",TYPE=VIDEO,URI=\"\"";
+        std::string body = "#EXTM3U\n#EXT-X-VERSION:4\n";
+        body += media;
+        body += "\n#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n";
+        body += d4video.filename().string();
+        body += '\n';
+        std::ofstream(dir / "d4-chomp-overlong.m3u8", std::ios::binary) << body;
+    }
+    testDecode((dir / "d4-chomp-overlong.m3u8").string());
+
+    g_case = "hls in-band AUDIO small variant presents";
+    {
+        std::ofstream playlist(dir / "d4-inband-small.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-inband-small.m3u8").string());
+
+    g_case = "hls in-band AUDIO huge variant stays capped";
+    {
+        std::ofstream playlist(dir / "d4-inband-huge.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4audio.filename().string() << "\n";
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        const bool opened = decoder.open((dir / "d4-inband-huge.m3u8").string());
+        if (opened) {
+            DecodedFrame frame;
+            CHECK(!decoder.readFrame(frame) || (frame.width < 200 && frame.height < 200));
+        }
+        decoder.close();
+    }
+
     {
         std::ifstream src(d4master);
         std::ofstream(dir / "failpeek.m3u8") << src.rdbuf();
@@ -1298,6 +1381,20 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         FfmpegDecoder partial;
         CHECK(!partial.open(httpBase + "/partial.m3u8"));
         partial.close();
+        g_case = "hls chomp TYPE=AUDIO space http presents";
+        {
+            std::ifstream src(dir / "d4-chomp-space.m3u8");
+            std::ofstream(dir / "chomp-http.m3u8") << src.rdbuf();
+        }
+        openHttpSmall(httpBase + "/chomp-http.m3u8");
+        g_case = "hls 256-byte video/mp2t reset refuses";
+        FfmpegDecoder decoy;
+        CHECK(!decoy.open(httpBase + "/decoy256"));
+        decoy.close();
+        g_case = "hls 302 decoy then master refuses";
+        FfmpegDecoder hop;
+        CHECK(!hop.open(httpBase + "/hop.m3u8"));
+        hop.close();
     }
     server.stop();
 }

@@ -64,11 +64,12 @@ public:
     // would keep max_pixels == INT_MAX. open() peeks http(s) even when
     // the path ends in .ts (mpegurl Content-Type or a redirect to a
     // master). Playlist lines end on \\n / \\r / \\0 like ff_get_line
-    // and are capped at 4095 bytes. MEDIA attributes follow
-    // ff_parse_key_value (strchr('='), so a bare token swallows the
-    // next attribute). A truncated #EXTM3U, a peek that errors after
-    // any bytes, or mpegurl that is not #EXTM3U is refused rather
-    // than opened uncapped (AUDIT12 D4).
+    // and are capped at 4095 bytes, then chomped like ff_get_chomp_line.
+    // Quoted values drop a final backslash. Any TYPE=AUDIO tag (URI=
+    // or in-band) is rewritten or refused. A truncated #EXTM3U, a peek
+    // that errors after any bytes, mpegurl that is not #EXTM3U, or a
+    // non-playlist http(s) decoy is refused rather than opened
+    // uncapped (AUDIT12 D4).
     // readFrame() also refuses to convert a frame that fails those
     // extent and stride caps (AUDIT9 D1).
     void setAllowLocalFile(bool allow);
