@@ -312,6 +312,26 @@ bool hlsHasExtInf(const std::string& text) {
     return false;
 }
 
+bool hlsPlaylistHasEndlist(const std::string& text) {
+    size_t pos = 0;
+    std::string line;
+    while (hlsNextLine(text, &pos, &line)) {
+        if (trimCopy(line).compare(0, 14, "#EXT-X-ENDLIST") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// FFmpeg 6.1.1 hls.c select_cur_seq_no: live_start_index defaults to -3,
+// so a live playlist starts at max(n_segments - 3, 0).
+size_t hlsLiveStartSegIndex(size_t n_segments) {
+    if (n_segments <= 3) {
+        return 0;
+    }
+    return n_segments - 3;
+}
+
 std::string firstHlsUriAfterTag(const std::string& text, const char* tag, size_t tag_len) {
     size_t pos = 0;
     std::string line;
@@ -457,41 +477,104 @@ bool urlHasScheme(const std::string& url) {
     return true;
 }
 
+// Collapse . / .. like FFmpeg 6.1.1 ff_make_absolute_url2 append_path.
+// Only http(s) URLs with an authority are simplified (file paths are not:
+// the directory may be a symlink).
+std::string normalizeUrlPath(const std::string& path) {
+    std::vector<std::string> parts;
+    const bool abs = !path.empty() && path[0] == '/';
+    size_t i = abs ? 1 : 0;
+    while (i <= path.size()) {
+        const size_t j = path.find('/', i);
+        const size_t end = j == std::string::npos ? path.size() : j;
+        const std::string part = path.substr(i, end - i);
+        if (part == "..") {
+            if (!parts.empty()) {
+                parts.pop_back();
+            }
+        } else if (!part.empty() && part != ".") {
+            parts.push_back(part);
+        }
+        if (j == std::string::npos) {
+            break;
+        }
+        i = j + 1;
+    }
+    std::string out = abs ? "/" : "";
+    for (size_t k = 0; k < parts.size(); ++k) {
+        if (k > 0) {
+            out += '/';
+        }
+        out += parts[k];
+    }
+    if (!path.empty() && path.back() == '/' && (out.empty() || out.back() != '/')) {
+        out += '/';
+    }
+    if (out.empty() && abs) {
+        return "/";
+    }
+    return out;
+}
+
+std::string normalizeHttpUrl(const std::string& url) {
+    std::string prefix;
+    std::string u = url;
+    if (u.compare(0, 4, "hls+") == 0) {
+        prefix = "hls+";
+        u = u.substr(4);
+    }
+    if (u.compare(0, 7, "http://") != 0 && u.compare(0, 8, "https://") != 0) {
+        return url;
+    }
+    const auto scheme = u.find("://");
+    if (scheme == std::string::npos) {
+        return url;
+    }
+    const size_t path_start = u.find_first_of("/?#", scheme + 3);
+    if (path_start == std::string::npos || u[path_start] != '/') {
+        return url;
+    }
+    const size_t path_end = u.find_first_of("?#", path_start);
+    const size_t end = path_end == std::string::npos ? u.size() : path_end;
+    return prefix + u.substr(0, path_start) + normalizeUrlPath(u.substr(path_start, end - path_start)) +
+           u.substr(end);
+}
+
 // Same join FFmpeg 6.1.1 ff_make_absolute_url uses for playlist refs:
 // scheme-bearing and // refs win, a leading / replaces the path, else
 // the ref is appended after the last slash of the base (query stripped).
+// http(s) results then drop . / .. like ff_make_absolute_url2.
 std::string resolvePlaylistUrl(const std::string& base, const std::string& ref) {
     const std::string rel = trimCopy(ref);
     if (rel.empty()) {
         return {};
     }
+    std::string out;
     if (urlHasScheme(rel)) {
-        return rel;
-    }
-    if (rel.compare(0, 2, "//") == 0) {
+        out = rel;
+    } else if (rel.compare(0, 2, "//") == 0) {
         const auto colon = base.find(':');
         if (colon != std::string::npos) {
-            return base.substr(0, colon + 1) + rel;
+            out = base.substr(0, colon + 1) + rel;
+        } else {
+            out = rel;
         }
-        return rel;
-    }
-    std::string root = stripUrlQuery(base);
-    if (!rel.empty() && rel[0] == '/') {
-        const auto scheme = root.find("://");
-        if (scheme == std::string::npos) {
-            return rel;
+    } else {
+        std::string root = stripUrlQuery(base);
+        if (!rel.empty() && rel[0] == '/') {
+            const auto scheme = root.find("://");
+            if (scheme == std::string::npos) {
+                out = rel;
+            } else {
+                const auto path = root.find('/', scheme + 3);
+                out = path == std::string::npos ? root + rel : root.substr(0, path) + rel;
+            }
+        } else {
+            const auto slash = root.rfind('/');
+            out = slash == std::string::npos ? rel : root.substr(0, slash + 1) + rel;
         }
-        const auto path = root.find('/', scheme + 3);
-        if (path == std::string::npos) {
-            return root + rel;
-        }
-        return root.substr(0, path) + rel;
     }
-    const auto slash = root.rfind('/');
-    if (slash == std::string::npos) {
-        return rel;
-    }
-    return root.substr(0, slash + 1) + rel;
+    return normalizeHttpUrl(out);
 }
 
 void stripUtf8Bom(std::string* text) {
@@ -511,13 +594,15 @@ bool firstLineIsExtm3u(const std::string& text) {
     return trimCopy(line).compare(0, 7, "#EXTM3U") == 0;
 }
 
+std::string stripUrlFragment(const std::string& url) {
+    const auto cut = url.find('#');
+    return cut == std::string::npos ? url : url.substr(0, cut);
+}
+
+// FFmpeg fetches the exact playlist URL, including the query. A different
+// query is a different playlist (master.m3u8?x=1 can be ID3 media).
 bool samePlaylistUrl(const std::string& a, const std::string& b) {
-    if (a == b) {
-        return true;
-    }
-    const std::string sa = stripUrlQuery(a);
-    const std::string sb = stripUrlQuery(b);
-    return !sa.empty() && sa == sb;
+    return stripUrlFragment(normalizeHttpUrl(a)) == stripUrlFragment(normalizeHttpUrl(b));
 }
 
 bool urlAlreadyVisited(const std::vector<std::string>& seen, const std::string& url) {
@@ -546,13 +631,18 @@ bool mimeLooksMpegurl(const std::string& mime) {
     return av_stristr(mime.c_str(), "mpegurl") != nullptr;
 }
 
-bool bodyLooksLikeMediaSegment(const std::string& body) {
-    if (body.size() >= 376 && static_cast<unsigned char>(body[0]) == 0x47 &&
-        static_cast<unsigned char>(body[188]) == 0x47 &&
-        static_cast<unsigned char>(body[376]) == 0x47) {
-        return true;
-    }
+bool bodyLooksLikeMpegTs(const std::string& body) {
+    return body.size() >= 376 && static_cast<unsigned char>(body[0]) == 0x47 &&
+           static_cast<unsigned char>(body[188]) == 0x47 &&
+           static_cast<unsigned char>(body[376]) == 0x47;
+}
+
+bool bodyLooksLikeFtyp(const std::string& body) {
     return body.size() >= 8 && body.compare(4, 4, "ftyp") == 0;
+}
+
+bool bodyLooksLikeMediaSegment(const std::string& body) {
+    return bodyLooksLikeMpegTs(body) || bodyLooksLikeFtyp(body);
 }
 
 bool bodyStartsWithId3At(const std::string& body, size_t off) {
@@ -585,11 +675,13 @@ bool containsIgnoreCase(const char* hay, size_t hay_n, const char* needle, size_
 }
 
 bool id3FrameCompressedOrEncrypted(int ver, unsigned char flags2) {
-    if (ver == 3) {
-        return (flags2 & 0x80) != 0 || (flags2 & 0x40) != 0;
-    }
-    if (ver == 4) {
-        return (flags2 & 0x08) != 0 || (flags2 & 0x04) != 0;
+    // ID3v2.3 format flags are 0x80 compress / 0x40 encrypt. FFmpeg 6.1.1
+    // still tests ID3v2_FLAG_COMPRESSION (0x0008) and ENCRYPTION (0x0004)
+    // on the 16-bit v2.3 frame flags, so 0x08 + zlib is inflated. Treat
+    // both encodings, and any other version, as uncertain.
+    if (ver == 3 || ver == 4) {
+        return (flags2 & 0x80) != 0 || (flags2 & 0x40) != 0 || (flags2 & 0x08) != 0 ||
+               (flags2 & 0x04) != 0;
     }
     return true;
 }
@@ -792,14 +884,30 @@ bool playlistWouldNestedId3Probe(const PlaylistPreview& prev, const std::string&
         seen->push_back(url);
     }
     const std::string base = !prev.final_url.empty() ? prev.final_url : url;
+    // Opening this playlist as a variant runs the nested probe if it
+    // names TYPE=AUDIO. Depth 0 already rewrote those masters.
+    if (hlsMasterHasExternalAudio(prev.body)) {
+        return true;
+    }
     const std::vector<HlsSegmentRef> segs = hlsMediaSegments(prev.body);
     // Depth 0 is the URL we would open: check every EXTINF (live ID3 can
-    // sit on a later segment). STREAM-INF variants only need the first
-    // segment — FFmpeg already probes those early, and fetching a later
-    // segment of the unused variant breaks dual-variant selection.
-    const size_t ncheck = segs.empty() ? 0 : (depth == 0 ? segs.size() : 1);
-    for (size_t i = 0; i < ncheck; ++i) {
-        if (segmentMayBeId3Timestamped(segs[i], base, allow_local, cb)) {
+    // sit on a later segment). VOD STREAM-INF variants only need the
+    // first segment — fetching a later segment of the unused variant
+    // breaks dual-variant selection. Live variants start at
+    // live_start_index (-3), not segment 0.
+    if (!segs.empty()) {
+        if (depth == 0) {
+            for (size_t i = 0; i < segs.size(); ++i) {
+                if (segmentMayBeId3Timestamped(segs[i], base, allow_local, cb)) {
+                    return true;
+                }
+            }
+        } else if (hlsPlaylistHasEndlist(prev.body)) {
+            if (segmentMayBeId3Timestamped(segs[0], base, allow_local, cb)) {
+                return true;
+            }
+        } else if (segmentMayBeId3Timestamped(segs[hlsLiveStartSegIndex(segs.size())], base,
+                                             allow_local, cb)) {
             return true;
         }
     }
@@ -836,10 +944,14 @@ bool playlistWouldNestedId3Probe(const PlaylistPreview& prev, const std::string&
 // refuse rather than falling through to an uncapped open.
 //
 // Returns false if avformat_open_input must not run on the current URL.
-bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AVIOInterruptCB* cb) {
+// When a remote peek accepted a TS/`ftyp` body, forced_fmt pins the
+// demuxer so a later GET of that URL cannot ride as HLS.
+bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AVIOInterruptCB* cb,
+                                          const AVInputFormat** forced_fmt) {
     if (url == nullptr || url->empty()) {
         return true;
     }
+    *url = normalizeHttpUrl(*url);
     constexpr int kMaxRewrites = 8;
     std::vector<std::string> seen;
     seen.reserve(static_cast<size_t>(kMaxRewrites) + 1);
@@ -860,10 +972,32 @@ bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AV
             seen.push_back(resolved);
             continue;
         }
-        // Bytes then error (short read + RST, TLS close, empty after
-        // error): the next avformat_open_input can still get a master.
-        if (prev.read_error ||
-            (urlIsRemoteHttp(*url) && (prev.open_error || prev.body.empty()))) {
+        // Nested master without TYPE=AUDIO on this playlist: if the
+        // first STREAM-INF is itself an audio-group master, recurse
+        // the same way as opening that master.
+        if (firstLineIsExtm3u(prev.body)) {
+            const std::string rel = firstHlsStreamInfUri(prev.body);
+            if (!rel.empty()) {
+                const std::string base = !prev.final_url.empty() ? prev.final_url : *url;
+                const std::string resolved = resolvePlaylistUrl(base, rel);
+                if (!resolved.empty() && !urlAlreadyVisited(seen, resolved)) {
+                    const PlaylistPreview inner = readHlsPlaylistPreview(resolved, allow_local, cb);
+                    if (!inner.open_error && hlsMasterHasExternalAudio(inner.body)) {
+                        *url = resolved;
+                        seen.push_back(resolved);
+                        continue;
+                    }
+                }
+            }
+        }
+        // Bytes then error on a non-segment URL (short read + RST, TLS
+        // close, empty after error): the next open can still get a
+        // master. A remote .ts/.mp4 stall or drip is not in that class.
+        const bool remote_media = urlIsRemoteHttp(*url) && urlLooksLikeMediaSegment(*url) &&
+                                  !firstLineIsExtm3u(prev.body) && !prev.mpegurl;
+        if ((prev.read_error ||
+             (urlIsRemoteHttp(*url) && (prev.open_error || prev.body.empty()))) &&
+            !remote_media) {
             return false;
         }
         if (firstLineIsExtm3u(prev.body) || prev.mpegurl) {
@@ -874,11 +1008,24 @@ bool preferFirstHlsVariantIfExternalAudio(std::string* url, bool allow_local, AV
         }
         // Remote non-#EXTM3U: a finished TS/`ftyp` body on an
         // extensionless / playlist URL must not clear a later GET of
-        // the same URL (that GET can be an audio-group master). A
-        // path that already looks like a media segment can proceed.
+        // the same URL (that GET can be a master). A path that already
+        // looks like a media segment can proceed; pin the demuxer so a
+        // later playlist cannot ride the URL (hole 6).
         if (urlIsRemoteHttp(*url)) {
-            return urlLooksLikeMediaSegment(*url) && !prev.read_error &&
-                   bodyLooksLikeMediaSegment(prev.body);
+            if (!urlLooksLikeMediaSegment(*url)) {
+                return false;
+            }
+            if (forced_fmt != nullptr) {
+                if (bodyLooksLikeFtyp(prev.body) || endsWithIgnoreCase(stripUrlQuery(*url), ".mp4") ||
+                    endsWithIgnoreCase(stripUrlQuery(*url), ".m4s") ||
+                    endsWithIgnoreCase(stripUrlQuery(*url), ".m4v") ||
+                    endsWithIgnoreCase(stripUrlQuery(*url), ".mov")) {
+                    *forced_fmt = av_find_input_format("mp4");
+                } else {
+                    *forced_fmt = av_find_input_format("mpegts");
+                }
+            }
+            return true;
         }
         return true;
     }
@@ -1180,12 +1327,13 @@ bool FfmpegDecoder::open(const std::string& url) {
     // no safe video playlist, or when the first segment would set
     // is_id3_timestamped, so the nested probe never runs uncapped.
     std::string open_url = url_;
+    const AVInputFormat* forced_fmt = nullptr;
     if (!preferFirstHlsVariantIfExternalAudio(&open_url, allow_local_file_,
-                                             &fmt_->interrupt_callback)) {
+                                             &fmt_->interrupt_callback, &forced_fmt)) {
         av_dict_free(&opts);
         return failOpen("HLS playlist would run an uncapped nested probe", AVERROR(EINVAL));
     }
-    const int open_rc = avformat_open_input(&fmt_, open_url.c_str(), nullptr, &opts);
+    const int open_rc = avformat_open_input(&fmt_, open_url.c_str(), forced_fmt, &opts);
     av_dict_free(&opts);
     if (open_rc < 0) {
         fmt_ = nullptr;

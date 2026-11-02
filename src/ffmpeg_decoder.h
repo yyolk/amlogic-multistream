@@ -66,13 +66,16 @@ public:
     // master). Playlist lines end on \\n / \\r / \\0 like ff_get_line
     // and are capped at 4095 bytes, then chomped like ff_get_chomp_line.
     // Quoted values drop a final backslash. Any TYPE=AUDIO tag (URI=
-    // or in-band) is rewritten or refused. A media playlist whose
+    // or in-band) is rewritten or refused, including a nested master
+    // whose outer playlist has no AUDIO tag. A media playlist whose
     // segments cannot be proven free of ID3 transportStreamTimestamp
     // (any EXTINF, BYTERANGE, AES-128, uppercase owner, later ID3
-    // tag, compressed PRIV, or a tag past the peek window) is refused.
-    // Every STREAM-INF, including nested masters, is checked. A
-    // finished remote TS/`ftyp` peek is not enough to open that URL
-    // again (the next GET can be a master). A truncated #EXTM3U, a
+    // tag, compressed PRIV including ID3v2.3 flag 0x08, a tag past
+    // the peek window, or the live_start_index segment of a live
+    // STREAM-INF) is refused. Playlist refs keep their query string
+    // and http(s) paths drop . / .. like ff_make_absolute_url2. A
+    // finished remote TS/`ftyp` peek pins mpegts/mp4 so a later GET
+    // of that URL cannot ride as a master. A truncated #EXTM3U, a
     // peek that errors after any bytes, mpegurl that is not #EXTM3U,
     // or a non-playlist http(s) decoy is refused rather than opened
     // uncapped (AUDIT12 D4).

@@ -212,6 +212,16 @@ std::string id3v23Tit2Tag() {
     return id3v23Tag(id3v23Frame("TIT2", std::string("\x00en", 3) + "decoy"));
 }
 
+std::string id3v23ZlibPrivFlag08() {
+    static const unsigned char z[] = {
+        0x78, 0x9c, 0x4b, 0xce, 0xcf, 0xd5, 0x4b, 0x2c, 0x28, 0xc8, 0x49, 0xd5, 0x2b, 0x2e,
+        0x29, 0x4a, 0x4d, 0xcc, 0xcd, 0xcc, 0x4b, 0xd7, 0x2b, 0x29, 0x4a, 0xcc, 0x2b, 0x2e,
+        0xc8, 0x2f, 0x2a, 0x09, 0x06, 0x0b, 0x85, 0x64, 0xe6, 0xa6, 0x16, 0x97, 0x24, 0xe6,
+        0x16, 0x30, 0x80, 0x01, 0x63, 0xfc, 0x04, 0x00, 0x27, 0xd6, 0x12, 0xa3};
+    return id3v23Tag(id3v23Frame("PRIV",
+                                 std::string(reinterpret_cast<const char*>(z), sizeof(z)), 0x08));
+}
+
 void sendAll(int fd, const char* data, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -248,7 +258,7 @@ std::string readRequest(int fd) {
     return data;
 }
 
-std::string requestPath(const std::string& headers) {
+std::string requestRawUrl(const std::string& headers) {
     const auto lineEnd = headers.find("\r\n");
     const std::string line = headers.substr(0, lineEnd == std::string::npos ? headers.size() : lineEnd);
     if (line.compare(0, 4, "GET ") != 0) {
@@ -258,7 +268,11 @@ std::string requestPath(const std::string& headers) {
     if (sp == std::string::npos) {
         return {};
     }
-    std::string url = line.substr(4, sp - 4);
+    return line.substr(4, sp - 4);
+}
+
+std::string requestPath(const std::string& headers) {
+    std::string url = requestRawUrl(headers);
     const auto query = url.find('?');
     if (query != std::string::npos) {
         url.resize(query);
@@ -338,7 +352,32 @@ struct LocalHttp {
             }
             _exit(0);
         }
-        const std::string path = requestPath(readRequest(client));
+        const std::string headers = readRequest(client);
+        const std::string rawUrl = requestRawUrl(headers);
+        const std::string path = requestPath(headers);
+        auto sendBody = [&](const std::string& payload, const char* type) {
+            std::ostringstream hdr;
+            hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << payload.size()
+                << "\r\nContent-Type: " << type << "\r\nConnection: close\r\n\r\n";
+            const std::string header = hdr.str();
+            sendAll(client, header.data(), header.size());
+            sendAll(client, payload.data(), payload.size());
+            ::close(client);
+        };
+        if (rawUrl == "/d4-query.m3u8?x=1") {
+            std::ifstream in(root / "d4-id3-media.m3u8");
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            sendBody(ss.str(), "application/vnd.apple.mpegurl");
+            continue;
+        }
+        if (rawUrl == "/dotdot/../id3/media.m3u8") {
+            std::ifstream in(root / "d4-video.m3u8");
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            sendBody(ss.str(), "application/vnd.apple.mpegurl");
+            continue;
+        }
         std::filesystem::path rel;
         bool ok = !path.empty() && path[0] == '/';
         if (ok) {
@@ -439,6 +478,43 @@ struct LocalHttp {
                 sendDecoyRst(ss.str(), "video/mp2t", 128);
                 continue;
             }
+        }
+        auto sendFlipMaster = [&]() {
+            std::ifstream in(root / "d4-master-audio.m3u8");
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            sendBody(ss.str(), "application/vnd.apple.mpegurl");
+        };
+        if (ok && (rel == "flip.ts" || rel == "flip.mp4")) {
+            static int flip_ts_hits = 0;
+            static int flip_mp4_hits = 0;
+            int* hits = rel == "flip.ts" ? &flip_ts_hits : &flip_mp4_hits;
+            if ((*hits)++ == 0) {
+                if (rel == "flip.ts") {
+                    std::ifstream in(root / "small.ts", std::ios::binary);
+                    std::ostringstream ss;
+                    ss << in.rdbuf();
+                    sendBody(ss.str(), "video/mp2t");
+                } else {
+                    sendBody(ftypPrefix(), "video/mp4");
+                }
+                continue;
+            }
+            sendFlipMaster();
+            continue;
+        }
+        if (ok && rel == "flip-hop.ts") {
+            static int flip_hop_hits = 0;
+            if (flip_hop_hits++ == 0) {
+                const char* redir =
+                    "HTTP/1.1 302 Found\r\nLocation: /small.ts\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+                sendAll(client, redir, std::char_traits<char>::length(redir));
+                ::close(client);
+                continue;
+            }
+            sendFlipMaster();
+            continue;
         }
         if (ok && (rel == "fin-sync" || rel == "fin-ftyp" || rel == "fin-small")) {
             static int fin_sync_hits = 0;
@@ -1094,6 +1170,21 @@ int main() {
                 return 1;
             }
 
+            const std::filesystem::path nestedNoAudio = tmp.path() / "d4-nested-noaudio-outer.m3u8";
+            {
+                std::ofstream outer(nestedNoAudio);
+                outer << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                      << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                      << nestedInner.filename().string() << "\n";
+            }
+            long noAudioRss = 0;
+            const int noAudioRc =
+                run({player, "--url", nestedNoAudio.string(), "--frames", "1"}, out, err, &noAudioRss);
+            if (!d4MustStayCapped("nested master without outer AUDIO", noAudioRc, noAudioRss,
+                                  readFile(out), readFile(err), true)) {
+                return 1;
+            }
+
             const std::filesystem::path spaceMaster = tmp.path() / "d4-space.m3u8";
             const std::filesystem::path lastWins = tmp.path() / "d4-lastwins.m3u8";
             const std::filesystem::path unclosed = tmp.path() / "d4-unclosed.m3u8";
@@ -1438,6 +1529,36 @@ int main() {
                 std::ofstream(tmp.path() / "d4-id3-nested-outer.m3u8")
                     << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
                     << "d4-id3-nested-inner.m3u8\n";
+                {
+                    std::ifstream in(hugeTs, std::ios::binary);
+                    std::ofstream outz(tmp.path() / "d4-id3-zlib08.ts", std::ios::binary);
+                    outz << id3v23ZlibPrivFlag08();
+                    outz << in.rdbuf();
+                }
+                std::ofstream(tmp.path() / "d4-id3-zlib08.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                    << "d4-id3-zlib08.ts\n#EXT-X-ENDLIST\n";
+                std::ofstream(tmp.path() / "d4-id3-live4.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n#EXTINF:0.040,\n"
+                    << id3HugeTs.filename().string() << "\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n";
+                std::ofstream(tmp.path() / "d4-id3-live-var.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << "d4-id3-live4.m3u8\n";
+                std::ofstream(tmp.path() / "d4-query.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << "d4-query.m3u8?x=1\n";
+                std::filesystem::create_directories(tmp.path() / "dotdot");
+                std::filesystem::create_directories(tmp.path() / "id3");
+                std::ofstream(tmp.path() / "dotdot" / "master.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << "../id3/media.m3u8\n";
+                std::ifstream id3src(id3Media);
+                std::ofstream(tmp.path() / "id3" / "media.m3u8") << id3src.rdbuf();
             }
             long chompRss = 0;
             const int chompRc =
@@ -1506,6 +1627,8 @@ int main() {
                 {"d4-id3-live.m3u8", "live playlist ID3 segment 1"},
                 {"d4-id3-second-var.m3u8", "second STREAM-INF ID3"},
                 {"d4-id3-nested-outer.m3u8", "nested master ID3"},
+                {"d4-id3-zlib08.m3u8", "ID3v2.3 compression flag 0x08"},
+                {"d4-id3-live-var.m3u8", "live STREAM-INF ID3 live_start_index"},
             };
             for (const auto& extra : id3Extra) {
                 long extraRss = 0;
@@ -1732,8 +1855,52 @@ int main() {
             const int finSmallRc =
                 run({player, "--url", httpBase + "/fin-small", "--frames", "1"}, out, err,
                     &finSmallRss);
-            d4http.stop();
             if (!d4MustStayCapped("finished small TS exact-CL then master", finSmallRc, finSmallRss,
+                                  readFile(out), readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long queryRss = 0;
+            const int queryRc =
+                run({player, "--url", httpBase + "/d4-query.m3u8", "--frames", "1"}, out, err,
+                    &queryRss);
+            if (!d4MustStayCapped("query-stripped STREAM-INF ID3", queryRc, queryRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long dotRss = 0;
+            const int dotRc =
+                run({player, "--url", httpBase + "/dotdot/master.m3u8", "--frames", "1"}, out, err,
+                    &dotRss);
+            if (!d4MustStayCapped("relative .. STREAM-INF ID3", dotRc, dotRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long flipTsRss = 0;
+            const int flipTsRc =
+                run({player, "--url", httpBase + "/flip.ts", "--frames", "1"}, out, err, &flipTsRss);
+            if (!d4MustStayCapped(".ts finished then master Content-Type flip", flipTsRc, flipTsRss,
+                                  readFile(out), readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long flipMp4Rss = 0;
+            const int flipMp4Rc =
+                run({player, "--url", httpBase + "/flip.mp4", "--frames", "1"}, out, err,
+                    &flipMp4Rss);
+            if (!d4MustStayCapped(".mp4 ftyp then master Content-Type flip", flipMp4Rc, flipMp4Rss,
+                                  readFile(out), readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long flipHopRss = 0;
+            const int flipHopRc =
+                run({player, "--url", httpBase + "/flip-hop.ts", "--frames", "1"}, out, err,
+                    &flipHopRss);
+            d4http.stop();
+            if (!d4MustStayCapped(".ts 302 finished TS then master", flipHopRc, flipHopRss,
                                   readFile(out), readFile(err), false)) {
                 return 1;
             }

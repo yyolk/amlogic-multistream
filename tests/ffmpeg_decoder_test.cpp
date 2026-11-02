@@ -276,7 +276,7 @@ std::string readRequest(int fd) {
     return data;
 }
 
-std::string requestPath(const std::string& headers) {
+std::string requestRawUrl(const std::string& headers) {
     const auto line_end = headers.find("\r\n");
     const std::string line = headers.substr(0, line_end == std::string::npos ? headers.size() : line_end);
     if (!startsWith(line, "GET ")) {
@@ -287,14 +287,19 @@ std::string requestPath(const std::string& headers) {
         return {};
     }
     std::string url = line.substr(4, sp - 4);
-    const auto query = url.find('?');
-    if (query != std::string::npos) {
-        url = url.substr(0, query);
-    }
     const auto scheme = url.find("://");
     if (scheme != std::string::npos) {
         const auto slash = url.find('/', scheme + 3);
         url = slash == std::string::npos ? "/" : url.substr(slash);
+    }
+    return url;
+}
+
+std::string requestPath(const std::string& headers) {
+    std::string url = requestRawUrl(headers);
+    const auto query = url.find('?');
+    if (query != std::string::npos) {
+        url = url.substr(0, query);
     }
     return url;
 }
@@ -379,9 +384,28 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
             _exit(0);
         }
         const std::string headers = readRequest(client);
+        const std::string rawUrl = requestRawUrl(headers);
         const std::string url = requestPath(headers);
-        if (!url.empty()) {
-            appendLog(log_path, url);
+        if (!rawUrl.empty()) {
+            appendLog(log_path, rawUrl);
+        }
+        auto sendBody = [&](const std::string& payload, const char* type) {
+            sendResponse(client, 200, payload, type);
+            ::close(client);
+        };
+        if (rawUrl == "/d4-query.m3u8?x=1") {
+            std::ifstream in(root / "d4-id3-media.m3u8");
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            sendBody(ss.str(), "application/vnd.apple.mpegurl");
+            continue;
+        }
+        if (rawUrl == "/dotdot/../id3/media.m3u8") {
+            std::ifstream in(root / "d4-video.m3u8");
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            sendBody(ss.str(), "application/vnd.apple.mpegurl");
+            continue;
         }
         std::filesystem::path rel;
         std::string body;
@@ -470,6 +494,45 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
                 sendDecoyRst(ss.str(), "video/mp2t", 128);
                 continue;
             }
+        }
+        auto sendFlipMaster = [&]() {
+            std::ifstream in(root / "d4-master-audio.m3u8");
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            sendResponse(client, 200, ss.str(), "application/vnd.apple.mpegurl");
+            ::close(client);
+        };
+        if (ok && (rel == "flip.ts" || rel == "flip.mp4")) {
+            static int flip_ts_hits = 0;
+            static int flip_mp4_hits = 0;
+            int* hits = rel == "flip.ts" ? &flip_ts_hits : &flip_mp4_hits;
+            if ((*hits)++ == 0) {
+                if (rel == "flip.ts") {
+                    std::ifstream in(root / "small-pmt.ts", std::ios::binary);
+                    std::ostringstream ss;
+                    ss << in.rdbuf();
+                    sendResponse(client, 200, ss.str(), "video/mp2t");
+                } else {
+                    sendResponse(client, 200, ftypPrefix(), "video/mp4");
+                }
+                ::close(client);
+                continue;
+            }
+            sendFlipMaster();
+            continue;
+        }
+        if (ok && rel == "flip-hop.ts") {
+            static int flip_hop_hits = 0;
+            if (flip_hop_hits++ == 0) {
+                const char* redir =
+                    "HTTP/1.1 302 Found\r\nLocation: /small-pmt.ts\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+                sendAll(client, redir, std::char_traits<char>::length(redir));
+                ::close(client);
+                continue;
+            }
+            sendFlipMaster();
+            continue;
         }
         if (ok && (rel == "fin-sync" || rel == "fin-ftyp" || rel == "fin-small")) {
             static int fin_sync_hits = 0;
@@ -1085,6 +1148,19 @@ std::string id3v23Tit2Tag() {
     return id3v23Tag(id3v23Frame("TIT2", std::string("\x00en", 3) + "decoy"));
 }
 
+// ID3v2.3 PRIV with FFmpeg ID3v2_FLAG_COMPRESSION (0x08) and a real zlib
+// payload of transportStreamTimestamp. The v2.3 spec uses 0x80; FFmpeg
+// still inflates 0x08 on v2.3.
+std::string id3v23ZlibPrivFlag08() {
+    static const unsigned char z[] = {
+        0x78, 0x9c, 0x4b, 0xce, 0xcf, 0xd5, 0x4b, 0x2c, 0x28, 0xc8, 0x49, 0xd5, 0x2b, 0x2e,
+        0x29, 0x4a, 0x4d, 0xcc, 0xcd, 0xcc, 0x4b, 0xd7, 0x2b, 0x29, 0x4a, 0xcc, 0x2b, 0x2e,
+        0xc8, 0x2f, 0x2a, 0x09, 0x06, 0x0b, 0x85, 0x64, 0xe6, 0xa6, 0x16, 0x97, 0x24, 0xe6,
+        0x16, 0x30, 0x80, 0x01, 0x63, 0xfc, 0x04, 0x00, 0x27, 0xd6, 0x12, 0xa3};
+    return id3v23Tag(id3v23Frame("PRIV",
+                                 std::string(reinterpret_cast<const char*>(z), sizeof(z)), 0x08));
+}
+
 bool writePrefixed(const std::filesystem::path& src, const std::filesystem::path& dst,
                    const std::string& prefix) {
     std::ifstream in(src, std::ios::binary);
@@ -1632,6 +1708,41 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         refuseOpen(dir / "d4-id3-nested-outer.m3u8");
     }
 
+    g_case = "hls nested master without outer AUDIO presents small stream";
+    {
+        std::ofstream outer(dir / "d4-nested-noaudio-outer.m3u8");
+        outer << "#EXTM3U\n#EXT-X-VERSION:4\n"
+              << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+              << d4inner.filename().string() << "\n";
+        outer.close();
+        testDecode((dir / "d4-nested-noaudio-outer.m3u8").string());
+    }
+
+    g_case = "hls live STREAM-INF ID3 at live_start_index refuses";
+    {
+        std::ofstream live(dir / "d4-id3-live4.m3u8");
+        live << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+             << "#EXT-X-MEDIA-SEQUENCE:0\n"
+             << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+             << "#EXTINF:0.040,\n" << d4id3ts.filename().string() << "\n"
+             << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+             << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n";
+        live.close();
+        std::ofstream master(dir / "d4-id3-live-var.m3u8");
+        master << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+               << "d4-id3-live4.m3u8\n";
+        master.close();
+        refuseOpen(dir / "d4-id3-live-var.m3u8");
+    }
+
+    g_case = "hls ID3v2.3 compression flag 0x08 refuses";
+    {
+        const auto ts = dir / "d4-id3-zlib08.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23ZlibPrivFlag08()));
+        writeMediaPlaylist(dir / "d4-id3-zlib08.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-zlib08.m3u8");
+    }
+
     {
         std::ifstream src(d4master);
         std::ofstream(dir / "failpeek.m3u8") << src.rdbuf();
@@ -1761,6 +1872,39 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         FfmpegDecoder finsmall;
         CHECK(!finsmall.open(httpBase + "/fin-small"));
         finsmall.close();
+
+        {
+            std::ofstream query(dir / "d4-query.m3u8");
+            query << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                  << "d4-query.m3u8?x=1\n";
+            std::filesystem::create_directories(dir / "dotdot");
+            std::filesystem::create_directories(dir / "id3");
+            std::ofstream(dir / "dotdot" / "master.m3u8")
+                << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                << "../id3/media.m3u8\n";
+            std::ifstream id3src(d4id3media);
+            std::ofstream(dir / "id3" / "media.m3u8") << id3src.rdbuf();
+        }
+        g_case = "hls query-stripped STREAM-INF ID3 refuses";
+        FfmpegDecoder qurl;
+        CHECK(!qurl.open(httpBase + "/d4-query.m3u8"));
+        qurl.close();
+        g_case = "hls relative .. STREAM-INF ID3 refuses";
+        FfmpegDecoder dotdot;
+        CHECK(!dotdot.open(httpBase + "/dotdot/master.m3u8"));
+        dotdot.close();
+        g_case = "hls .ts finished then master Content-Type flip refuses";
+        FfmpegDecoder flipts;
+        CHECK(!flipts.open(httpBase + "/flip.ts"));
+        flipts.close();
+        g_case = "hls .mp4 ftyp then master Content-Type flip refuses";
+        FfmpegDecoder flipmp4;
+        CHECK(!flipmp4.open(httpBase + "/flip.mp4"));
+        flipmp4.close();
+        g_case = "hls .ts 302 finished TS then master refuses";
+        FfmpegDecoder fliphop;
+        CHECK(!fliphop.open(httpBase + "/flip-hop.ts"));
+        fliphop.close();
     }
     server.stop();
 }
