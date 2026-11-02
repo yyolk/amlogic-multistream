@@ -70,9 +70,12 @@ public:
     // whose outer playlist has no AUDIO tag. A media playlist whose
     // segments cannot be proven free of ID3 transportStreamTimestamp
     // (any EXTINF, BYTERANGE, AES-128, uppercase owner, later ID3
-    // tag, compressed PRIV including ID3v2.3 flag 0x08, a tag past
-    // the peek window, or the live_start_index segment of a live
-    // STREAM-INF) is refused. Playlist refs keep their query string
+    // tag, compressed PRIV including ID3v2.3 flag 0x08, a tag with a
+    // non-zero header flag (extended header 0x40), a tag past the
+    // peek window, the live_start_index segment of a live STREAM-INF,
+    // EXT-X-MEDIA TYPE=VIDEO URIs, or a live multi-variant
+    // highest_cur_seq_no bump) is refused. Segment URIs keep leading
+    // whitespace. Playlist refs keep their query string
     // and http(s) paths drop . / .. like ff_make_absolute_url2. A
     // finished remote TS/`ftyp` peek pins mpegts/mp4 so a later GET
     // of that URL cannot ride as a master. A truncated #EXTM3U, a

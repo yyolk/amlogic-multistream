@@ -337,18 +337,19 @@ std::string firstHlsUriAfterTag(const std::string& text, const char* tag, size_t
     std::string line;
     bool want_uri = false;
     while (hlsNextLine(text, &pos, &line)) {
-        const std::string trimmed = trimCopy(line);
-        if (trimmed.empty()) {
+        if (line.empty()) {
             continue;
         }
-        if (trimmed[0] == '#') {
-            if (trimmed.compare(0, tag_len, tag) == 0) {
+        if (line[0] == '#') {
+            if (line.compare(0, tag_len, tag) == 0) {
                 want_uri = true;
             }
             continue;
         }
         if (want_uri) {
-            return trimmed;
+            // ff_get_chomp_line only strips trailing whitespace. A
+            // leading space is part of the URI FFmpeg fetches.
+            return line;
         }
     }
     return {};
@@ -364,19 +365,38 @@ std::vector<std::string> allHlsStreamInfUris(const std::string& text) {
     std::string line;
     bool want_uri = false;
     while (hlsNextLine(text, &pos, &line)) {
-        const std::string trimmed = trimCopy(line);
-        if (trimmed.empty()) {
+        if (line.empty()) {
             continue;
         }
-        if (trimmed[0] == '#') {
-            if (trimmed.compare(0, 18, "#EXT-X-STREAM-INF:") == 0) {
+        if (line[0] == '#') {
+            if (line.compare(0, 18, "#EXT-X-STREAM-INF:") == 0) {
                 want_uri = true;
             }
             continue;
         }
         if (want_uri) {
-            out.push_back(trimmed);
+            out.push_back(line);
             want_uri = false;
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> allHlsOpenedMediaUris(const std::string& text) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    std::string line;
+    while (hlsNextLine(text, &pos, &line)) {
+        if (line.compare(0, 13, "#EXT-X-MEDIA:") != 0) {
+            continue;
+        }
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        const HlsMediaAttrs attrs = parseHlsMediaAttrs(line.substr(colon));
+        if ((attrs.type == "VIDEO" || attrs.type == "AUDIO") && !attrs.uri.empty()) {
+            out.push_back(attrs.uri);
         }
     }
     return out;
@@ -426,21 +446,20 @@ std::vector<HlsSegmentRef> hlsMediaSegments(const std::string& text) {
     int64_t range_off = 0;
     int64_t implicit_off = 0;
     while (hlsNextLine(text, &pos, &line)) {
-        const std::string trimmed = trimCopy(line);
-        if (trimmed.empty()) {
+        if (line.empty()) {
             continue;
         }
-        if (trimmed.compare(0, 11, "#EXT-X-KEY:") == 0) {
-            const HlsMediaAttrs attrs = parseHlsMediaAttrs(trimmed.substr(10));
+        if (line.compare(0, 11, "#EXT-X-KEY:") == 0) {
+            const HlsMediaAttrs attrs = parseHlsMediaAttrs(line.substr(10));
             encrypted = !attrs.method.empty() && attrs.method != "NONE";
             continue;
         }
-        if (trimmed.compare(0, 17, "#EXT-X-BYTERANGE:") == 0) {
-            have_range = parseHlsByteRange(trimmed.substr(17), &range_len, &range_has_off, &range_off);
+        if (line.compare(0, 17, "#EXT-X-BYTERANGE:") == 0) {
+            have_range = parseHlsByteRange(line.substr(17), &range_len, &range_has_off, &range_off);
             continue;
         }
-        if (trimmed[0] == '#') {
-            if (trimmed.compare(0, 8, "#EXTINF:") == 0) {
+        if (line[0] == '#') {
+            if (line.compare(0, 8, "#EXTINF:") == 0) {
                 want_uri = true;
             }
             continue;
@@ -449,7 +468,7 @@ std::vector<HlsSegmentRef> hlsMediaSegments(const std::string& text) {
             continue;
         }
         HlsSegmentRef ref;
-        ref.uri = trimmed;
+        ref.uri = line;
         ref.encrypted = encrypted;
         if (have_range) {
             ref.byte_length = range_len;
@@ -545,7 +564,11 @@ std::string normalizeHttpUrl(const std::string& url) {
 // the ref is appended after the last slash of the base (query stripped).
 // http(s) results then drop . / .. like ff_make_absolute_url2.
 std::string resolvePlaylistUrl(const std::string& base, const std::string& ref) {
-    const std::string rel = trimCopy(ref);
+    // Keep leading whitespace: FFmpeg fetches " video.ts" as %20video.ts.
+    std::string rel = ref;
+    while (!rel.empty() && std::isspace(static_cast<unsigned char>(rel.back()))) {
+        rel.pop_back();
+    }
     if (rel.empty()) {
         return {};
     }
@@ -701,9 +724,17 @@ bool bodyMayBeId3Timestamped(const std::string& body) {
             return true;
         }
         const int ver = p[off + 3];
+        const unsigned char tag_flags = p[off + 5];
         const uint32_t tag_size = id3Synchsafe32(p + off + 6);
         const size_t tag_end = off + 10 + static_cast<size_t>(tag_size);
         if (tag_end > body.size()) {
+            return true;
+        }
+        // v2.3 0x40 is an extended header. The size field starts with
+        // 0x00, which the frame walk treated as padding and skipped a
+        // later zlib PRIV. Unsync / experimental flags are also
+        // uncertain. Refuse any non-zero tag flag.
+        if (ver >= 3 && tag_flags != 0) {
             return true;
         }
         if (containsIgnoreCase(body.data() + off, tag_end - off, kHlsId3TimestampOwner,
@@ -894,7 +925,9 @@ bool playlistWouldNestedId3Probe(const PlaylistPreview& prev, const std::string&
     // sit on a later segment). VOD STREAM-INF variants only need the
     // first segment — fetching a later segment of the unused variant
     // breaks dual-variant selection. Live variants start at
-    // live_start_index (-3), not segment 0.
+    // live_start_index (-3), not segment 0. Two or more live siblings
+    // are aligned with highest_cur_seq_no; check every live segment
+    // rather than miss the bumped index.
     if (!segs.empty()) {
         if (depth == 0) {
             for (size_t i = 0; i < segs.size(); ++i) {
@@ -911,7 +944,18 @@ bool playlistWouldNestedId3Probe(const PlaylistPreview& prev, const std::string&
             return true;
         }
     }
-    const std::vector<std::string> variants = allHlsStreamInfUris(prev.body);
+    std::vector<std::string> variants = allHlsStreamInfUris(prev.body);
+    const std::vector<std::string> media_uris = allHlsOpenedMediaUris(prev.body);
+    variants.insert(variants.end(), media_uris.begin(), media_uris.end());
+
+    struct InnerVar {
+        std::string resolved;
+        PlaylistPreview prev;
+        bool live = false;
+    };
+    std::vector<InnerVar> inners;
+    inners.reserve(variants.size());
+    int live_siblings = 0;
     for (const std::string& rel : variants) {
         const std::string resolved = resolvePlaylistUrl(base, rel);
         if (resolved.empty() || samePlaylistUrl(resolved, url) ||
@@ -922,7 +966,34 @@ bool playlistWouldNestedId3Probe(const PlaylistPreview& prev, const std::string&
         if (inner.open_error || inner.body.empty()) {
             return true;
         }
-        if (playlistWouldNestedId3Probe(inner, resolved, allow_local, cb, depth + 1, seen)) {
+        if (bodyMayBeId3Timestamped(inner.body)) {
+            return true;
+        }
+        InnerVar v;
+        v.resolved = resolved;
+        v.prev = inner;
+        const std::vector<HlsSegmentRef> inner_segs = hlsMediaSegments(inner.body);
+        v.live = !inner_segs.empty() && !hlsPlaylistHasEndlist(inner.body);
+        if (v.live) {
+            ++live_siblings;
+        }
+        inners.push_back(std::move(v));
+    }
+    for (InnerVar& v : inners) {
+        if (v.live && live_siblings >= 2) {
+            const std::vector<HlsSegmentRef> inner_segs = hlsMediaSegments(v.prev.body);
+            // highest_cur_seq_no can bump a live sibling onto a later
+            // segment (ID3 on the shorter playlist's index 2). Check
+            // every live segment when more than one live variant exists.
+            for (size_t i = 0; i < inner_segs.size(); ++i) {
+                if (segmentMayBeId3Timestamped(inner_segs[i], !v.prev.final_url.empty() ? v.prev.final_url
+                                                                                       : v.resolved,
+                                             allow_local, cb)) {
+                    return true;
+                }
+            }
+        }
+        if (playlistWouldNestedId3Probe(v.prev, v.resolved, allow_local, cb, depth + 1, seen)) {
             return true;
         }
     }

@@ -222,6 +222,24 @@ std::string id3v23ZlibPrivFlag08() {
                                  std::string(reinterpret_cast<const char*>(z), sizeof(z)), 0x08));
 }
 
+std::string id3v23ExtHdrZlibPriv() {
+    static const unsigned char z[] = {
+        0x78, 0x9c, 0x4b, 0xce, 0xcf, 0xd5, 0x4b, 0x2c, 0x28, 0xc8, 0x49, 0xd5, 0x2b, 0x2e,
+        0x29, 0x4a, 0x4d, 0xcc, 0xcd, 0xcc, 0x4b, 0xd7, 0x2b, 0x29, 0x4a, 0xcc, 0x2b, 0x2e,
+        0xc8, 0x2f, 0x2a, 0x09, 0x06, 0x0b, 0x85, 0x64, 0xe6, 0xa6, 0x16, 0x97, 0x24, 0xe6,
+        0x16, 0x30, 0x80, 0x01, 0x63, 0xfc, 0x04, 0x00, 0x27, 0xd6, 0x12, 0xa3};
+    const std::string frames = id3v23Frame(
+        "PRIV", std::string(reinterpret_cast<const char*>(z), sizeof(z)), 0x08);
+    std::string ext(10, '\0');
+    ext[3] = 6;
+    std::string tag = "ID3";
+    tag.push_back(3);
+    tag.push_back(0);
+    tag.push_back(0x40);
+    tag += id3Synchsafe(static_cast<uint32_t>(ext.size() + frames.size()));
+    return tag + ext + frames;
+}
+
 void sendAll(int fd, const char* data, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -1559,6 +1577,57 @@ int main() {
                     << "../id3/media.m3u8\n";
                 std::ifstream id3src(id3Media);
                 std::ofstream(tmp.path() / "id3" / "media.m3u8") << id3src.rdbuf();
+                {
+                    std::ifstream in(hugeTs, std::ios::binary);
+                    std::ofstream outx(tmp.path() / "d4-id3-exthdr.ts", std::ios::binary);
+                    outx << id3v23ExtHdrZlibPriv();
+                    outx << in.rdbuf();
+                }
+                std::ofstream(tmp.path() / "d4-id3-exthdr.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                    << "d4-id3-exthdr.ts\n#EXT-X-ENDLIST\n";
+                {
+                    std::ifstream in(hugeTs, std::ios::binary);
+                    std::ofstream outx(tmp.path() / " video.ts", std::ios::binary);
+                    outx << id3v23HlsTimestampTag();
+                    outx << in.rdbuf();
+                }
+                {
+                    std::ifstream in(smallTs, std::ios::binary);
+                    std::ofstream(tmp.path() / "video.ts", std::ios::binary) << in.rdbuf();
+                }
+                std::ofstream(tmp.path() / "d4-id3-leadws.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                    << " video.ts\n#EXT-X-ENDLIST\n";
+                std::ofstream(tmp.path() / "d4-id3-media-video.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                    << "#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"vid\",NAME=\"main\",DEFAULT=YES,URI=\""
+                    << id3Media.filename().string() << "\"\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000,VIDEO=\"vid\"\n"
+                    << videoHls.filename().string() << "\n";
+                std::ofstream(tmp.path() / "d4-id3-live5.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n";
+                std::ofstream(tmp.path() / "d4-id3-live4b.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n#EXTINF:0.040,\n"
+                    << id3HugeTs.filename().string() << "\n#EXTINF:0.400,\n"
+                    << smallTs.filename().string() << "\n";
+                std::ofstream(tmp.path() / "d4-id3-live-align.m3u8")
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=500000\n"
+                    << "d4-id3-live5.m3u8\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << "d4-id3-live4b.m3u8\n";
             }
             long chompRss = 0;
             const int chompRc =
@@ -1629,6 +1698,10 @@ int main() {
                 {"d4-id3-nested-outer.m3u8", "nested master ID3"},
                 {"d4-id3-zlib08.m3u8", "ID3v2.3 compression flag 0x08"},
                 {"d4-id3-live-var.m3u8", "live STREAM-INF ID3 live_start_index"},
+                {"d4-id3-exthdr.m3u8", "ID3v2.3 extended header 0x40"},
+                {"d4-id3-leadws.m3u8", "leading-space segment URI"},
+                {"d4-id3-media-video.m3u8", "EXT-X-MEDIA TYPE=VIDEO ID3"},
+                {"d4-id3-live-align.m3u8", "two live variants ID3 shorter index 2"},
             };
             for (const auto& extra : id3Extra) {
                 long extraRss = 0;

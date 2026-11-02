@@ -1161,6 +1161,26 @@ std::string id3v23ZlibPrivFlag08() {
                                  std::string(reinterpret_cast<const char*>(z), sizeof(z)), 0x08));
 }
 
+// Tag flag 0x40 = extended header. The 4-byte size starts with 0x00 so a
+// frame walk that ignores the flag stops before the zlib PRIV.
+std::string id3v23ExtHdrZlibPriv() {
+    static const unsigned char z[] = {
+        0x78, 0x9c, 0x4b, 0xce, 0xcf, 0xd5, 0x4b, 0x2c, 0x28, 0xc8, 0x49, 0xd5, 0x2b, 0x2e,
+        0x29, 0x4a, 0x4d, 0xcc, 0xcd, 0xcc, 0x4b, 0xd7, 0x2b, 0x29, 0x4a, 0xcc, 0x2b, 0x2e,
+        0xc8, 0x2f, 0x2a, 0x09, 0x06, 0x0b, 0x85, 0x64, 0xe6, 0xa6, 0x16, 0x97, 0x24, 0xe6,
+        0x16, 0x30, 0x80, 0x01, 0x63, 0xfc, 0x04, 0x00, 0x27, 0xd6, 0x12, 0xa3};
+    const std::string frames = id3v23Frame(
+        "PRIV", std::string(reinterpret_cast<const char*>(z), sizeof(z)), 0x08);
+    std::string ext(10, '\0');
+    ext[3] = 6;
+    std::string tag = "ID3";
+    tag.push_back(3);
+    tag.push_back(0);
+    tag.push_back(0x40);
+    tag += id3Synchsafe(static_cast<uint32_t>(ext.size() + frames.size()));
+    return tag + ext + frames;
+}
+
 bool writePrefixed(const std::filesystem::path& src, const std::filesystem::path& dst,
                    const std::string& prefix) {
     std::ifstream in(src, std::ios::binary);
@@ -1741,6 +1761,71 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         CHECK(writePrefixed(hugePmt, ts, id3v23ZlibPrivFlag08()));
         writeMediaPlaylist(dir / "d4-id3-zlib08.m3u8", ts.filename().string());
         refuseOpen(dir / "d4-id3-zlib08.m3u8");
+    }
+
+    g_case = "hls ID3v2.3 extended header 0x40 zlib PRIV refuses";
+    {
+        const auto ts = dir / "d4-id3-exthdr.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23ExtHdrZlibPriv()));
+        writeMediaPlaylist(dir / "d4-id3-exthdr.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-exthdr.m3u8");
+    }
+
+    g_case = "hls leading-space segment URI refuses";
+    {
+        const auto spaced = dir / " video.ts";
+        CHECK(writePrefixed(hugePmt, spaced, id3v23HlsTimestampTag()));
+        {
+            std::ifstream in(smallPmt, std::ios::binary);
+            std::ofstream(dir / "video.ts", std::ios::binary) << in.rdbuf();
+        }
+        std::ofstream playlist(dir / "d4-id3-leadws.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                 << " video.ts\n#EXT-X-ENDLIST\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-leadws.m3u8");
+    }
+
+    g_case = "hls EXT-X-MEDIA TYPE=VIDEO ID3 URI refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-media-video.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"vid\",NAME=\"main\",DEFAULT=YES,URI=\""
+                 << d4id3media.filename().string() << "\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,VIDEO=\"vid\"\n"
+                 << d4video.filename().string() << "\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-media-video.m3u8");
+    }
+
+    g_case = "hls two live variants ID3 on shorter index 2 refuses";
+    {
+        std::ofstream live5(dir / "d4-id3-live5.m3u8");
+        live5 << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+              << "#EXT-X-MEDIA-SEQUENCE:0\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n";
+        live5.close();
+        std::ofstream live4(dir / "d4-id3-live4b.m3u8");
+        live4 << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+              << "#EXT-X-MEDIA-SEQUENCE:0\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.040,\n" << d4id3ts.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n";
+        live4.close();
+        std::ofstream master(dir / "d4-id3-live-align.m3u8");
+        master << "#EXTM3U\n#EXT-X-VERSION:4\n"
+               << "#EXT-X-STREAM-INF:BANDWIDTH=500000\n"
+               << "d4-id3-live5.m3u8\n"
+               << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+               << "d4-id3-live4b.m3u8\n";
+        master.close();
+        refuseOpen(dir / "d4-id3-live-align.m3u8");
     }
 
     {
