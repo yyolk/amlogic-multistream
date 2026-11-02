@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -275,7 +276,7 @@ std::string readRequest(int fd) {
     return data;
 }
 
-std::string requestPath(const std::string& headers) {
+std::string requestRawUrl(const std::string& headers) {
     const auto line_end = headers.find("\r\n");
     const std::string line = headers.substr(0, line_end == std::string::npos ? headers.size() : line_end);
     if (!startsWith(line, "GET ")) {
@@ -286,14 +287,19 @@ std::string requestPath(const std::string& headers) {
         return {};
     }
     std::string url = line.substr(4, sp - 4);
-    const auto query = url.find('?');
-    if (query != std::string::npos) {
-        url = url.substr(0, query);
-    }
     const auto scheme = url.find("://");
     if (scheme != std::string::npos) {
         const auto slash = url.find('/', scheme + 3);
         url = slash == std::string::npos ? "/" : url.substr(slash);
+    }
+    return url;
+}
+
+std::string requestPath(const std::string& headers) {
+    std::string url = requestRawUrl(headers);
+    const auto query = url.find('?');
+    if (query != std::string::npos) {
+        url = url.substr(0, query);
     }
     return url;
 }
@@ -309,6 +315,29 @@ bool safeRelative(const std::string& url, std::filesystem::path& rel) {
         }
     }
     return true;
+}
+
+void rstClose(int fd) {
+    linger lin{};
+    lin.l_onoff = 1;
+    lin.l_linger = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+    ::close(fd);
+}
+
+std::string mpegTsSyncPrefix() {
+    std::string body(377, 'X');
+    body[0] = body[188] = body[376] = static_cast<char>(0x47);
+    return body;
+}
+
+std::string ftypPrefix() {
+    std::string body(32, '\0');
+    body[4] = 'f';
+    body[5] = 't';
+    body[6] = 'y';
+    body[7] = 'p';
+    return body;
 }
 
 void sendAll(int fd, const char* data, size_t len) {
@@ -355,13 +384,195 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
             _exit(0);
         }
         const std::string headers = readRequest(client);
+        const std::string rawUrl = requestRawUrl(headers);
         const std::string url = requestPath(headers);
-        if (!url.empty()) {
-            appendLog(log_path, url);
+        if (!rawUrl.empty()) {
+            appendLog(log_path, rawUrl);
+        }
+        auto sendBody = [&](const std::string& payload, const char* type) {
+            sendResponse(client, 200, payload, type);
+            ::close(client);
+        };
+        if (rawUrl == "/d4-query.m3u8?x=1") {
+            std::ifstream in(root / "d4-id3-media.m3u8");
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            sendBody(ss.str(), "application/vnd.apple.mpegurl");
+            continue;
+        }
+        if (rawUrl == "/dotdot/../id3/media.m3u8") {
+            std::ifstream in(root / "d4-video.m3u8");
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            sendBody(ss.str(), "application/vnd.apple.mpegurl");
+            continue;
         }
         std::filesystem::path rel;
         std::string body;
         bool ok = !url.empty() && safeRelative(url, rel);
+        if (ok && rel == "seg.ts") {
+            const char* redir =
+                "HTTP/1.1 302 Found\r\nLocation: /d4-space.m3u8\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, redir, std::char_traits<char>::length(redir));
+            ::close(client);
+            continue;
+        }
+        if (ok && rel == "failpeek.m3u8") {
+            static int failpeek_hits = 0;
+            if (failpeek_hits++ == 0) {
+                ::close(client);
+                continue;
+            }
+        }
+        if (ok && rel == "garbage.m3u8") {
+            static int garbage_hits = 0;
+            if (garbage_hits++ == 0) {
+                sendResponse(client, 200, "X", "application/vnd.apple.mpegurl");
+                ::close(client);
+                continue;
+            }
+        }
+        if (ok && rel == "partial.m3u8") {
+            static int partial_hits = 0;
+            if (partial_hits++ == 0) {
+                const char* stub =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n"
+                    "Content-Type: video/mp2t\r\nConnection: close\r\n\r\nX";
+                sendAll(client, stub, std::char_traits<char>::length(stub));
+                rstClose(client);
+                continue;
+            }
+        }
+        if (ok && rel == "decoy256") {
+            std::string stub =
+                "HTTP/1.1 200 OK\r\nContent-Length: 400\r\n"
+                "Content-Type: video/mp2t\r\nConnection: close\r\n\r\n";
+            stub.append(256, 'X');
+            sendAll(client, stub.data(), stub.size());
+            rstClose(client);
+            continue;
+        }
+        if (ok && rel == "hop.m3u8") {
+            static int hop_hits = 0;
+            const char* loc = hop_hits++ == 0 ? "/decoy256" : "/playlist";
+            std::string redir = std::string("HTTP/1.1 302 Found\r\nLocation: ") + loc +
+                                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, redir.data(), redir.size());
+            ::close(client);
+            continue;
+        }
+        auto sendDecoyRst = [&](const std::string& body, const char* type, size_t extra) {
+            std::ostringstream hdr;
+            hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << (body.size() + extra)
+                << "\r\nContent-Type: " << type << "\r\nConnection: close\r\n\r\n";
+            const std::string header = hdr.str();
+            sendAll(client, header.data(), header.size());
+            sendAll(client, body.data(), body.size());
+            rstClose(client);
+        };
+        if (ok && (rel == "decoyts" || rel == "syncrst")) {
+            static int decoyts_hits = 0;
+            if (rel == "syncrst" || decoyts_hits++ == 0) {
+                sendDecoyRst(mpegTsSyncPrefix(), "video/mp2t", 200);
+                continue;
+            }
+        }
+        if (ok && (rel == "decoyftyp" || rel == "ftyprst")) {
+            static int decoyftyp_hits = 0;
+            if (rel == "ftyprst" || decoyftyp_hits++ == 0) {
+                sendDecoyRst(ftypPrefix(), "video/mp4", 200);
+                continue;
+            }
+        }
+        if (ok && (rel == "decoyfin" || rel == "finrst")) {
+            static int decoyfin_hits = 0;
+            if (rel == "finrst" || decoyfin_hits++ == 0) {
+                std::ifstream in(root / "small-pmt.ts", std::ios::binary);
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                sendDecoyRst(ss.str(), "video/mp2t", 128);
+                continue;
+            }
+        }
+        auto sendFlipMaster = [&]() {
+            std::ifstream in(root / "d4-master-audio.m3u8");
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            sendResponse(client, 200, ss.str(), "application/vnd.apple.mpegurl");
+            ::close(client);
+        };
+        if (ok && (rel == "flip.ts" || rel == "flip.mp4")) {
+            static int flip_ts_hits = 0;
+            static int flip_mp4_hits = 0;
+            int* hits = rel == "flip.ts" ? &flip_ts_hits : &flip_mp4_hits;
+            if ((*hits)++ == 0) {
+                if (rel == "flip.ts") {
+                    std::ifstream in(root / "small-pmt.ts", std::ios::binary);
+                    std::ostringstream ss;
+                    ss << in.rdbuf();
+                    sendResponse(client, 200, ss.str(), "video/mp2t");
+                } else {
+                    sendResponse(client, 200, ftypPrefix(), "video/mp4");
+                }
+                ::close(client);
+                continue;
+            }
+            sendFlipMaster();
+            continue;
+        }
+        if (ok && rel == "flip-hop.ts") {
+            static int flip_hop_hits = 0;
+            if (flip_hop_hits++ == 0) {
+                const char* redir =
+                    "HTTP/1.1 302 Found\r\nLocation: /small-pmt.ts\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n";
+                sendAll(client, redir, std::char_traits<char>::length(redir));
+                ::close(client);
+                continue;
+            }
+            sendFlipMaster();
+            continue;
+        }
+        if (ok && (rel == "fin-sync" || rel == "fin-ftyp" || rel == "fin-small")) {
+            static int fin_sync_hits = 0;
+            static int fin_ftyp_hits = 0;
+            static int fin_small_hits = 0;
+            int* hits = rel == "fin-sync" ? &fin_sync_hits : rel == "fin-ftyp" ? &fin_ftyp_hits
+                                                                              : &fin_small_hits;
+            if ((*hits)++ == 0) {
+                if (rel == "fin-sync") {
+                    sendResponse(client, 200, mpegTsSyncPrefix(), "video/mp2t");
+                } else if (rel == "fin-ftyp") {
+                    sendResponse(client, 200, ftypPrefix(), "video/mp4");
+                } else {
+                    std::ifstream in(root / "small-pmt.ts", std::ios::binary);
+                    std::ostringstream ss;
+                    ss << in.rdbuf();
+                    sendResponse(client, 200, ss.str(), "video/mp2t");
+                }
+                ::close(client);
+                continue;
+            }
+        }
+        if (ok && (rel == "hop-ts.m3u8" || rel == "hop-ftyp.m3u8" || rel == "hop-fin.m3u8")) {
+            static int hop_ts_hits = 0;
+            static int hop_ftyp_hits = 0;
+            static int hop_fin_hits = 0;
+            const char* loc = "/playlist";
+            if (rel == "hop-ts.m3u8") {
+                loc = hop_ts_hits++ == 0 ? "/syncrst" : "/playlist";
+            } else if (rel == "hop-ftyp.m3u8") {
+                loc = hop_ftyp_hits++ == 0 ? "/ftyprst" : "/playlist";
+            } else {
+                loc = hop_fin_hits++ == 0 ? "/finrst" : "/playlist";
+            }
+            std::string redir = std::string("HTTP/1.1 302 Found\r\nLocation: ") + loc +
+                                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, redir.data(), redir.size());
+            ::close(client);
+            continue;
+        }
         if (ok) {
             const std::filesystem::path full = root / rel;
             std::ifstream in(full, std::ios::binary);
@@ -373,11 +584,19 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
                 body = ss.str();
             }
         }
+        if (ok && rel == "trunc.m3u8") {
+            static int trunc_hits = 0;
+            if (trunc_hits++ == 0) {
+                sendResponse(client, 200, "#EXTM3U\n", "application/vnd.apple.mpegurl");
+                ::close(client);
+                continue;
+            }
+        }
         if (!ok) {
             sendResponse(client, 404, "missing\n", "text/plain");
         } else {
             const char* type = "application/octet-stream";
-            if (rel.extension() == ".m3u8") {
+            if (rel.extension() == ".m3u8" || body.compare(0, 7, "#EXTM3U") == 0) {
                 type = "application/vnd.apple.mpegurl";
             }
             sendResponse(client, 200, body, type);
@@ -876,6 +1095,108 @@ void writeMediaPlaylist(const std::filesystem::path& playlist, const std::string
         << "#EXT-X-ENDLIST\n";
 }
 
+// ID3v2.3 PRIV com.apple.streaming.transportStreamTimestamp. FFmpeg 6.1.1
+// hls.c sets is_id3_timestamped from this tag and runs find_stream_info(NULL).
+std::string id3Synchsafe(uint32_t n) {
+    std::string s(4, '\0');
+    s[0] = static_cast<char>((n >> 21) & 0x7f);
+    s[1] = static_cast<char>((n >> 14) & 0x7f);
+    s[2] = static_cast<char>((n >> 7) & 0x7f);
+    s[3] = static_cast<char>(n & 0x7f);
+    return s;
+}
+
+std::string id3v23Frame(const char id[4], const std::string& payload, unsigned char flags2 = 0) {
+    std::string f(10, '\0');
+    std::memcpy(&f[0], id, 4);
+    const uint32_t n = static_cast<uint32_t>(payload.size());
+    f[4] = static_cast<char>((n >> 24) & 0xff);
+    f[5] = static_cast<char>((n >> 16) & 0xff);
+    f[6] = static_cast<char>((n >> 8) & 0xff);
+    f[7] = static_cast<char>(n & 0xff);
+    f[9] = static_cast<char>(flags2);
+    return f + payload;
+}
+
+std::string id3v23Tag(const std::string& frames) {
+    std::string tag = "ID3";
+    tag.push_back(3);
+    tag.push_back(0);
+    tag.push_back(0);
+    tag += id3Synchsafe(static_cast<uint32_t>(frames.size()));
+    return tag + frames;
+}
+
+std::string id3PrivPayload(const char* owner) {
+    std::string p(owner);
+    p.push_back('\0');
+    p.append(5, '\0');
+    p.push_back(0x01);
+    p.push_back(static_cast<char>(0x5F));
+    p.push_back(static_cast<char>(0x90));
+    return p;
+}
+
+std::string id3v23HlsTimestampTag(const char* owner = "com.apple.streaming.transportStreamTimestamp",
+                                  size_t pad_before_priv = 0, unsigned char priv_flags2 = 0) {
+    std::string frames(pad_before_priv, '\0');
+    frames += id3v23Frame("PRIV", id3PrivPayload(owner), priv_flags2);
+    return id3v23Tag(frames);
+}
+
+std::string id3v23Tit2Tag() {
+    return id3v23Tag(id3v23Frame("TIT2", std::string("\x00en", 3) + "decoy"));
+}
+
+// ID3v2.3 PRIV with FFmpeg ID3v2_FLAG_COMPRESSION (0x08) and a real zlib
+// payload of transportStreamTimestamp. The v2.3 spec uses 0x80; FFmpeg
+// still inflates 0x08 on v2.3.
+std::string id3v23ZlibPrivFlag08() {
+    static const unsigned char z[] = {
+        0x78, 0x9c, 0x4b, 0xce, 0xcf, 0xd5, 0x4b, 0x2c, 0x28, 0xc8, 0x49, 0xd5, 0x2b, 0x2e,
+        0x29, 0x4a, 0x4d, 0xcc, 0xcd, 0xcc, 0x4b, 0xd7, 0x2b, 0x29, 0x4a, 0xcc, 0x2b, 0x2e,
+        0xc8, 0x2f, 0x2a, 0x09, 0x06, 0x0b, 0x85, 0x64, 0xe6, 0xa6, 0x16, 0x97, 0x24, 0xe6,
+        0x16, 0x30, 0x80, 0x01, 0x63, 0xfc, 0x04, 0x00, 0x27, 0xd6, 0x12, 0xa3};
+    return id3v23Tag(id3v23Frame("PRIV",
+                                 std::string(reinterpret_cast<const char*>(z), sizeof(z)), 0x08));
+}
+
+// Tag flag 0x40 = extended header. The 4-byte size starts with 0x00 so a
+// frame walk that ignores the flag stops before the zlib PRIV.
+std::string id3v23ExtHdrZlibPriv() {
+    static const unsigned char z[] = {
+        0x78, 0x9c, 0x4b, 0xce, 0xcf, 0xd5, 0x4b, 0x2c, 0x28, 0xc8, 0x49, 0xd5, 0x2b, 0x2e,
+        0x29, 0x4a, 0x4d, 0xcc, 0xcd, 0xcc, 0x4b, 0xd7, 0x2b, 0x29, 0x4a, 0xcc, 0x2b, 0x2e,
+        0xc8, 0x2f, 0x2a, 0x09, 0x06, 0x0b, 0x85, 0x64, 0xe6, 0xa6, 0x16, 0x97, 0x24, 0xe6,
+        0x16, 0x30, 0x80, 0x01, 0x63, 0xfc, 0x04, 0x00, 0x27, 0xd6, 0x12, 0xa3};
+    const std::string frames = id3v23Frame(
+        "PRIV", std::string(reinterpret_cast<const char*>(z), sizeof(z)), 0x08);
+    std::string ext(10, '\0');
+    ext[3] = 6;
+    std::string tag = "ID3";
+    tag.push_back(3);
+    tag.push_back(0);
+    tag.push_back(0x40);
+    tag += id3Synchsafe(static_cast<uint32_t>(ext.size() + frames.size()));
+    return tag + ext + frames;
+}
+
+bool writePrefixed(const std::filesystem::path& src, const std::filesystem::path& dst,
+                   const std::string& prefix) {
+    std::ifstream in(src, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::ofstream out(dst, std::ios::binary);
+    out << prefix;
+    out << in.rdbuf();
+    return static_cast<bool>(out);
+}
+
+bool writeId3Prefixed(const std::filesystem::path& src, const std::filesystem::path& dst) {
+    return writePrefixed(src, dst, id3v23HlsTimestampTag());
+}
+
 void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::path& dir) {
     const std::filesystem::path log = dir / "late-stream-ffmpeg.log";
 
@@ -961,6 +1282,716 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
     const std::filesystem::path extraHls = dir / "extra-pid.m3u8";
     writeMediaPlaylist(extraHls, extraPid.filename().string());
     testDecode(extraHls.string());
+
+    // AUDIT12 D4: AUDIO group points at the 12000x12000 TS; video is small.
+    g_case = "hls master audio huge ts presents small stream";
+    const std::filesystem::path d4audio = dir / "d4-audio.m3u8";
+    const std::filesystem::path d4video = dir / "d4-video.m3u8";
+    const std::filesystem::path d4master = dir / "d4-master-audio.m3u8";
+    writeMediaPlaylist(d4audio, hugePmt.filename().string());
+    writeMediaPlaylist(d4video, smallPmt.filename().string());
+    {
+        std::ofstream master(d4master);
+        master << "#EXTM3U\n"
+               << "#EXT-X-VERSION:4\n"
+               << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,"
+                  "AUTOSELECT=YES,URI=\""
+               << d4audio.filename().string() << "\"\n"
+               << "#EXT-X-STREAM-INF:BANDWIDTH=400000,CODECS=\"avc1.42e01e,mp4a.40.2\","
+                  "AUDIO=\"aud\"\n"
+               << d4video.filename().string() << "\n";
+    }
+    testDecode(d4master.string());
+
+    g_case = "hls media-only AUDIO no STREAM-INF refuses";
+    const std::filesystem::path d4media = dir / "d4-media-only.m3u8";
+    {
+        std::ofstream playlist(d4media);
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\"\n"
+                 << "#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                 << "#EXTINF:0.400,\n"
+                 << smallPmt.filename().string() << "\n"
+                 << "#EXT-X-ENDLIST\n";
+    }
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open(d4media.string()));
+        decoder.close();
+    }
+
+    g_case = "hls self-loop STREAM-INF refuses";
+    const std::filesystem::path d4self = dir / "d4-self.m3u8";
+    {
+        std::ofstream playlist(d4self);
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4self.filename().string() << "\n";
+    }
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open(d4self.string()));
+        decoder.close();
+    }
+
+    g_case = "hls nested master audio presents small stream";
+    const std::filesystem::path d4inner = dir / "d4-nested-inner.m3u8";
+    const std::filesystem::path d4outer = dir / "d4-nested-outer.m3u8";
+    {
+        std::ofstream inner(d4inner);
+        inner << "#EXTM3U\n"
+              << "#EXT-X-VERSION:4\n"
+              << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+              << d4audio.filename().string() << "\"\n"
+              << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+              << d4video.filename().string() << "\n";
+        std::ofstream outer(d4outer);
+        outer << "#EXTM3U\n"
+              << "#EXT-X-VERSION:4\n"
+              << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+              << d4audio.filename().string() << "\"\n"
+              << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+              << d4inner.filename().string() << "\n";
+    }
+    testDecode(d4outer.string());
+
+    g_case = "hls space-separated MEDIA presents small stream";
+    const std::filesystem::path d4space = dir / "d4-space.m3u8";
+    {
+        std::ostringstream space;
+        space << "#EXTM3U\n"
+              << "#EXT-X-VERSION:4\n"
+              << "#EXT-X-MEDIA:TYPE=AUDIO GROUP-ID=\"aud\" NAME=\"en\" DEFAULT=YES URI=\""
+              << d4audio.filename().string() << "\"\n"
+              << "#EXT-X-STREAM-INF:BANDWIDTH=400000 AUDIO=\"aud\"\n"
+              << d4video.filename().string() << "\n";
+        std::ofstream(d4space) << space.str();
+        std::ofstream(dir / "playlist.ts") << space.str();
+        std::ofstream(dir / "trunc.m3u8") << space.str();
+    }
+    testDecode(d4space.string());
+
+    g_case = "hls last-wins TYPE/URI presents small stream";
+    const std::filesystem::path d4last = dir / "d4-lastwins.m3u8";
+    {
+        std::ofstream playlist(d4last);
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=VIDEO,TYPE=AUDIO,URI=\"\",URI=\""
+                 << d4audio.filename().string() << "\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode(d4last.string());
+
+    g_case = "hls unclosed URI quote presents small stream";
+    const std::filesystem::path d4unclosed = dir / "d4-unclosed.m3u8";
+    {
+        std::ofstream playlist(d4unclosed);
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,URI=\"" << d4audio.filename().string() << "\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode(d4unclosed.string());
+
+    auto writeD4Master = [&](const std::filesystem::path& path, const std::string& media_prefix,
+                             bool media_after_streaminf) {
+        std::string body = "#EXTM3U\n#EXT-X-VERSION:4\n";
+        const std::string media = std::string("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",") +
+                                  "NAME=\"en\",DEFAULT=YES,URI=\"" + d4audio.filename().string() +
+                                  "\"";
+        const std::string stream = "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"";
+        if (media_after_streaminf) {
+            body += stream;
+            body += media_prefix;
+            body += media;
+            body += '\n';
+        } else {
+            body += media_prefix;
+            body += media;
+            body += '\n';
+            body += stream;
+            body += '\n';
+        }
+        body += d4video.filename().string();
+        body += '\n';
+        std::ofstream(path, std::ios::binary) << body;
+    };
+
+    g_case = "hls CR-prefixed MEDIA presents small stream";
+    writeD4Master(dir / "d4-cr-media.m3u8", std::string(1, '\r'), false);
+    testDecode((dir / "d4-cr-media.m3u8").string());
+
+    g_case = "hls NUL-prefixed MEDIA presents small stream";
+    writeD4Master(dir / "d4-nul-media.m3u8", std::string(1, '\0'), false);
+    testDecode((dir / "d4-nul-media.m3u8").string());
+
+    g_case = "hls comment-NUL MEDIA presents small stream";
+    writeD4Master(dir / "d4-cnul-media.m3u8", std::string("#c") + '\0', false);
+    testDecode((dir / "d4-cnul-media.m3u8").string());
+
+    g_case = "hls STREAM-INF CR MEDIA presents small stream";
+    writeD4Master(dir / "d4-streaminf-cr-media.m3u8", std::string(1, '\r'), true);
+    testDecode((dir / "d4-streaminf-cr-media.m3u8").string());
+
+    g_case = "hls NOTAKEY URI= presents small stream";
+    {
+        std::ofstream playlist(dir / "d4-notakey-uri.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\",NOTAKEY URI=\"\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-notakey-uri.m3u8").string());
+
+    g_case = "hls NOTAKEY TYPE=VIDEO presents small stream";
+    {
+        std::ofstream playlist(dir / "d4-notakey-type.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\",NOTAKEY TYPE=VIDEO\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-notakey-type.m3u8").string());
+
+    g_case = "hls NOTAKEY URI= EXTINF media refuses";
+    {
+        std::ofstream playlist(dir / "d4-notakey-extinf.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\",NOTAKEY URI=\"\"\n"
+                 << "#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n"
+                 << "#EXTINF:0.400,\n"
+                 << smallPmt.filename().string() << "\n"
+                 << "#EXT-X-ENDLIST\n";
+    }
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open((dir / "d4-notakey-extinf.m3u8").string()));
+        decoder.close();
+    }
+
+    g_case = "hls overlong MEDIA line presents small stream";
+    {
+        std::string media = "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"";
+        media += d4audio.filename().string();
+        media += "\",PAD=";
+        if (media.size() < 4095) {
+            media.append(4095 - media.size(), 'x');
+        }
+        media += ",TYPE=VIDEO,URI=\"\"";
+        std::string body = "#EXTM3U\n#EXT-X-VERSION:4\n";
+        body += media;
+        body += "\n#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n";
+        body += d4video.filename().string();
+        body += '\n';
+        std::ofstream(dir / "d4-overlong.m3u8", std::ios::binary) << body;
+    }
+    testDecode((dir / "d4-overlong.m3u8").string());
+
+    g_case = "hls chomp TYPE=AUDIO space presents small stream";
+    {
+        std::ofstream playlist(dir / "d4-chomp-space.m3u8", std::ios::binary);
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-MEDIA:TYPE=\"AUDIO \n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-chomp-space.m3u8").string());
+
+    g_case = "hls chomp TYPE=AUDIO backslash presents small stream";
+    {
+        std::ofstream playlist(dir / "d4-chomp-bs.m3u8", std::ios::binary);
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-MEDIA:TYPE=\"AUDIO\\\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-chomp-bs.m3u8").string());
+
+    g_case = "hls chomp spaces to 4095 presents small stream";
+    {
+        std::string media = "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"";
+        media += d4audio.filename().string();
+        media += '"';
+        if (media.size() < 4095) {
+            media.append(4095 - media.size(), ' ');
+        }
+        media += ",TYPE=VIDEO,URI=\"\"";
+        std::string body = "#EXTM3U\n#EXT-X-VERSION:4\n";
+        body += media;
+        body += "\n#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n";
+        body += d4video.filename().string();
+        body += '\n';
+        std::ofstream(dir / "d4-chomp-overlong.m3u8", std::ios::binary) << body;
+    }
+    testDecode((dir / "d4-chomp-overlong.m3u8").string());
+
+    g_case = "hls in-band AUDIO small variant presents";
+    {
+        std::ofstream playlist(dir / "d4-inband-small.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4video.filename().string() << "\n";
+    }
+    testDecode((dir / "d4-inband-small.m3u8").string());
+
+    g_case = "hls in-band AUDIO huge variant stays capped";
+    {
+        std::ofstream playlist(dir / "d4-inband-huge.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\"\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4audio.filename().string() << "\n";
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        const bool opened = decoder.open((dir / "d4-inband-huge.m3u8").string());
+        if (opened) {
+            DecodedFrame frame;
+            CHECK(!decoder.readFrame(frame) || (frame.width < 200 && frame.height < 200));
+        }
+        decoder.close();
+    }
+
+    g_case = "hls ID3-timestamped huge media playlist refuses";
+    const std::filesystem::path d4id3ts = dir / "d4-id3-huge.ts";
+    const std::filesystem::path d4id3media = dir / "d4-id3-media.m3u8";
+    if (!writeId3Prefixed(hugePmt, d4id3ts)) {
+        std::cerr << "failed to write ID3-prefixed huge TS\n";
+        ++g_failures;
+        return;
+    }
+    writeMediaPlaylist(d4id3media, d4id3ts.filename().string());
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open(d4id3media.string()));
+        decoder.close();
+    }
+
+    g_case = "hls rewrite to ID3-timestamped media playlist refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-rewrite.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4id3media.filename().string() << "\n";
+        playlist.close();
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open((dir / "d4-id3-rewrite.m3u8").string()));
+        decoder.close();
+    }
+
+    g_case = "hls STREAM-INF ID3-timestamped variant refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-variant.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4id3media.filename().string() << "\n";
+        playlist.close();
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open((dir / "d4-id3-variant.m3u8").string()));
+        decoder.close();
+    }
+
+    auto refuseOpen = [&](const std::filesystem::path& path) {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open(path.string()));
+        decoder.close();
+    };
+
+    g_case = "hls ID3 uppercase owner refuses";
+    {
+        const auto ts = dir / "d4-id3-upper.ts";
+        CHECK(writePrefixed(hugePmt, ts,
+                            id3v23HlsTimestampTag("COM.APPLE.STREAMING.TRANSPORTSTREAMTIMESTAMP")));
+        writeMediaPlaylist(dir / "d4-id3-upper.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-upper.m3u8");
+    }
+
+    g_case = "hls second ID3 tag PRIV refuses";
+    {
+        const auto ts = dir / "d4-id3-second.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23Tit2Tag() + id3v23HlsTimestampTag()));
+        writeMediaPlaylist(dir / "d4-id3-second.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-second.m3u8");
+    }
+
+    g_case = "hls zlib-compressed PRIV refuses";
+    {
+        const auto ts = dir / "d4-id3-zlib.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23HlsTimestampTag(
+                                            "com.apple.streaming.transportStreamTimestamp", 0, 0x80)));
+        writeMediaPlaylist(dir / "d4-id3-zlib.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-zlib.m3u8");
+    }
+
+    g_case = "hls ID3 PRIV past 4096 peek window refuses";
+    {
+        const auto ts = dir / "d4-id3-late.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23HlsTimestampTag(
+                                            "com.apple.streaming.transportStreamTimestamp", 5000)));
+        writeMediaPlaylist(dir / "d4-id3-late.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-late.m3u8");
+    }
+
+    g_case = "hls BYTERANGE ID3 segment refuses";
+    {
+        const auto ranged = dir / "d4-id3-range.ts";
+        {
+            std::ofstream out(ranged, std::ios::binary);
+            out << std::string(1000, 'X');
+            out << id3v23HlsTimestampTag();
+            std::ifstream in(hugePmt, std::ios::binary);
+            out << in.rdbuf();
+        }
+        const auto prefix = id3v23HlsTimestampTag();
+        const uint64_t slice = prefix.size() + std::filesystem::file_size(hugePmt);
+        std::ofstream playlist(dir / "d4-id3-range.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                 << "#EXT-X-BYTERANGE:" << slice << "@1000\n"
+                 << ranged.filename().string() << "\n#EXT-X-ENDLIST\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-range.m3u8");
+    }
+
+    g_case = "hls AES-128 first segment refuses";
+    {
+        std::ofstream(dir / "d4-id3-key.bin", std::ios::binary) << std::string(16, 'K');
+        std::ofstream playlist(dir / "d4-id3-aes.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-KEY:METHOD=AES-128,URI=\"" << (dir / "d4-id3-key.bin").filename().string()
+                 << "\"\n#EXTINF:0.040,\n"
+                 << hugePmt.filename().string() << "\n#EXT-X-ENDLIST\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-aes.m3u8");
+    }
+
+    g_case = "hls live playlist ID3 on second segment refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-live.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.400,\n"
+                 << smallPmt.filename().string() << "\n#EXTINF:0.040,\n"
+                 << d4id3ts.filename().string() << "\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-live.m3u8");
+    }
+
+    g_case = "hls second STREAM-INF ID3 media refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-second-var.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4video.filename().string() << "\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=500000\n"
+                 << d4id3media.filename().string() << "\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-second-var.m3u8");
+    }
+
+    g_case = "hls nested master ID3 media refuses";
+    {
+        std::ofstream inner(dir / "d4-id3-nested-inner.m3u8");
+        inner << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+              << d4id3media.filename().string() << "\n";
+        inner.close();
+        std::ofstream outer(dir / "d4-id3-nested-outer.m3u8");
+        outer << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+              << (dir / "d4-id3-nested-inner.m3u8").filename().string() << "\n";
+        outer.close();
+        refuseOpen(dir / "d4-id3-nested-outer.m3u8");
+    }
+
+    g_case = "hls nested master without outer AUDIO presents small stream";
+    {
+        std::ofstream outer(dir / "d4-nested-noaudio-outer.m3u8");
+        outer << "#EXTM3U\n#EXT-X-VERSION:4\n"
+              << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+              << d4inner.filename().string() << "\n";
+        outer.close();
+        testDecode((dir / "d4-nested-noaudio-outer.m3u8").string());
+    }
+
+    g_case = "hls live STREAM-INF ID3 at live_start_index refuses";
+    {
+        std::ofstream live(dir / "d4-id3-live4.m3u8");
+        live << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+             << "#EXT-X-MEDIA-SEQUENCE:0\n"
+             << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+             << "#EXTINF:0.040,\n" << d4id3ts.filename().string() << "\n"
+             << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+             << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n";
+        live.close();
+        std::ofstream master(dir / "d4-id3-live-var.m3u8");
+        master << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+               << "d4-id3-live4.m3u8\n";
+        master.close();
+        refuseOpen(dir / "d4-id3-live-var.m3u8");
+    }
+
+    g_case = "hls ID3v2.3 compression flag 0x08 refuses";
+    {
+        const auto ts = dir / "d4-id3-zlib08.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23ZlibPrivFlag08()));
+        writeMediaPlaylist(dir / "d4-id3-zlib08.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-zlib08.m3u8");
+    }
+
+    g_case = "hls ID3v2.3 extended header 0x40 zlib PRIV refuses";
+    {
+        const auto ts = dir / "d4-id3-exthdr.ts";
+        CHECK(writePrefixed(hugePmt, ts, id3v23ExtHdrZlibPriv()));
+        writeMediaPlaylist(dir / "d4-id3-exthdr.m3u8", ts.filename().string());
+        refuseOpen(dir / "d4-id3-exthdr.m3u8");
+    }
+
+    g_case = "hls leading-space segment URI refuses";
+    {
+        const auto spaced = dir / " video.ts";
+        CHECK(writePrefixed(hugePmt, spaced, id3v23HlsTimestampTag()));
+        {
+            std::ifstream in(smallPmt, std::ios::binary);
+            std::ofstream(dir / "video.ts", std::ios::binary) << in.rdbuf();
+        }
+        std::ofstream playlist(dir / "d4-id3-leadws.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                 << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                 << " video.ts\n#EXT-X-ENDLIST\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-leadws.m3u8");
+    }
+
+    g_case = "hls EXT-X-MEDIA TYPE=VIDEO ID3 URI refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-media-video.m3u8");
+        playlist << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"vid\",NAME=\"main\",DEFAULT=YES,URI=\""
+                 << d4id3media.filename().string() << "\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,VIDEO=\"vid\"\n"
+                 << d4video.filename().string() << "\n";
+        playlist.close();
+        refuseOpen(dir / "d4-id3-media-video.m3u8");
+    }
+
+    g_case = "hls two live variants ID3 on shorter index 2 refuses";
+    {
+        std::ofstream live5(dir / "d4-id3-live5.m3u8");
+        live5 << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+              << "#EXT-X-MEDIA-SEQUENCE:0\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n";
+        live5.close();
+        std::ofstream live4(dir / "d4-id3-live4b.m3u8");
+        live4 << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+              << "#EXT-X-MEDIA-SEQUENCE:0\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n"
+              << "#EXTINF:0.040,\n" << d4id3ts.filename().string() << "\n"
+              << "#EXTINF:0.400,\n" << smallPmt.filename().string() << "\n";
+        live4.close();
+        std::ofstream master(dir / "d4-id3-live-align.m3u8");
+        master << "#EXTM3U\n#EXT-X-VERSION:4\n"
+               << "#EXT-X-STREAM-INF:BANDWIDTH=500000\n"
+               << "d4-id3-live5.m3u8\n"
+               << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+               << "d4-id3-live4b.m3u8\n";
+        master.close();
+        refuseOpen(dir / "d4-id3-live-align.m3u8");
+    }
+
+    {
+        std::ifstream src(d4master);
+        std::ofstream(dir / "failpeek.m3u8") << src.rdbuf();
+    }
+    {
+        std::ifstream src(d4master);
+        std::ofstream(dir / "garbage.m3u8") << src.rdbuf();
+    }
+    {
+        std::ifstream src(d4master);
+        std::ofstream(dir / "partial.m3u8") << src.rdbuf();
+    }
+    {
+        std::ifstream src(dir / "d4-notakey-uri.m3u8");
+        std::ofstream(dir / "notakey-http.m3u8") << src.rdbuf();
+    }
+
+    g_case = "hls extensionless http master audio";
+    {
+        std::ifstream src(d4master);
+        std::ofstream dst(dir / "playlist");
+        dst << src.rdbuf();
+    }
+    const std::filesystem::path get_log = dir / "d4-extless-gets.log";
+    LocalHttp server = startLocalHttp(dir, get_log);
+    CHECK(server.pid > 0);
+    CHECK(server.port > 0);
+    if (server.pid > 0 && server.port > 0) {
+        const std::string httpBase = "http://127.0.0.1:" + std::to_string(server.port);
+        auto openHttpSmall = [&](const std::string& url) {
+            FfmpegDecoder decoder;
+            const bool opened = decoder.open(url);
+            CHECK(opened);
+            if (opened) {
+                DecodedFrame frame;
+                CHECK(decoder.readFrame(frame));
+                expectYuv420(frame);
+            }
+            decoder.close();
+        };
+        openHttpSmall(httpBase + "/playlist");
+        g_case = "hls playlist.ts mpegurl http master audio";
+        openHttpSmall(httpBase + "/playlist.ts");
+        g_case = "hls seg.ts redirect http master audio";
+        openHttpSmall(httpBase + "/seg.ts");
+        g_case = "hls truncated EXTM3U preview refuses";
+        FfmpegDecoder trunc;
+        CHECK(!trunc.open(httpBase + "/trunc.m3u8"));
+        trunc.close();
+        g_case = "hls http peek failure refuses";
+        FfmpegDecoder failpeek;
+        CHECK(!failpeek.open(httpBase + "/failpeek.m3u8"));
+        failpeek.close();
+        g_case = "hls mpegurl body X refuses";
+        FfmpegDecoder garbage;
+        CHECK(!garbage.open(httpBase + "/garbage.m3u8"));
+        garbage.close();
+        g_case = "hls NOTAKEY URI= http presents small stream";
+        openHttpSmall(httpBase + "/notakey-http.m3u8");
+        g_case = "hls partial peek reset refuses";
+        FfmpegDecoder partial;
+        CHECK(!partial.open(httpBase + "/partial.m3u8"));
+        partial.close();
+        g_case = "hls chomp TYPE=AUDIO space http presents";
+        {
+            std::ifstream src(dir / "d4-chomp-space.m3u8");
+            std::ofstream(dir / "chomp-http.m3u8") << src.rdbuf();
+        }
+        openHttpSmall(httpBase + "/chomp-http.m3u8");
+        g_case = "hls 256-byte video/mp2t reset refuses";
+        FfmpegDecoder decoy;
+        CHECK(!decoy.open(httpBase + "/decoy256"));
+        decoy.close();
+        g_case = "hls 302 decoy then master refuses";
+        FfmpegDecoder hop;
+        CHECK(!hop.open(httpBase + "/hop.m3u8"));
+        hop.close();
+        {
+            std::ifstream src(d4master);
+            std::ofstream(dir / "decoyts") << src.rdbuf();
+            std::ifstream src2(d4master);
+            std::ofstream(dir / "decoyftyp") << src2.rdbuf();
+            std::ifstream src3(d4master);
+            std::ofstream(dir / "decoyfin") << src3.rdbuf();
+        }
+        g_case = "hls TS sync prefix reset refuses";
+        FfmpegDecoder decoyts;
+        CHECK(!decoyts.open(httpBase + "/decoyts"));
+        decoyts.close();
+        g_case = "hls ftyp prefix reset refuses";
+        FfmpegDecoder decoyftyp;
+        CHECK(!decoyftyp.open(httpBase + "/decoyftyp"));
+        decoyftyp.close();
+        g_case = "hls finished small TS reset refuses";
+        FfmpegDecoder decoyfin;
+        CHECK(!decoyfin.open(httpBase + "/decoyfin"));
+        decoyfin.close();
+        g_case = "hls 302 TS decoy then master refuses";
+        FfmpegDecoder hopts;
+        CHECK(!hopts.open(httpBase + "/hop-ts.m3u8"));
+        hopts.close();
+        g_case = "hls 302 ftyp decoy then master refuses";
+        FfmpegDecoder hopftyp;
+        CHECK(!hopftyp.open(httpBase + "/hop-ftyp.m3u8"));
+        hopftyp.close();
+        g_case = "hls 302 finished-TS decoy then master refuses";
+        FfmpegDecoder hopfin;
+        CHECK(!hopfin.open(httpBase + "/hop-fin.m3u8"));
+        hopfin.close();
+        {
+            std::ifstream src(d4master);
+            std::ofstream(dir / "fin-sync") << src.rdbuf();
+            std::ifstream src2(d4master);
+            std::ofstream(dir / "fin-ftyp") << src2.rdbuf();
+            std::ifstream src3(d4master);
+            std::ofstream(dir / "fin-small") << src3.rdbuf();
+        }
+        g_case = "hls finished sync exact-CL then master refuses";
+        FfmpegDecoder finsync;
+        CHECK(!finsync.open(httpBase + "/fin-sync"));
+        finsync.close();
+        g_case = "hls finished ftyp exact-CL then master refuses";
+        FfmpegDecoder finftyp;
+        CHECK(!finftyp.open(httpBase + "/fin-ftyp"));
+        finftyp.close();
+        g_case = "hls finished small TS exact-CL then master refuses";
+        FfmpegDecoder finsmall;
+        CHECK(!finsmall.open(httpBase + "/fin-small"));
+        finsmall.close();
+
+        {
+            std::ofstream query(dir / "d4-query.m3u8");
+            query << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                  << "d4-query.m3u8?x=1\n";
+            std::filesystem::create_directories(dir / "dotdot");
+            std::filesystem::create_directories(dir / "id3");
+            std::ofstream(dir / "dotdot" / "master.m3u8")
+                << "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                << "../id3/media.m3u8\n";
+            std::ifstream id3src(d4id3media);
+            std::ofstream(dir / "id3" / "media.m3u8") << id3src.rdbuf();
+        }
+        g_case = "hls query-stripped STREAM-INF ID3 refuses";
+        FfmpegDecoder qurl;
+        CHECK(!qurl.open(httpBase + "/d4-query.m3u8"));
+        qurl.close();
+        g_case = "hls relative .. STREAM-INF ID3 refuses";
+        FfmpegDecoder dotdot;
+        CHECK(!dotdot.open(httpBase + "/dotdot/master.m3u8"));
+        dotdot.close();
+        g_case = "hls .ts finished then master Content-Type flip refuses";
+        FfmpegDecoder flipts;
+        CHECK(!flipts.open(httpBase + "/flip.ts"));
+        flipts.close();
+        g_case = "hls .mp4 ftyp then master Content-Type flip refuses";
+        FfmpegDecoder flipmp4;
+        CHECK(!flipmp4.open(httpBase + "/flip.mp4"));
+        flipmp4.close();
+        g_case = "hls .ts 302 finished TS then master refuses";
+        FfmpegDecoder fliphop;
+        CHECK(!fliphop.open(httpBase + "/flip-hop.ts"));
+        fliphop.close();
+    }
+    server.stop();
 }
 
 void testMissingFile(const std::filesystem::path& dir) {

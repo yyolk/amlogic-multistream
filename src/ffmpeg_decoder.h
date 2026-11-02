@@ -58,8 +58,32 @@ public:
     // as find_stream_info so a normal HLS master is not drained. If that
     // window ends on a timestamp gap, the queued packets are kept and
     // the probe is clamped so a later PID cannot be born without the
-    // cap (AUDIT11 D3). readFrame() also refuses to convert a frame that
-    // fails those extent and stride caps (AUDIT9 D1).
+    // cap (AUDIT11 D3). Those clamps run after avformat_open_input.
+    // FFmpeg 6.1.1 HLS still probes a TYPE=AUDIO rendition inside
+    // read_header with find_stream_info(NULL), so that nested decoder
+    // would keep max_pixels == INT_MAX. open() peeks http(s) even when
+    // the path ends in .ts (mpegurl Content-Type or a redirect to a
+    // master). Playlist lines end on \\n / \\r / \\0 like ff_get_line
+    // and are capped at 4095 bytes, then chomped like ff_get_chomp_line.
+    // Quoted values drop a final backslash. Any TYPE=AUDIO tag (URI=
+    // or in-band) is rewritten or refused, including a nested master
+    // whose outer playlist has no AUDIO tag. A media playlist whose
+    // segments cannot be proven free of ID3 transportStreamTimestamp
+    // (any EXTINF, BYTERANGE, AES-128, uppercase owner, later ID3
+    // tag, compressed PRIV including ID3v2.3 flag 0x08, a tag with a
+    // non-zero header flag (extended header 0x40), a tag past the
+    // peek window, the live_start_index segment of a live STREAM-INF,
+    // EXT-X-MEDIA TYPE=VIDEO URIs, or a live multi-variant
+    // highest_cur_seq_no bump) is refused. Segment URIs keep leading
+    // whitespace. Playlist refs keep their query string
+    // and http(s) paths drop . / .. like ff_make_absolute_url2. A
+    // finished remote TS/`ftyp` peek pins mpegts/mp4 so a later GET
+    // of that URL cannot ride as a master. A truncated #EXTM3U, a
+    // peek that errors after any bytes, mpegurl that is not #EXTM3U,
+    // or a non-playlist http(s) decoy is refused rather than opened
+    // uncapped (AUDIT12 D4).
+    // readFrame() also refuses to convert a frame that fails those
+    // extent and stride caps (AUDIT9 D1).
     void setAllowLocalFile(bool allow);
 
     bool open(const std::string& url) override;
