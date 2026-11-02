@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdint>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -319,6 +320,21 @@ void rstClose(int fd) {
     ::close(fd);
 }
 
+std::string mpegTsSyncPrefix() {
+    std::string body(377, 'X');
+    body[0] = body[188] = body[376] = static_cast<char>(0x47);
+    return body;
+}
+
+std::string ftypPrefix() {
+    std::string body(32, '\0');
+    body[4] = 'f';
+    body[5] = 't';
+    body[6] = 'y';
+    body[7] = 'p';
+    return body;
+}
+
 void sendAll(int fd, const char* data, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -416,6 +432,57 @@ void sendResponse(int fd, int status, const std::string& body, const char* conte
         if (ok && rel == "hop.m3u8") {
             static int hop_hits = 0;
             const char* loc = hop_hits++ == 0 ? "/decoy256" : "/playlist";
+            std::string redir = std::string("HTTP/1.1 302 Found\r\nLocation: ") + loc +
+                                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, redir.data(), redir.size());
+            ::close(client);
+            continue;
+        }
+        auto sendDecoyRst = [&](const std::string& body, const char* type, size_t extra) {
+            std::ostringstream hdr;
+            hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << (body.size() + extra)
+                << "\r\nContent-Type: " << type << "\r\nConnection: close\r\n\r\n";
+            const std::string header = hdr.str();
+            sendAll(client, header.data(), header.size());
+            sendAll(client, body.data(), body.size());
+            rstClose(client);
+        };
+        if (ok && (rel == "decoyts" || rel == "syncrst")) {
+            static int decoyts_hits = 0;
+            if (rel == "syncrst" || decoyts_hits++ == 0) {
+                sendDecoyRst(mpegTsSyncPrefix(), "video/mp2t", 200);
+                continue;
+            }
+        }
+        if (ok && (rel == "decoyftyp" || rel == "ftyprst")) {
+            static int decoyftyp_hits = 0;
+            if (rel == "ftyprst" || decoyftyp_hits++ == 0) {
+                sendDecoyRst(ftypPrefix(), "video/mp4", 200);
+                continue;
+            }
+        }
+        if (ok && (rel == "decoyfin" || rel == "finrst")) {
+            static int decoyfin_hits = 0;
+            if (rel == "finrst" || decoyfin_hits++ == 0) {
+                std::ifstream in(root / "small-pmt.ts", std::ios::binary);
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                sendDecoyRst(ss.str(), "video/mp2t", 128);
+                continue;
+            }
+        }
+        if (ok && (rel == "hop-ts.m3u8" || rel == "hop-ftyp.m3u8" || rel == "hop-fin.m3u8")) {
+            static int hop_ts_hits = 0;
+            static int hop_ftyp_hits = 0;
+            static int hop_fin_hits = 0;
+            const char* loc = "/playlist";
+            if (rel == "hop-ts.m3u8") {
+                loc = hop_ts_hits++ == 0 ? "/syncrst" : "/playlist";
+            } else if (rel == "hop-ftyp.m3u8") {
+                loc = hop_ftyp_hits++ == 0 ? "/ftyprst" : "/playlist";
+            } else {
+                loc = hop_fin_hits++ == 0 ? "/finrst" : "/playlist";
+            }
             std::string redir = std::string("HTTP/1.1 302 Found\r\nLocation: ") + loc +
                                 "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             sendAll(client, redir.data(), redir.size());
@@ -944,6 +1011,45 @@ void writeMediaPlaylist(const std::filesystem::path& playlist, const std::string
         << "#EXT-X-ENDLIST\n";
 }
 
+// ID3v2.3 PRIV com.apple.streaming.transportStreamTimestamp. FFmpeg 6.1.1
+// hls.c sets is_id3_timestamped from this tag and runs find_stream_info(NULL).
+std::string id3v23HlsTimestampTag() {
+    const char owner[] = "com.apple.streaming.transportStreamTimestamp";
+    const uint32_t owner_len = 44;
+    const uint32_t payload = owner_len + 1 + 8;
+    const uint32_t tag_size = 10 + payload;
+    std::string tag(10 + tag_size, '\0');
+    tag[0] = 'I';
+    tag[1] = 'D';
+    tag[2] = '3';
+    tag[3] = 3;
+    tag[6] = static_cast<char>((tag_size >> 21) & 0x7f);
+    tag[7] = static_cast<char>((tag_size >> 14) & 0x7f);
+    tag[8] = static_cast<char>((tag_size >> 7) & 0x7f);
+    tag[9] = static_cast<char>(tag_size & 0x7f);
+    tag[10] = 'P';
+    tag[11] = 'R';
+    tag[12] = 'I';
+    tag[13] = 'V';
+    tag[14] = static_cast<char>((payload >> 24) & 0xff);
+    tag[15] = static_cast<char>((payload >> 16) & 0xff);
+    tag[16] = static_cast<char>((payload >> 8) & 0xff);
+    tag[17] = static_cast<char>(payload & 0xff);
+    std::memcpy(&tag[20], owner, owner_len);
+    return tag;
+}
+
+bool writeId3Prefixed(const std::filesystem::path& src, const std::filesystem::path& dst) {
+    std::ifstream in(src, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::ofstream out(dst, std::ios::binary);
+    out << id3v23HlsTimestampTag();
+    out << in.rdbuf();
+    return static_cast<bool>(out);
+}
+
 void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::path& dir) {
     const std::filesystem::path log = dir / "late-stream-ffmpeg.log";
 
@@ -1318,6 +1424,52 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         decoder.close();
     }
 
+    g_case = "hls ID3-timestamped huge media playlist refuses";
+    const std::filesystem::path d4id3ts = dir / "d4-id3-huge.ts";
+    const std::filesystem::path d4id3media = dir / "d4-id3-media.m3u8";
+    if (!writeId3Prefixed(hugePmt, d4id3ts)) {
+        std::cerr << "failed to write ID3-prefixed huge TS\n";
+        ++g_failures;
+        return;
+    }
+    writeMediaPlaylist(d4id3media, d4id3ts.filename().string());
+    {
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open(d4id3media.string()));
+        decoder.close();
+    }
+
+    g_case = "hls rewrite to ID3-timestamped media playlist refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-rewrite.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                 << d4audio.filename().string() << "\"\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                 << d4id3media.filename().string() << "\n";
+        playlist.close();
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open((dir / "d4-id3-rewrite.m3u8").string()));
+        decoder.close();
+    }
+
+    g_case = "hls STREAM-INF ID3-timestamped variant refuses";
+    {
+        std::ofstream playlist(dir / "d4-id3-variant.m3u8");
+        playlist << "#EXTM3U\n"
+                 << "#EXT-X-VERSION:4\n"
+                 << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                 << d4id3media.filename().string() << "\n";
+        playlist.close();
+        FfmpegDecoder decoder;
+        decoder.setAllowLocalFile(true);
+        CHECK(!decoder.open((dir / "d4-id3-variant.m3u8").string()));
+        decoder.close();
+    }
+
     {
         std::ifstream src(d4master);
         std::ofstream(dir / "failpeek.m3u8") << src.rdbuf();
@@ -1395,6 +1547,38 @@ void testLateStreamMaxPixels(const std::string& ffmpeg, const std::filesystem::p
         FfmpegDecoder hop;
         CHECK(!hop.open(httpBase + "/hop.m3u8"));
         hop.close();
+        {
+            std::ifstream src(d4master);
+            std::ofstream(dir / "decoyts") << src.rdbuf();
+            std::ifstream src2(d4master);
+            std::ofstream(dir / "decoyftyp") << src2.rdbuf();
+            std::ifstream src3(d4master);
+            std::ofstream(dir / "decoyfin") << src3.rdbuf();
+        }
+        g_case = "hls TS sync prefix reset refuses";
+        FfmpegDecoder decoyts;
+        CHECK(!decoyts.open(httpBase + "/decoyts"));
+        decoyts.close();
+        g_case = "hls ftyp prefix reset refuses";
+        FfmpegDecoder decoyftyp;
+        CHECK(!decoyftyp.open(httpBase + "/decoyftyp"));
+        decoyftyp.close();
+        g_case = "hls finished small TS reset refuses";
+        FfmpegDecoder decoyfin;
+        CHECK(!decoyfin.open(httpBase + "/decoyfin"));
+        decoyfin.close();
+        g_case = "hls 302 TS decoy then master refuses";
+        FfmpegDecoder hopts;
+        CHECK(!hopts.open(httpBase + "/hop-ts.m3u8"));
+        hopts.close();
+        g_case = "hls 302 ftyp decoy then master refuses";
+        FfmpegDecoder hopftyp;
+        CHECK(!hopftyp.open(httpBase + "/hop-ftyp.m3u8"));
+        hopftyp.close();
+        g_case = "hls 302 finished-TS decoy then master refuses";
+        FfmpegDecoder hopfin;
+        CHECK(!hopfin.open(httpBase + "/hop-fin.m3u8"));
+        hopfin.close();
     }
     server.stop();
 }

@@ -146,6 +146,47 @@ void rstClose(int fd) {
     ::close(fd);
 }
 
+std::string mpegTsSyncPrefix() {
+    std::string body(377, 'X');
+    body[0] = body[188] = body[376] = static_cast<char>(0x47);
+    return body;
+}
+
+std::string ftypPrefix() {
+    std::string body(32, '\0');
+    body[4] = 'f';
+    body[5] = 't';
+    body[6] = 'y';
+    body[7] = 'p';
+    return body;
+}
+
+std::string id3v23HlsTimestampTag() {
+    const char owner[] = "com.apple.streaming.transportStreamTimestamp";
+    const uint32_t owner_len = 44;
+    const uint32_t payload = owner_len + 1 + 8;
+    const uint32_t tag_size = 10 + payload;
+    std::string tag(10 + tag_size, '\0');
+    tag[0] = 'I';
+    tag[1] = 'D';
+    tag[2] = '3';
+    tag[3] = 3;
+    tag[6] = static_cast<char>((tag_size >> 21) & 0x7f);
+    tag[7] = static_cast<char>((tag_size >> 14) & 0x7f);
+    tag[8] = static_cast<char>((tag_size >> 7) & 0x7f);
+    tag[9] = static_cast<char>(tag_size & 0x7f);
+    tag[10] = 'P';
+    tag[11] = 'R';
+    tag[12] = 'I';
+    tag[13] = 'V';
+    tag[14] = static_cast<char>((payload >> 24) & 0xff);
+    tag[15] = static_cast<char>((payload >> 16) & 0xff);
+    tag[16] = static_cast<char>((payload >> 8) & 0xff);
+    tag[17] = static_cast<char>(payload & 0xff);
+    std::memcpy(&tag[20], owner, owner_len);
+    return tag;
+}
+
 void sendAll(int fd, const char* data, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -335,6 +376,57 @@ struct LocalHttp {
         if (ok && rel == "hop.m3u8") {
             static int hop_hits = 0;
             const char* loc = hop_hits++ == 0 ? "/decoy256" : "/playlist";
+            std::string redir = std::string("HTTP/1.1 302 Found\r\nLocation: ") + loc +
+                                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            sendAll(client, redir.data(), redir.size());
+            ::close(client);
+            continue;
+        }
+        auto sendDecoyRst = [&](const std::string& body, const char* type, size_t extra) {
+            std::ostringstream hdr;
+            hdr << "HTTP/1.1 200 OK\r\nContent-Length: " << (body.size() + extra)
+                << "\r\nContent-Type: " << type << "\r\nConnection: close\r\n\r\n";
+            const std::string header = hdr.str();
+            sendAll(client, header.data(), header.size());
+            sendAll(client, body.data(), body.size());
+            rstClose(client);
+        };
+        if (ok && (rel == "decoyts" || rel == "syncrst")) {
+            static int decoyts_hits = 0;
+            if (rel == "syncrst" || decoyts_hits++ == 0) {
+                sendDecoyRst(mpegTsSyncPrefix(), "video/mp2t", 200);
+                continue;
+            }
+        }
+        if (ok && (rel == "decoyftyp" || rel == "ftyprst")) {
+            static int decoyftyp_hits = 0;
+            if (rel == "ftyprst" || decoyftyp_hits++ == 0) {
+                sendDecoyRst(ftypPrefix(), "video/mp4", 200);
+                continue;
+            }
+        }
+        if (ok && (rel == "decoyfin" || rel == "finrst")) {
+            static int decoyfin_hits = 0;
+            if (rel == "finrst" || decoyfin_hits++ == 0) {
+                std::ifstream in(root / "small.ts", std::ios::binary);
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                sendDecoyRst(ss.str(), "video/mp2t", 128);
+                continue;
+            }
+        }
+        if (ok && (rel == "hop-ts.m3u8" || rel == "hop-ftyp.m3u8" || rel == "hop-fin.m3u8")) {
+            static int hop_ts_hits = 0;
+            static int hop_ftyp_hits = 0;
+            static int hop_fin_hits = 0;
+            const char* loc = "/playlist";
+            if (rel == "hop-ts.m3u8") {
+                loc = hop_ts_hits++ == 0 ? "/syncrst" : "/playlist";
+            } else if (rel == "hop-ftyp.m3u8") {
+                loc = hop_ftyp_hits++ == 0 ? "/ftyprst" : "/playlist";
+            } else {
+                loc = hop_fin_hits++ == 0 ? "/finrst" : "/playlist";
+            }
             std::string redir = std::string("HTTP/1.1 302 Found\r\nLocation: ") + loc +
                                 "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             sendAll(client, redir.data(), redir.size());
@@ -1186,6 +1278,31 @@ int main() {
                 std::ifstream src(chompSpace);
                 std::ofstream(tmp.path() / "chomp-http.m3u8") << src.rdbuf();
             }
+
+            const std::filesystem::path id3HugeTs = tmp.path() / "d4-id3-huge.ts";
+            const std::filesystem::path id3Media = tmp.path() / "d4-id3-media.m3u8";
+            const std::filesystem::path id3Rewrite = tmp.path() / "d4-id3-rewrite.m3u8";
+            const std::filesystem::path id3Variant = tmp.path() / "d4-id3-variant.m3u8";
+            {
+                std::ifstream in(hugeTs, std::ios::binary);
+                std::ofstream out(id3HugeTs, std::ios::binary);
+                out << id3v23HlsTimestampTag();
+                out << in.rdbuf();
+                std::ofstream(id3Media)
+                    << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    << "#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:0.040,\n"
+                    << id3HugeTs.filename().string() << "\n#EXT-X-ENDLIST\n";
+                std::ofstream(id3Rewrite)
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                    << "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",DEFAULT=YES,URI=\""
+                    << audioHls.filename().string() << "\"\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000,AUDIO=\"aud\"\n"
+                    << id3Media.filename().string() << "\n";
+                std::ofstream(id3Variant)
+                    << "#EXTM3U\n#EXT-X-VERSION:4\n"
+                    << "#EXT-X-STREAM-INF:BANDWIDTH=400000\n"
+                    << id3Media.filename().string() << "\n";
+            }
             long chompRss = 0;
             const int chompRc =
                 run({player, "--url", chompSpace.string(), "--frames", "1"}, out, err, &chompRss);
@@ -1219,6 +1336,28 @@ int main() {
                 run({player, "--url", inbandHuge.string(), "--frames", "1"}, out, err, &inHugeRss);
             if (!d4MustStayCapped("in-band AUDIO huge variant", inHugeRc, inHugeRss, readFile(out),
                                   readFile(err), false)) {
+                return 1;
+            }
+
+            long id3Rss = 0;
+            const int id3Rc =
+                run({player, "--url", id3Media.string(), "--frames", "1"}, out, err, &id3Rss);
+            if (!d4MustStayCapped("ID3-timestamped huge media", id3Rc, id3Rss, readFile(out),
+                                  readFile(err), false)) {
+                return 1;
+            }
+            long id3RwRss = 0;
+            const int id3RwRc =
+                run({player, "--url", id3Rewrite.string(), "--frames", "1"}, out, err, &id3RwRss);
+            if (!d4MustStayCapped("rewrite to ID3-timestamped media", id3RwRc, id3RwRss,
+                                  readFile(out), readFile(err), false)) {
+                return 1;
+            }
+            long id3VarRss = 0;
+            const int id3VarRc =
+                run({player, "--url", id3Variant.string(), "--frames", "1"}, out, err, &id3VarRss);
+            if (!d4MustStayCapped("STREAM-INF ID3-timestamped variant", id3VarRc, id3VarRss,
+                                  readFile(out), readFile(err), false)) {
                 return 1;
             }
 
@@ -1336,9 +1475,73 @@ int main() {
             long hopRss = 0;
             const int hopRc =
                 run({player, "--url", httpBase + "/hop.m3u8", "--frames", "1"}, out, err, &hopRss);
-            d4http.stop();
             if (!d4MustStayCapped("302 decoy then master", hopRc, hopRss, readFile(out),
                                   readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+
+            {
+                std::ifstream src(masterAudio);
+                std::ofstream(tmp.path() / "decoyts") << src.rdbuf();
+                std::ifstream src2(masterAudio);
+                std::ofstream(tmp.path() / "decoyftyp") << src2.rdbuf();
+                std::ifstream src3(masterAudio);
+                std::ofstream(tmp.path() / "decoyfin") << src3.rdbuf();
+            }
+
+            long decoyTsRss = 0;
+            const int decoyTsRc =
+                run({player, "--url", httpBase + "/decoyts", "--frames", "1"}, out, err,
+                    &decoyTsRss);
+            if (!d4MustStayCapped("TS sync prefix reset", decoyTsRc, decoyTsRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long decoyFtypRss = 0;
+            const int decoyFtypRc =
+                run({player, "--url", httpBase + "/decoyftyp", "--frames", "1"}, out, err,
+                    &decoyFtypRss);
+            if (!d4MustStayCapped("ftyp prefix reset", decoyFtypRc, decoyFtypRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long decoyFinRss = 0;
+            const int decoyFinRc =
+                run({player, "--url", httpBase + "/decoyfin", "--frames", "1"}, out, err,
+                    &decoyFinRss);
+            if (!d4MustStayCapped("finished small TS reset", decoyFinRc, decoyFinRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long hopTsRss = 0;
+            const int hopTsRc =
+                run({player, "--url", httpBase + "/hop-ts.m3u8", "--frames", "1"}, out, err,
+                    &hopTsRss);
+            if (!d4MustStayCapped("302 TS decoy then master", hopTsRc, hopTsRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long hopFtypRss = 0;
+            const int hopFtypRc =
+                run({player, "--url", httpBase + "/hop-ftyp.m3u8", "--frames", "1"}, out, err,
+                    &hopFtypRss);
+            if (!d4MustStayCapped("302 ftyp decoy then master", hopFtypRc, hopFtypRss, readFile(out),
+                                  readFile(err), false)) {
+                d4http.stop();
+                return 1;
+            }
+            long hopFinRss = 0;
+            const int hopFinRc =
+                run({player, "--url", httpBase + "/hop-fin.m3u8", "--frames", "1"}, out, err,
+                    &hopFinRss);
+            d4http.stop();
+            if (!d4MustStayCapped("302 finished-TS decoy then master", hopFinRc, hopFinRss,
+                                  readFile(out), readFile(err), false)) {
                 return 1;
             }
         }

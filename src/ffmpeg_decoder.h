@@ -66,9 +66,12 @@ public:
     // master). Playlist lines end on \\n / \\r / \\0 like ff_get_line
     // and are capped at 4095 bytes, then chomped like ff_get_chomp_line.
     // Quoted values drop a final backslash. Any TYPE=AUDIO tag (URI=
-    // or in-band) is rewritten or refused. A truncated #EXTM3U, a peek
-    // that errors after any bytes, mpegurl that is not #EXTM3U, or a
-    // non-playlist http(s) decoy is refused rather than opened
+    // or in-band) is rewritten or refused. A media playlist whose first
+    // segment is ID3-timestamped (PRIV transportStreamTimestamp) is
+    // refused — FFmpeg would still run the nested probe with no AUDIO
+    // tag. A truncated #EXTM3U, a peek that errors after any bytes
+    // (including after a TS/`ftyp` sniff), mpegurl that is not #EXTM3U,
+    // or a non-playlist http(s) decoy is refused rather than opened
     // uncapped (AUDIT12 D4).
     // readFrame() also refuses to convert a frame that fails those
     // extent and stride caps (AUDIT9 D1).
